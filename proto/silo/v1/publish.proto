@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package silo.v1;
+
+option go_package = "github.com/BirknerAlex/silo/gen/go/silo/v1;silov1";
+
+// PackageFormat identifies the package format a repo/channel holds.
+// RPM is the only supported format for the MVP; the field exists so
+// future formats (deb, generic) don't require a wire-compatibility break.
+enum PackageFormat {
+  PACKAGE_FORMAT_UNSPECIFIED = 0;
+  PACKAGE_FORMAT_RPM = 1;
+}
+
+// PublishService lets authorized clients push packages into a repo/channel.
+// The server owns S3 credentials and the GPG signing key; clients never see them.
+service PublishService {
+  // Publish uploads a single package. Request is streamed so large RPMs
+  // don't need to be buffered whole in a single message; the server
+  // reassembles bytes then validates, optionally signs, stores to S3,
+  // and regenerates repodata for the target repo/channel.
+  rpc Publish(stream PublishRequest) returns (PublishResponse);
+}
+
+message PublishRequest {
+  oneof payload {
+    PublishMetadata metadata = 1; // must be the first message on the stream
+    bytes chunk = 2;              // subsequent messages carry raw package bytes
+  }
+}
+
+message PublishMetadata {
+  string repo = 1;
+  string channel = 2;
+  PackageFormat format = 3;
+}
+
+message PublishResponse {
+  string name = 1;
+  string version = 2;
+  string release = 3;
+  string arch = 4;
+  string storage_path = 5; // path within the bucket the package was written to
+  bool signed = 6;
+}
+
+// ReadService exposes metadata reads over gRPC. Bulk package/repodata
+// retrieval for dnf/yum happens over plain HTTP, served separately by
+// the same binary (see README) — not through this service.
+service ReadService {
+  rpc ListPackages(ListPackagesRequest) returns (ListPackagesResponse);
+}
+
+message ListPackagesRequest {
+  string repo = 1;
+  string channel = 2;
+}
+
+message ListPackagesResponse {
+  repeated PackageInfo packages = 1;
+}
+
+message PackageInfo {
+  string name = 1;
+  string version = 2;
+  string release = 3;
+  string arch = 4;
+  string storage_path = 5;
+  int64 size_bytes = 6;
+}

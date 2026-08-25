@@ -1,0 +1,9 @@
+apiVersion: v2
+name: silo
+description: Self-hosted, S3-backed RPM package registry
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/BirknerAlex/silo
+sources:
+  - https://github.com/BirknerAlex/silo

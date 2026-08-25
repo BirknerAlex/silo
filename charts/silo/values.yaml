@@ -1,0 +1,36 @@
+# silo-server is stateless — all durable state lives in S3. There is
+# intentionally no PVC/StatefulSet here: any replica can serve any
+# request, so this is a plain Deployment + Service that can be scaled
+# horizontally by bumping replicaCount. Note the known MVP limitation
+# (see project README): concurrent publishes to the same repo/channel
+# across replicas can race on repodata regeneration — there's no
+# distributed lock. Keep replicaCount modest / publish concurrency low
+# until that's addressed upstream.
+replicaCount: 1
+
+image:
+  repository: birkneralex/silo
+  tag: latest
+  pullPolicy: IfNotPresent
+
+grpc:
+  port: 9090
+service:
+  type: ClusterIP
+  grpcPort: 9090
+  httpPort: 8080
+
+resources: {}
+
+# Mounted verbatim as /etc/silo/config.yaml. See the project README for
+# the full schema (storage/auth/gpg). Secrets (tokens, S3 credentials,
+# GPG key/passphrase) belong in `config` only if you're supplying your
+# own Secret via `existingConfigSecret` instead of this inline value —
+# inline `config` here ends up in a plain ConfigMap-less Secret either
+# way (see templates/secret.yaml), but prefer `existingConfigSecret` for
+# GitOps setups that shouldn't put credentials in values.yaml/Helm history.
+config: ""
+
+# Name of a pre-existing Secret with a `config.yaml` key, used instead of
+# rendering `config` above. Takes precedence over `config` when set.
+existingConfigSecret: ""

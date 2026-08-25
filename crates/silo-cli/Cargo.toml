@@ -1,0 +1,24 @@
+[package]
+name = "silo-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "silo"
+path = "src/main.rs"
+
+[dependencies]
+silo-proto = { path = "../silo-proto" }
+silo-rpm = { path = "../silo-rpm" }
+tokio.workspace = true
+tonic.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio-stream = "0.1"
+shellexpand = "3"

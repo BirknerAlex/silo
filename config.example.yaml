@@ -1,0 +1,30 @@
+# Server config. Mount this at /etc/silo/config.yaml (or point SILO_CONFIG
+# at another path). Everything here is server-only — the CLI never sees
+# S3 credentials or the GPG key.
+
+grpc_addr: "0.0.0.0:9090"
+http_addr: "0.0.0.0:8080"
+
+storage:
+  bucket: "silo"
+  region: "us-east-1"
+  access_key_id: "minioadmin"
+  secret_access_key: "minioadmin"
+  # Omit for real AWS S3. Set for MinIO / any S3-compatible endpoint.
+  endpoint: "http://minio.internal:9000"
+  # Required when `endpoint` is not TLS (e.g. local MinIO over http://).
+  allow_http: true
+
+auth:
+  publish_token: "change-me-publish-token"
+  read_token: "change-me-read-token"
+
+# Optional. Omit entirely to publish unsigned packages.
+gpg:
+  key_path: "/etc/silo/gpg-key.asc"
+  passphrase: "change-me-passphrase"
+  # Alternatively, inline the armored key instead of key_path:
+  # key: |
+  #   -----BEGIN PGP PRIVATE KEY BLOCK-----
+  #   ...
+  #   -----END PGP PRIVATE KEY BLOCK-----

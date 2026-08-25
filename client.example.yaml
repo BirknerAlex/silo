@@ -1,0 +1,6 @@
+# silo CLI config. Defaults to ~/.config/silo/client.yaml, or set
+# SILO_CLIENT_CONFIG / --config to point elsewhere.
+
+server_addr: "http://silo.internal:9090"
+publish_token: "change-me-publish-token"
+read_token: "change-me-read-token"

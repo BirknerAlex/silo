@@ -1,0 +1,30 @@
+[package]
+name = "silo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+silo-rpm = { path = "../silo-rpm" }
+tokio.workspace = true
+object_store.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tempfile.workspace = true
+bytes.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+pgp.workspace = true
+rand.workspace = true
+url = "2"
+reqwest = { version = "0.12", default-features = false }
+
+[features]
+test-util = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

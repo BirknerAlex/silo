@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "silo.fullname" . }}
+  labels:
+    {{- include "silo.labels" . | nindent 4 }}
+spec:
+  # No PVC/StatefulSet: silo-server keeps no local state, so any number
+  # of replicas can come and go freely behind the Service.
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "silo.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "silo.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: silo-server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.grpcPort }}
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+          env:
+            - name: SILO_CONFIG
+              value: /etc/silo/config.yaml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/silo
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ include "silo.configSecretName" . }}
