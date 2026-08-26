@@ -24,4 +24,5 @@ jobs:
       - name: Package and push chart
         run: |
           helm package charts/silo -d .cr-release-packages
-          helm push .cr-release-packages/silo-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          helm push .cr-release-packages/silo-*.tgz "oci://ghcr.io/$owner/charts"
