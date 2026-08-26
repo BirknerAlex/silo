@@ -99,13 +99,14 @@ Homebrew) — CI runs them for real on Linux via `apt install createrepo-c`.
   is `debian:bookworm-slim` + `createrepo-c`. Published to Docker Hub as
   `birkneralex/silo` on push to `main`/tags via `.github/workflows/docker.yml`.
 - **Helm**: `charts/silo` — plain Deployment + Service, no PVC/StatefulSet
-  since all state lives in S3. Published via `chart-releaser-action` to
-  this repo's GitHub Pages (`gh-pages` branch, `index.yaml` + packaged
-  `.tgz`) on changes under `charts/`. One-time setup: enable GitHub Pages
-  for this repo, serving from the `gh-pages` branch.
+  since all state lives in S3. Published as an OCI artifact to GHCR
+  (`ghcr.io/birkneralex/charts/silo`) on changes under `charts/`, via
+  `.github/workflows/helm-release.yml`. GitHub Pages was the original
+  plan but isn't available on this repo's plan while it's private, so
+  OCI/GHCR is used instead — it needs no extra setup beyond the
+  workflow's own `GITHUB_TOKEN` and works the same for private repos.
   ```sh
-  helm repo add silo https://birkneralex.github.io/silo
-  helm install silo silo/silo -f my-values.yaml
+  helm install silo oci://ghcr.io/birkneralex/charts/silo -f my-values.yaml
   ```
 - **Proto**: `proto/silo/v1` is a buf module (`buf.build/birkner/silo`),
   pushed on changes via `.github/workflows/ci.yml`'s `buf-push` job.
@@ -114,7 +115,7 @@ Homebrew) — CI runs them for real on Linux via `apt install createrepo-c`.
 
 - `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` — Docker Hub push
 - `BUF_TOKEN` — buf.build push
-- `GITHUB_TOKEN` is provided automatically for the Helm chart-releaser job
+- `GITHUB_TOKEN` is provided automatically for the Helm GHCR push job
 
 ## Out of scope for the MVP
 
