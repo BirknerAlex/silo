@@ -107,7 +107,7 @@ Homebrew) — CI runs them for real on Linux via `apt install createrepo-c`.
   helm repo add silo https://birkneralex.github.io/silo
   helm install silo silo/silo -f my-values.yaml
   ```
-- **Proto**: `proto/silo/v1` is a buf module (`buf.build/birkneralex/silo`),
+- **Proto**: `proto/silo/v1` is a buf module (`buf.build/birkner/silo`),
   pushed on changes via `.github/workflows/ci.yml`'s `buf-push` job.
 
 ### Required CI secrets

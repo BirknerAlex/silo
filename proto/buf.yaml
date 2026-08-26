@@ -1,7 +1,7 @@
 version: v2
 modules:
   - path: .
-    name: buf.build/birkneralex/silo
+    name: buf.build/birkner/silo
 lint:
   use:
     - STANDARD
