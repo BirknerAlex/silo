@@ -1,4 +1,5 @@
 FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
 WORKDIR /build
 COPY . .
 RUN cargo build --release -p silo-server
