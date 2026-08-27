@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+package silo.v1;
+
+import "silo/v1/publish.proto";
+
+option go_package = "github.com/BirknerAlex/silo/gen/go/silo/v1;silov1";
+
+// AdminService covers everything that manages the registry rather than its
+// contents: tokens, users, the audit log, and index repair. Every method
+// requires an admin-permission credential.
+service AdminService {
+  rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+  rpc SetUserDisabled(SetUserDisabledRequest) returns (SetUserDisabledResponse);
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+  rpc SetUserPassword(SetUserPasswordRequest) returns (SetUserPasswordResponse);
+
+  rpc QueryAudit(QueryAuditRequest) returns (QueryAuditResponse);
+
+  // Rebuilds an index from the database. Repairs a bucket restored from
+  // backup, or an index left stale by a crash mid-publish.
+  rpc RebuildIndex(RebuildIndexRequest) returns (RebuildIndexResponse);
+  rpc DeletePackage(DeletePackageRequest) returns (DeletePackageResponse);
+}
+
+// Which repos a token may act on.
+enum TokenScope {
+  TOKEN_SCOPE_UNSPECIFIED = 0;
+  // Every repo, including ones created after the token was issued.
+  TOKEN_SCOPE_ALL = 1;
+  // Exactly the repos listed in `repos`. One repo is just the
+  // single-element case.
+  TOKEN_SCOPE_REPOS = 2;
+}
+
+message CreateTokenRequest {
+  string name = 1;
+  // "read", "write", or "admin".
+  string permission = 2;
+  TokenScope scope = 3;
+  repeated string repos = 4;
+  // Unix seconds; 0 means the token never expires.
+  int64 expires_at = 5;
+}
+
+message CreateTokenResponse {
+  // The full token string — shown once, never recoverable afterwards.
+  string token = 1;
+  TokenInfo info = 2;
+}
+
+message TokenInfo {
+  string id = 1;
+  string name = 2;
+  // Public lookup handle; the leading segment of the token string.
+  string prefix = 3;
+  string permission = 4;
+  bool all_repos = 5;
+  repeated string repos = 6;
+  int64 created_at = 7;
+  int64 expires_at = 8;
+  int64 last_used_at = 9;
+  int64 revoked_at = 10;
+  string kind = 11;
+}
+
+message ListTokensRequest {
+  bool include_revoked = 1;
+}
+
+message ListTokensResponse {
+  repeated TokenInfo tokens = 1;
+}
+
+message RevokeTokenRequest {
+  // Either the token id or its name; whichever is set is used.
+  string id = 1;
+  string name = 2;
+}
+
+message RevokeTokenResponse {
+  bool revoked = 1;
+}
+
+message CreateUserRequest {
+  string username = 1;
+  // Omit for a user who will only ever sign in through OIDC.
+  string password = 2;
+  bool is_admin = 3;
+}
+
+// One response message per RPC even where they carry the same thing today.
+// Sharing one would mean that adding a field to any of these operations
+// forces it onto all of them, and there is no compatible way out of that
+// once clients exist.
+message CreateUserResponse {
+  UserInfo user = 1;
+}
+
+message SetUserDisabledResponse {
+  UserInfo user = 1;
+}
+
+message SetUserPasswordResponse {
+  UserInfo user = 1;
+}
+
+message UserInfo {
+  string id = 1;
+  string username = 2;
+  bool is_admin = 3;
+  bool disabled = 4;
+  bool oidc_only = 5;
+  int64 created_at = 6;
+  int64 last_login_at = 7;
+}
+
+message ListUsersRequest {}
+
+message ListUsersResponse {
+  repeated UserInfo users = 1;
+}
+
+message SetUserDisabledRequest {
+  string username = 1;
+  bool disabled = 2;
+}
+
+message SetUserPasswordRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message DeleteUserRequest {
+  string username = 1;
+}
+
+message DeleteUserResponse {
+  bool deleted = 1;
+}
+
+message QueryAuditRequest {
+  string action = 1;
+  string repo = 2;
+  string actor = 3;
+  bool only_failures = 4;
+  int32 limit = 5;
+}
+
+message QueryAuditResponse {
+  repeated AuditEntry entries = 1;
+}
+
+message AuditEntry {
+  int64 id = 1;
+  int64 at = 2;
+  string action = 3;
+  string actor_kind = 4;
+  string actor_name = 5;
+  string repo = 6;
+  string channel = 7;
+  string target = 8;
+  bool success = 9;
+  string remote_addr = 10;
+  // JSON object.
+  string detail = 11;
+}
+
+message RebuildIndexRequest {
+  string repo = 1;
+  string channel = 2;
+  PackageFormat format = 3;
+  // The index unit: empty for rpm, an architecture for apk, a package
+  // name for npm. Empty rebuilds every group of that format.
+  string index_group = 4;
+}
+
+message RebuildIndexResponse {
+  repeated string objects = 1;
+  int32 groups_rebuilt = 2;
+}
+
+message DeletePackageRequest {
+  int64 id = 1;
+}
+
+message DeletePackageResponse {
+  bool deleted = 1;
+  string storage_path = 2;
+}

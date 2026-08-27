@@ -1,0 +1,34 @@
+[package]
+name = "silo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+silo-pkg = { path = "../silo-pkg" }
+silo-db = { path = "../silo-db" }
+tokio.workspace = true
+object_store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+futures.workspace = true
+pgp.workspace = true
+rand.workspace = true
+rsa.workspace = true
+sha2.workspace = true
+sha1 = "0.10"
+url = "2"
+reqwest = { workspace = true }
+jsonwebtoken.workspace = true
+
+[features]
+test-util = ["silo-pkg/test-util"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+silo-pkg = { path = "../silo-pkg", features = ["test-util"] }

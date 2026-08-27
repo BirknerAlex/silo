@@ -1,0 +1,81 @@
+# The stack ci/e2e.sh runs against: silo, a Postgres, and a SeaweedFS
+# standing in for S3.
+#
+# Separate from the repository root's docker-compose.yaml on purpose. That
+# one is a quickstart someone reads and copies; this one has a
+# generated-per-run config mounted in, non-default ports so it doesn't
+# collide with whatever a developer already has running, and no host
+# volumes to leave behind.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: silo
+      POSTGRES_PASSWORD: silo
+      POSTGRES_DB: silo
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U silo -d silo"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks: [silo]
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    # Master, volume server, filer and S3 gateway in one process.
+    # `-s3.autoCreateBucket=false` because it defaults to *true*: left on,
+    # the gateway would create the bucket on silo's first upload and the
+    # createbucket service below would stop proving anything.
+    command: server -dir=/data -s3 -s3.port=8333 -s3.autoCreateBucket=false
+    environment:
+      # With no -s3.config file these are the sole admin identity, so the
+      # suite exercises a credentialed S3 rather than an open one.
+      AWS_ACCESS_KEY_ID: siloadmin
+      AWS_SECRET_ACCESS_KEY: siloadmin
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8333/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks: [silo]
+
+  # silo never creates buckets itself — doing so would need broader S3
+  # permissions than it otherwise requires — so this does, then exits.
+  # The image's entrypoint is `weed`, hence the explicit shell; the
+  # read-back is what turns a silently-failed create into a failed run.
+  createbucket:
+    image: chrislusf/seaweedfs:latest
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      echo 's3.bucket.create -name silo' | weed shell -master=seaweedfs:9333 &&
+      echo 's3.bucket.list' | weed shell -master=seaweedfs:9333 | grep -q 'silo'
+      "
+    networks: [silo]
+
+  silo:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully
+    environment:
+      SILO_CONFIG: /etc/silo/config.yaml
+      RUST_LOG: info
+    volumes:
+      # Generated per run: it embeds the signing keys the suite just made.
+      - ${SILO_E2E_CONFIG_DIR}:/etc/silo:ro
+    ports:
+      # Published so the suite's own curl checks can reach it from the
+      # host. The package-manager containers use the service name instead.
+      - "${SILO_E2E_HTTP_PORT}:8080"
+      - "${SILO_E2E_GRPC_PORT}:9090"
+    networks: [silo]
+
+networks:
+  silo:

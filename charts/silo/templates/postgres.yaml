@@ -1,0 +1,122 @@
+{{- if .Values.postgres.enabled }}
+{{- if not .Values.postgres.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "silo.fullname" . }}-postgres
+  labels:
+    {{- include "silo.postgres.labels" . | nindent 4 }}
+  {{- include "silo.annotations" (dict "ctx" . "extra" (dict)) }}
+type: Opaque
+stringData:
+  password: {{ .Values.postgres.password | quote }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "silo.postgres.fullname" . }}
+  labels:
+    {{- include "silo.postgres.labels" . | nindent 4 }}
+  {{- include "silo.annotations" (dict "ctx" . "extra" (dict)) }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "silo.postgres.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+# A single-replica Postgres for development and evaluation only.
+#
+# This is a StatefulSet rather than a Deployment because the two are not
+# interchangeable here: a Deployment rolling update can briefly run two
+# pods against one RWO volume, and `Recreate` would still reattach
+# unpredictably. A StatefulSet gives ordered, one-at-a-time replacement
+# and a stable volume claim.
+#
+# What it is not: replicated, backed up, pooled, or tuned. Use
+# `externalPostgres` for anything whose loss would matter.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "silo.postgres.fullname" . }}
+  labels:
+    {{- include "silo.postgres.labels" . | nindent 4 }}
+  {{- include "silo.annotations" (dict "ctx" . "extra" (dict)) }}
+spec:
+  serviceName: {{ include "silo.postgres.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "silo.postgres.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "silo.postgres.labels" . | nindent 8 }}
+      {{- include "silo.annotations" (dict "ctx" . "extra" (dict)) | nindent 4 }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image | quote }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.username | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.existingSecret | default (printf "%s-postgres" (include "silo.fullname" .)) }}
+                  key: password
+            # The official image refuses to initialise into a non-empty
+            # directory, and a PVC mounted at /var/lib/postgresql/data has
+            # a lost+found on many storage classes.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - {{ .Values.postgres.username | quote }}
+                - -d
+                - {{ .Values.postgres.database | quote }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - {{ .Values.postgres.username | quote }}
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+      {{- if not .Values.postgres.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.postgres.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.postgres.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.persistence.size | quote }}
+  {{- end }}
+{{- end }}

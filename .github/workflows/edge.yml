@@ -1,0 +1,64 @@
+name: edge
+
+# A container image built from every commit on main, tagged `edge`.
+#
+# Kept separate from `release.yml` on purpose: this one is a moving target
+# for people tracking main, and it deliberately does *not* touch `latest`
+# — pointing `latest` at an untagged commit is how a cluster ends up
+# running something nobody chose to release.
+#
+# amd64 only, because a QEMU-emulated arm64 Rust build costs more minutes
+# than a main-branch convenience image is worth. Releases build both.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: edge
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # build.rs stamps the commit into the binary, which is the whole
+          # point of an edge image: `silo version` tells you exactly which
+          # commit you are running.
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=edge
+            type=sha,format=long
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

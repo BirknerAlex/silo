@@ -1,0 +1,8 @@
+# .git is deliberately NOT ignored: silo-core's build.rs stamps the commit
+# into the binary, and without it every image reports its build as
+# "unknown" — which is precisely when you most want to know.
+target
+charts
+.github
+docker-compose.yaml
+*.md

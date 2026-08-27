@@ -1,0 +1,93 @@
+# A complete local Silo: server, Postgres, and SeaweedFS standing in for S3.
+#
+#   docker compose up -d
+#   docker compose logs silo | grep -A 12 'SILO BOOTSTRAP'   # grab the token
+#
+# For development only — the credentials below are deliberately obvious.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: silo
+      POSTGRES_PASSWORD: silo
+      POSTGRES_DB: silo
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U silo -d silo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    # `server` runs the master, a volume server, the filer and the S3
+    # gateway in one process, which is the whole reason to use it here
+    # rather than a real S3. Silo talks plain S3 to :8333 and needs no
+    # knowledge of any of the rest.
+    #
+    # `-s3.autoCreateBucket=false` is load-bearing: it defaults to *true*,
+    # which would have SeaweedFS create the bucket on Silo's first upload
+    # and quietly turn the createbucket service below into dead code.
+    command: server -dir=/data -s3 -s3.port=8333 -s3.autoCreateBucket=false
+    environment:
+      # With no -s3.config file, these become the one admin identity;
+      # unset, the gateway would accept anonymous requests instead.
+      AWS_ACCESS_KEY_ID: siloadmin
+      AWS_SECRET_ACCESS_KEY: siloadmin
+    ports:
+      - "8333:8333"
+      # The filer's web UI. Browse the bucket under /buckets/silo.
+      - "8888:8888"
+    volumes:
+      - seaweedfs-data:/data
+    healthcheck:
+      # The S3 gateway's own probe, and the only one worth waiting on:
+      # the master and filer come up before it, so a 200 here means the
+      # surface Silo actually uses is serving.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Creates the bucket, then exits. Silo does not create buckets itself —
+  # doing so would need broader S3 permissions than it otherwise requires.
+  createbucket:
+    image: chrislusf/seaweedfs:latest
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    # The image's entrypoint is `weed`, so the shell has to be spelled
+    # out. `s3.bucket.create` is idempotent, and the read-back is what
+    # makes this step fail loudly rather than exit 0 having done nothing.
+    entrypoint: >
+      /bin/sh -c "
+      until echo 's3.bucket.create -name silo' | weed shell -master=seaweedfs:9333; do
+        echo 'waiting for seaweedfs'; sleep 1;
+      done &&
+      echo 's3.bucket.list' | weed shell -master=seaweedfs:9333 | grep -q 'silo' &&
+      echo 'bucket ready'
+      "
+
+  silo:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully
+    environment:
+      SILO_CONFIG: /etc/silo/config.yaml
+      SILO_DATABASE_URL: postgres://silo:silo@postgres:5432/silo
+      RUST_LOG: info
+    ports:
+      - "9090:9090"
+      - "8080:8080"
+    volumes:
+      - ./config.example.yaml:/etc/silo/config.yaml:ro
+
+volumes:
+  postgres-data:
+  seaweedfs-data:

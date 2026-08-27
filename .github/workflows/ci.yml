@@ -1,0 +1,173 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a PR makes the in-flight run irrelevant, and the e2e job is
+# expensive enough that letting both finish wastes real time.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Nothing in CI writes anything back: no comments, no annotations, no
+# pushes. Declared here rather than inherited so widening the repository's
+# default token cannot quietly widen these jobs with it.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI is not an interactive debugging session; a backtrace on a failing
+  # test is what you want to read in the log.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Fast, no-services checks. Split from `test` so a formatting mistake
+  # reports in under a minute instead of behind a full build.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # The test-util feature gates the package fixtures the tests build
+      # from, so without it clippy never sees most of the test code.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --features silo-core/test-util,silo-pkg/test-util -- -D warnings
+
+      # A dependency that is declared and never used is a build-time and
+      # supply-chain cost for nothing.
+      - name: unused dependencies
+        run: |
+          cargo install cargo-machete --locked --quiet || cargo install cargo-machete --locked
+          cargo machete --with-metadata
+
+      - name: shellcheck
+        run: |
+          sudo apt-get install -y shellcheck
+          shellcheck ci/*.sh ci/e2e/*.sh .devcontainer/*.sh
+
+      # actionlint straight from its own image rather than through
+      # reviewdog. reviewdog reads the pull request's diff and writes
+      # annotations back, which needs pull-request scopes this job has no
+      # other use for — and fails outright without them. The linter's exit
+      # code is the signal we actually wanted.
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+
+  proto:
+    runs-on: ubuntu-latest
+    # buf-action defaults to summarising itself in a PR comment, which needs
+    # `pull-requests: write`. The check status and its log already say
+    # everything the comment would, so `pr_comment` is off below and the
+    # workflow's read-only token is enough.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-action@v1
+        with:
+          input: proto
+          # Push happens in the release workflow; here we only check.
+          push: false
+          pr_comment: false
+          # A wire-incompatible proto change is a broken CLI for everyone
+          # who has not upgraded, so it has to be deliberate.
+          breaking_against: "https://github.com/${{ github.repository }}.git#branch=main,subdir=proto"
+
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      # The database-backed integration tests need a real Postgres: they
+      # exercise migrations, transactions, and advisory locks, none of
+      # which a mock would cover. Without SILO_TEST_DATABASE_URL those
+      # tests skip rather than fail, so local runs still work.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: silo
+          POSTGRES_PASSWORD: silo
+          POSTGRES_DB: silo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U silo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      SILO_TEST_DATABASE_URL: postgres://silo:silo@localhost:5432/silo
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `--nocapture` so the skip message below is visible. The
+      # database-backed tests skip rather than fail when they have no
+      # database, which is right for a laptop and wrong for CI: it would
+      # mean losing most of the coverage without anyone noticing.
+      - name: test
+        run: |
+          set -o pipefail
+          cargo test --workspace --features silo-core/test-util,silo-pkg/test-util \
+            -- --nocapture 2>&1 | tee /tmp/test.log
+          if grep -q "skipping: set SILO_TEST_DATABASE_URL" /tmp/test.log; then
+            echo "::error::the database-backed tests skipped; SILO_TEST_DATABASE_URL is not reaching them"
+            exit 1
+          fi
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: lint
+        run: helm lint charts/silo
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pyyaml
+
+      # `helm lint` only checks that the chart renders. These check that
+      # what it renders is correct — see the script for what and why.
+      - name: chart checks
+        run: ci/check-chart.py
+
+  # The one job that tests silo against software we do not control:
+  # packages built by rpmbuild/abuild/npm, served by a real silo, and
+  # installed by real dnf/apk/npm. See ci/e2e.sh.
+  e2e:
+    runs-on: ubuntu-latest
+    # 25 rather than the 360-minute default: the suite takes about five,
+    # and the failure mode worth guarding against is a package manager
+    # blocking on a prompt, which would otherwise burn six hours.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: end-to-end suite
+        run: ci/e2e.sh
