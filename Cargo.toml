@@ -2,14 +2,18 @@
 resolver = "2"
 members = [
     "crates/silo-proto",
-    "crates/silo-rpm",
+    "crates/silo-pkg",
+    "crates/silo-db",
     "crates/silo-core",
     "crates/silo-server",
     "crates/silo-cli",
 ]
 
 [workspace.package]
-version = "0.1.0"
+# The single source of truth for silo's version: `silo-core` re-exports it
+# as `silo_core::VERSION`, and every binary, the `silo version` command and
+# the Helm chart's appVersion follow from it. Bump here and nowhere else.
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/BirknerAlex/silo"
@@ -34,8 +38,21 @@ bytes = "1"
 futures = "0.3"
 async-trait = "0.1"
 rpm = "0.27"
-pgp = "0.14"
+pgp = "0.20"
 rand = "0.8"
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+argon2 = "0.5"
+sha2 = "0.10"
+rsa = "0.9"
+prometheus = { version = "0.13", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+jsonwebtoken = "9"
+base64 = "0.22"
+hex = "0.4"
+semver = "1"
 
 [profile.release]
 lto = true

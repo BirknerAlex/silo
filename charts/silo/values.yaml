@@ -1,36 +1,271 @@
-# silo-server is stateless — all durable state lives in S3. There is
-# intentionally no PVC/StatefulSet here: any replica can serve any
-# request, so this is a plain Deployment + Service that can be scaled
-# horizontally by bumping replicaCount. Note the known MVP limitation
-# (see project README): concurrent publishes to the same repo/channel
-# across replicas can race on repodata regeneration — there's no
-# distributed lock. Keep replicaCount modest / publish concurrency low
-# until that's addressed upstream.
+# silo-server keeps no local state: packages live in object storage and
+# everything else lives in Postgres. Any replica can serve any request, so
+# this is a plain Deployment that scales horizontally.
+#
+# Concurrent publishes are safe at any replica count — publishes take a
+# Postgres advisory lock scoped to the index they'd rewrite, so two
+# replicas publishing to the same repo/channel serialize, while unrelated
+# repos, apk architectures and npm packages proceed in parallel.
 replicaCount: 1
 
 image:
   repository: birkneralex/silo
-  tag: latest
+  # Defaults to the chart's appVersion, so `helm upgrade` to a new chart
+  # version moves the image with it. Override to pin, or to track `latest`.
+  tag: ""
   pullPolicy: IfNotPresent
 
-grpc:
-  port: 9090
+imagePullSecrets: []
+
+# ------------------------------------------------------- labels and metadata
+
+# Added to the `metadata.labels` and `metadata.annotations` of every
+# resource this chart creates. Use these for organisation-wide conventions
+# (cost centre, team, environment) rather than repeating them per resource.
+#
+# Note what commonLabels deliberately does NOT touch: the Deployment's
+# `spec.selector`. That field is immutable, so folding user labels into it
+# would make adding one break every subsequent upgrade.
+commonLabels: {}
+commonAnnotations: {}
+
+# Per-resource additions, merged on top of the common ones above. The
+# annotation blocks are where controller-specific keys go — external-dns,
+# cert-manager, cloud load balancers, IRSA — since those only make sense on
+# one particular object.
+deploymentLabels: {}
+deploymentAnnotations: {}
+podLabels: {}
+podAnnotations: {}
+
+serviceAccount:
+  create: true
+  # Defaults to the release's full name.
+  name: ""
+  automount: true
+  labels: {}
+  # For cloud object-storage identity, which removes the need for static
+  # S3 credentials entirely:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/silo
+  #   iam.gke.io/gcp-service-account: silo@project.iam.gserviceaccount.com
+  annotations: {}
+
 service:
   type: ClusterIP
   grpcPort: 9090
   httpPort: 8080
+  labels: {}
+  # e.g. external-dns.alpha.kubernetes.io/hostname, or a cloud
+  # load-balancer class, when type is LoadBalancer.
+  annotations: {}
 
 resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+# e.g. {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0}}
+strategy: {}
 
-# Mounted verbatim as /etc/silo/config.yaml. See the project README for
-# the full schema (storage/auth/gpg). Secrets (tokens, S3 credentials,
-# GPG key/passphrase) belong in `config` only if you're supplying your
-# own Secret via `existingConfigSecret` instead of this inline value —
-# inline `config` here ends up in a plain ConfigMap-less Secret either
-# way (see templates/secret.yaml), but prefer `existingConfigSecret` for
-# GitOps setups that shouldn't put credentials in values.yaml/Helm history.
-config: ""
+# Extra environment variables for the server container, in full env-var
+# form (so `valueFrom` works). RUST_LOG is the common one.
+extraEnv: []
+  # - name: RUST_LOG
+  #   value: info,silo_server=debug
 
-# Name of a pre-existing Secret with a `config.yaml` key, used instead of
-# rendering `config` above. Takes precedence over `config` when set.
+# The image already runs as uid 10001 with no need to write to disk, so
+# these are hardening on top of an already-unprivileged container rather
+# than a prerequisite. Left empty by default because some clusters set
+# them through a policy controller instead.
+podSecurityContext: {}
+  # runAsNonRoot: true
+  # seccompProfile:
+  #   type: RuntimeDefault
+securityContext: {}
+  # allowPrivilegeEscalation: false
+  # readOnlyRootFilesystem: true
+  # capabilities:
+  #   drop: [ALL]
+
+# ---------------------------------------------------------------- database
+
+postgres:
+  # A single-replica in-cluster Postgres for development and evaluation.
+  #
+  # Deliberately minimal and deliberately NOT for production: one pod, no
+  # replication, no backups, no connection pooling, and an upgrade
+  # restarts it. Point `externalPostgres` at a managed instance (RDS,
+  # Cloud SQL, CloudNativePG, ...) for anything you care about.
+  enabled: false
+  image: postgres:16-alpine
+  database: silo
+  username: silo
+  # Change this. Only used when postgres.enabled is true.
+  password: silo
+  # Set to an existing Secret with a `password` key to keep the password
+  # out of values.yaml and Helm release history.
+  existingSecret: ""
+  persistence:
+    # false uses an emptyDir — every restart loses the package index, and
+    # the indexes then have to be rebuilt with `silo index rebuild`.
+    enabled: true
+    size: 8Gi
+    storageClass: ""
+  resources: {}
+
+externalPostgres:
+  # Full connection URL, e.g.
+  #   postgres://silo:secret@postgres.internal:5432/silo?sslmode=require
+  # Prefer `existingSecret` so credentials don't land in values.yaml.
+  url: ""
+  # Name of a Secret holding the URL. Takes precedence over `url`.
+  existingSecret: ""
+  existingSecretKey: "url"
+
+# ------------------------------------------------------------------ config
+
+# Rendered into the server's config.yaml. `database.url` is filled in
+# automatically from the postgres/externalPostgres settings above, so it
+# must not be set here.
+#
+# See the project README for the full schema.
+config:
+  publicBaseUrl: ""
+
+  storage:
+    bucket: silo
+    region: us-east-1
+    endpoint: ""
+    allowHttp: false
+    accessKeyId: ""
+    secretAccessKey: ""
+    # Name of a Secret with `accessKeyId`/`secretAccessKey` keys. Takes
+    # precedence over the inline values above.
+    existingSecret: ""
+
+  auth:
+    # Mint an admin token and user on first start against an empty
+    # database, printed once to the pod log.
+    bootstrap: true
+    # Mixed into token hashes and never stored in the database, so a
+    # database dump alone yields no usable credentials. Generate with
+    # `openssl rand -hex 32`. Changing it invalidates every token.
+    tokenPepper: ""
+    tokenPepperExistingSecret: ""
+    sessionTtlHours: 720
+    # Let dnf/apk/npm read without a credential. Publishing always needs one.
+    allowAnonymousRead: false
+
+  audit:
+    logDownloads: true
+    retentionDays: 90
+
+  metrics:
+    enabled: true
+    requireAuth: false
+
+  # Optional single sign-on. Omit `issuer` to disable.
+  oidc:
+    issuer: ""
+    clientId: ""
+    usernameClaim: preferred_username
+    scopes:
+      - openid
+      - profile
+    adminClaim: ""
+    adminValue: ""
+    # Disable local password login once SSO is in place.
+    exclusive: false
+
+  signing:
+    # RPM package + repomd signatures.
+    gpg:
+      # Inline armored private key, or use existingSecret.
+      key: ""
+      passphrase: ""
+      # Secret with `key` and optionally `passphrase`.
+      existingSecret: ""
+    # APKINDEX signatures. `keyName` must match the filename the matching
+    # public key is deployed to under /etc/apk/keys on clients.
+    apk:
+      key: ""
+      keyName: ""
+      existingSecret: ""
+
+# Supply the whole config.yaml verbatim instead of having the chart render
+# it from the structured values above. Everything under `config:` is
+# ignored when this is set.
+configOverride: ""
+
+# Name of a pre-existing Secret with a `config.yaml` key. Takes precedence
+# over both `config` and `configOverride`.
 existingConfigSecret: ""
+
+# ------------------------------------------------------------------ probes
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 20
+
+# Readiness depends on the database, so a replica that loses Postgres is
+# taken out of the Service rather than serving 500s.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+serviceMonitor:
+  # Requires the Prometheus Operator CRDs.
+  enabled: false
+  interval: 30s
+  # Prometheus Operator instances usually select ServiceMonitors by label;
+  # put whatever yours looks for here.
+  labels: {}
+  annotations: {}
+
+ingress:
+  # The HTTP surface: dnf, apk and npm. This is the one most deployments
+  # need — the gRPC port below is only used by the `silo` CLI.
+  enabled: false
+  className: ""
+  labels: {}
+  # Controller, TLS and DNS wiring all go here, e.g.
+  #   cert-manager.io/cluster-issuer: letsencrypt-prod
+  #   external-dns.alpha.kubernetes.io/hostname: packages.example.com
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  annotations: {}
+  hosts:
+    - host: silo.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  # e.g. [{secretName: silo-tls, hosts: [silo.example.com]}]. With
+  # cert-manager, naming a secret here is what triggers issuance.
+  tls: []
+
+  # A second Ingress for the gRPC port. Separate because the annotation
+  # that makes a controller speak HTTP/2 to the backend is per-Ingress, and
+  # applying it to the dnf/apk/npm surface would break it.
+  #
+  # No annotations are guessed at: every controller spells this
+  # differently. nginx wants
+  #   nginx.ingress.kubernetes.io/backend-protocol: GRPC
+  # Traefik wants
+  #   traefik.ingress.kubernetes.io/service.serversscheme: h2c
+  grpc:
+    enabled: false
+    # Falls back to ingress.className when empty.
+    className: ""
+    labels: {}
+    annotations: {}
+    hosts:
+      - host: silo-grpc.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []

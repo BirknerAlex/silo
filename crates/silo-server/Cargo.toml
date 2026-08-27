@@ -11,28 +11,28 @@ path = "src/main.rs"
 
 [dependencies]
 silo-core = { path = "../silo-core" }
+silo-db = { path = "../silo-db" }
 silo-proto = { path = "../silo-proto" }
-silo-rpm = { path = "../silo-rpm" }
+silo-pkg = { path = "../silo-pkg" }
 tokio.workspace = true
 tonic.workspace = true
 axum.workspace = true
-serde.workspace = true
-serde_yaml.workspace = true
-thiserror.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 futures.workspace = true
-bytes.workspace = true
-object_store.workspace = true
-url = "2"
-base64 = "0.22"
+chrono.workspace = true
+uuid.workspace = true
+rand.workspace = true
+prometheus.workspace = true
+sqlx.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 tower = "0.5"
 silo-core = { path = "../silo-core", features = ["test-util"] }
-silo-rpm = { path = "../silo-rpm", features = ["test-util"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+silo-pkg = { path = "../silo-pkg", features = ["test-util"] }
+# The integration tests inflate APKINDEX payloads to assert their contents.
+flate2 = "1"

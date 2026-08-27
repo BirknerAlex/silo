@@ -1,0 +1,102 @@
+# Development environment for silo.
+#
+# Deliberately mirrors the shape of a real deployment — a stateless server
+# talking to a Postgres and an S3 — rather than mocking either out. The
+# integration tests exercise migrations, transactions and advisory locks,
+# none of which a mock would cover, so a real database is the point.
+#
+# This is not the same file as the repository root's `docker-compose.yaml`:
+# that one *runs* silo from a built image, this one gives you a shell with
+# a toolchain in it and leaves running silo to you.
+services:
+  dev:
+    image: mcr.microsoft.com/devcontainers/rust:1-bookworm
+    volumes:
+      - ..:/workspace:cached
+      # Named volumes for the two directories that dominate Rust build
+      # times. A bind mount for these is dramatically slower on macOS and
+      # Windows, and rebuilding them on every container recreate wastes
+      # more time than the cache costs in disk.
+      - cargo-registry:/usr/local/cargo/registry
+      - target:/workspace/target
+    command: sleep infinity
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Not `seaweedfs: service_healthy`: waiting on the bucket instead
+      # means setup.sh does not have to create it, and therefore does not
+      # have to carry an S3 client the base image doesn't have.
+      createbucket:
+        condition: service_completed_successfully
+    environment:
+      # The integration tests read this; unset, they skip.
+      SILO_TEST_DATABASE_URL: postgres://silo:silo@postgres:5432/silo
+    # Everything in the compose network is reachable by service name, and
+    # the editor forwards the ports listed in devcontainer.json to the
+    # host, so a browser on the host can reach the SeaweedFS filer UI.
+    networks: [silo]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: silo
+      POSTGRES_PASSWORD: silo
+      POSTGRES_DB: silo
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U silo -d silo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [silo]
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    # One process for master, volume server, filer and the S3 gateway.
+    # `-s3.autoCreateBucket=false` because it defaults to *true*, which
+    # would create the bucket behind silo's back and make the createbucket
+    # service below dead code nobody notices is dead.
+    command: server -dir=/data -s3 -s3.port=8333 -s3.autoCreateBucket=false
+    environment:
+      # With no -s3.config file these become the sole admin identity;
+      # unset, the gateway would serve anonymous requests instead.
+      AWS_ACCESS_KEY_ID: siloadmin
+      AWS_SECRET_ACCESS_KEY: siloadmin
+    volumes:
+      - seaweedfs-data:/data
+    healthcheck:
+      # The S3 gateway's own probe — the surface silo actually uses.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [silo]
+
+  # silo never creates buckets itself — doing so would need broader S3
+  # permissions than it otherwise requires — so this does, then exits.
+  createbucket:
+    image: chrislusf/seaweedfs:latest
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    # The image's entrypoint is `weed`, so the shell is spelled out.
+    # `s3.bucket.create` is idempotent, which matters here: the editor
+    # recreates these containers on every rebuild.
+    entrypoint: >
+      /bin/sh -c "
+      until echo 's3.bucket.create -name silo' | weed shell -master=seaweedfs:9333; do
+        echo 'waiting for seaweedfs'; sleep 1;
+      done &&
+      echo 's3.bucket.list' | weed shell -master=seaweedfs:9333 | grep -q 'silo'
+      "
+    networks: [silo]
+
+volumes:
+  postgres-data:
+  seaweedfs-data:
+  cargo-registry:
+  target:
+
+networks:
+  silo:

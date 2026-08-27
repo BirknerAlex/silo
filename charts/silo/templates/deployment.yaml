@@ -4,22 +4,55 @@ metadata:
   name: {{ include "silo.fullname" . }}
   labels:
     {{- include "silo.labels" . | nindent 4 }}
+    {{- with .Values.deploymentLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- include "silo.annotations" (dict "ctx" . "extra" .Values.deploymentAnnotations) }}
 spec:
-  # No PVC/StatefulSet: silo-server keeps no local state, so any number
-  # of replicas can come and go freely behind the Service.
+  # No PVC or StatefulSet: silo-server keeps no local state. Packages are
+  # in object storage, everything else is in Postgres, and publishes
+  # coordinate through Postgres advisory locks — so replicas are
+  # interchangeable and safe to scale.
   replicas: {{ .Values.replicaCount }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
-      {{- include "silo.labels" . | nindent 6 }}
+      {{- include "silo.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
         {{- include "silo.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll the pods when the config changes; otherwise a `helm upgrade`
+        # that only touches config leaves the old config running.
+        checksum/config: {{ include "silo.config" . | sha256sum }}
+        {{- with (merge (dict) (default (dict) .Values.podAnnotations) (default (dict) .Values.commonAnnotations)) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      serviceAccountName: {{ include "silo.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: silo-server
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.service.grpcPort }}
@@ -28,13 +61,84 @@ spec:
           env:
             - name: SILO_CONFIG
               value: /etc/silo/config.yaml
+            {{- include "silo.databaseUrlEnv" . | nindent 12 }}
+            {{- if .Values.config.auth.tokenPepperExistingSecret }}
+            - name: SILO_TOKEN_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.auth.tokenPepperExistingSecret }}
+                  key: tokenPepper
+            {{- end }}
+            {{- if .Values.config.storage.existingSecret }}
+            - name: SILO_STORAGE_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.storage.existingSecret }}
+                  key: accessKeyId
+            - name: SILO_STORAGE_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.storage.existingSecret }}
+                  key: secretAccessKey
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/silo
               readOnly: true
+            {{- if or .Values.config.signing.gpg.existingSecret .Values.config.signing.apk.existingSecret }}
+            - name: signing
+              mountPath: /etc/silo/signing
+              readOnly: true
+            {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: config
           secret:
             secretName: {{ include "silo.configSecretName" . }}
+        {{- if or .Values.config.signing.gpg.existingSecret .Values.config.signing.apk.existingSecret }}
+        - name: signing
+          projected:
+            sources:
+              {{- with .Values.config.signing.gpg.existingSecret }}
+              - secret:
+                  name: {{ . }}
+                  items:
+                    - key: key
+                      path: gpg-key.asc
+              {{- end }}
+              {{- with .Values.config.signing.apk.existingSecret }}
+              - secret:
+                  name: {{ . }}
+                  items:
+                    - key: key
+                      path: apk-key.pem
+              {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

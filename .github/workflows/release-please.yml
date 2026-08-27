@@ -1,0 +1,56 @@
+name: release-please
+
+# Versioning is derived from commit messages rather than decided by hand.
+# release-please watches main, keeps a release PR open with the version
+# bump and the changelog it has accumulated, and cuts the tag when that PR
+# is merged. Merging is the only manual step, and it is the one that
+# should be manual.
+#
+# What decides the bump, per Conventional Commits:
+#   fix:              -> patch
+#   feat:             -> minor
+#   feat!: / BREAKING -> major
+#
+# The tag it pushes is what `release.yml` builds and publishes.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  # To dispatch release.yml once a release exists; see the last step.
+  actions: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          # `rust` understands a Cargo workspace: it bumps
+          # `[workspace.package] version` and re-resolves Cargo.lock, which
+          # is what keeps `silo_core::VERSION` — and therefore every
+          # surface that reports a version — correct.
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # A tag pushed with GITHUB_TOKEN does not start a workflow: GitHub
+      # suppresses that so workflows cannot trigger themselves. So
+      # `release.yml`'s `on: push: tags` would never fire for the tag cut
+      # just above, and the release would sit there with nothing built.
+      #
+      # `workflow_dispatch` is the documented exception to that rule, and
+      # release.yml already takes the tag as an input — it was there for
+      # re-running a failed publish, and serves double duty here.
+      - name: build and publish the release
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          echo "dispatching release.yml for $TAG"
+          gh workflow run release.yml -f tag="$TAG"

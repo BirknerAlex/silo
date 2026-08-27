@@ -1,0 +1,87 @@
+version: 2
+
+updates:
+  # Rust. Grouped rather than one PR per crate: a workspace this size
+  # produces enough weekly churn that ungrouped updates stop being read,
+  # and the whole point of the CI suite is that one PR can be judged in
+  # one look.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+    groups:
+      # Patch and minor bumps across the whole tree in one PR. These are
+      # the ones that are either green or obviously broken.
+      rust-minor:
+        update-types:
+          - minor
+          - patch
+      # Majors are separated because each one needs reading. Grouping by
+      # ecosystem keeps a tonic/prost pair — which must move together —
+      # from arriving as two PRs that each fail on their own.
+      tonic-stack:
+        patterns:
+          - tonic*
+          - prost*
+        update-types:
+          - major
+      async-stack:
+        patterns:
+          - tokio*
+          - futures*
+          - hyper*
+          - axum*
+        update-types:
+          - major
+    ignore:
+      # sqlx, object_store and rpm are the three crates whose majors have
+      # broken silo's build in ways no test would catch until runtime
+      # (query macros, S3 builder shape, header accessors). They get
+      # updated deliberately, not by a bot opening a PR nobody merges.
+      - dependency-name: sqlx
+        update-types: [version-update:semver-major]
+      - dependency-name: object_store
+        update-types: [version-update:semver-major]
+      - dependency-name: rpm
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    labels:
+      - dependencies
+      - ci
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # The Dockerfile's base images. Postgres and SeaweedFS tags live in
+  # docker-compose.yaml and the chart, which Dependabot cannot see; they
+  # are pinned to major-version tags there on purpose so they float.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    labels:
+      - dependencies
+      - docker
+
+  - package-ecosystem: devcontainers
+    directory: /
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+      - devcontainer

@@ -4,28 +4,32 @@ package silo.v1;
 
 option go_package = "github.com/BirknerAlex/silo/gen/go/silo/v1;silov1";
 
-// PackageFormat identifies the package format a repo/channel holds.
-// RPM is the only supported format for the MVP; the field exists so
-// future formats (deb, generic) don't require a wire-compatibility break.
+// PackageFormat identifies the package format a package is in. Silo
+// supports three; adding a fourth is a new enum value plus a server-side
+// Format implementation, with no wire-compatibility break.
 enum PackageFormat {
   PACKAGE_FORMAT_UNSPECIFIED = 0;
   PACKAGE_FORMAT_RPM = 1;
+  PACKAGE_FORMAT_APK = 2;
+  PACKAGE_FORMAT_NPM = 3;
 }
 
 // PublishService lets authorized clients push packages into a repo/channel.
-// The server owns S3 credentials and the GPG signing key; clients never see them.
+// The server owns object-storage credentials and the signing keys; clients
+// never see them.
 service PublishService {
-  // Publish uploads a single package. Request is streamed so large RPMs
-  // don't need to be buffered whole in a single message; the server
-  // reassembles bytes then validates, optionally signs, stores to S3,
-  // and regenerates repodata for the target repo/channel.
+  // Publish uploads a single package. Request is streamed so large
+  // packages don't need to be buffered whole in a single message; the
+  // server reassembles bytes then validates, optionally signs, stores,
+  // records the package in the database, and regenerates the affected
+  // index under a distributed lock.
   rpc Publish(stream PublishRequest) returns (PublishResponse);
 }
 
 message PublishRequest {
   oneof payload {
     PublishMetadata metadata = 1; // must be the first message on the stream
-    bytes chunk = 2;              // subsequent messages carry raw package bytes
+    bytes chunk = 2; // subsequent messages carry raw package bytes
   }
 }
 
@@ -42,18 +46,26 @@ message PublishResponse {
   string arch = 4;
   string storage_path = 5; // path within the bucket the package was written to
   bool signed = 6;
+  PackageFormat format = 7;
+  int64 size_bytes = 8;
+  string sha256 = 9;
+  // Index objects rewritten as a side effect of this publish.
+  repeated string index_objects = 10;
 }
 
-// ReadService exposes metadata reads over gRPC. Bulk package/repodata
-// retrieval for dnf/yum happens over plain HTTP, served separately by
+// ReadService exposes metadata reads over gRPC. Bulk package/index
+// retrieval for dnf/apk/npm happens over plain HTTP, served separately by
 // the same binary (see README) — not through this service.
 service ReadService {
   rpc ListPackages(ListPackagesRequest) returns (ListPackagesResponse);
+  rpc ListRepos(ListReposRequest) returns (ListReposResponse);
 }
 
 message ListPackagesRequest {
   string repo = 1;
   string channel = 2;
+  // Unspecified lists every format in the repo/channel.
+  PackageFormat format = 3;
 }
 
 message ListPackagesResponse {
@@ -67,4 +79,23 @@ message PackageInfo {
   string arch = 4;
   string storage_path = 5;
   int64 size_bytes = 6;
+  PackageFormat format = 7;
+  string sha256 = 8;
+  // Unix seconds.
+  int64 published_at = 9;
+  int64 id = 10;
+}
+
+message ListReposRequest {}
+
+message ListReposResponse {
+  repeated RepoInfo repos = 1;
+}
+
+message RepoInfo {
+  string repo = 1;
+  string channel = 2;
+  PackageFormat format = 3;
+  int64 package_count = 4;
+  int64 total_bytes = 5;
 }

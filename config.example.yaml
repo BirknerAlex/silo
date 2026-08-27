@@ -1,30 +1,102 @@
-# Server config. Mount this at /etc/silo/config.yaml (or point SILO_CONFIG
-# at another path). Everything here is server-only — the CLI never sees
-# S3 credentials or the GPG key.
+# Silo server config. Mount at /etc/silo/config.yaml, or point SILO_CONFIG
+# elsewhere. Everything here is server-only — the CLI never sees object
+# storage credentials, signing keys, the database URL, or the token pepper.
+#
+# `${VAR}` and `${VAR:-default}` are expanded from the environment, so
+# secrets can be injected without being written into this file. An unset
+# variable with no default is a startup error, never an empty string.
 
 grpc_addr: "0.0.0.0:9090"
 http_addr: "0.0.0.0:8080"
 
+# Absolute URL clients reach this server on. Only npm strictly needs it
+# (packuments must embed absolute tarball URLs); when omitted it is derived
+# per request from Host / X-Forwarded-*, which is correct behind a normal
+# reverse proxy.
+# public_base_url: "https://silo.example.com"
+
+database:
+  url: "${SILO_DATABASE_URL:-postgres://silo:silo@localhost:5432/silo}"
+  max_connections: 10
+  # How long to keep retrying an unreachable database on startup. Generous
+  # because silo and its Postgres are routinely started together.
+  connect_timeout_seconds: 120
+
 storage:
   bucket: "silo"
   region: "us-east-1"
-  access_key_id: "minioadmin"
-  secret_access_key: "minioadmin"
-  # Omit for real AWS S3. Set for MinIO / any S3-compatible endpoint.
-  endpoint: "http://minio.internal:9000"
-  # Required when `endpoint` is not TLS (e.g. local MinIO over http://).
+  access_key_id: "siloadmin"
+  secret_access_key: "siloadmin"
+  # Omit for real AWS S3. Set for SeaweedFS or any S3-compatible endpoint.
+  endpoint: "http://seaweedfs:8333"
+  # Required when `endpoint` is not TLS (e.g. the local SeaweedFS in
+  # docker-compose.yaml, which speaks http://).
   allow_http: true
 
 auth:
-  publish_token: "change-me-publish-token"
-  read_token: "change-me-read-token"
+  # On the first start against an empty database, mint an admin token and
+  # an admin user and print them to stdout exactly once. Both are stored
+  # only as hashes and cannot be recovered afterwards.
+  bootstrap: true
+  bootstrap_token_name: "bootstrap-admin"
+  bootstrap_username: "admin"
 
-# Optional. Omit entirely to publish unsigned packages.
-gpg:
-  key_path: "/etc/silo/gpg-key.asc"
-  passphrase: "change-me-passphrase"
-  # Alternatively, inline the armored key instead of key_path:
-  # key: |
-  #   -----BEGIN PGP PRIVATE KEY BLOCK-----
-  #   ...
-  #   -----END PGP PRIVATE KEY BLOCK-----
+  # Mixed into every token hash and never stored in the database, so a
+  # database dump on its own yields no usable credentials. Generate with
+  # `openssl rand -hex 32`. Changing it invalidates every existing token.
+  # token_pepper: "${SILO_TOKEN_PEPPER}"
+
+  # Lifetime of the tokens `silo login` issues. 720h = 30 days.
+  session_ttl_hours: 720
+
+  # Let dnf/apk/npm read without a credential. Publishing always needs one.
+  # Off by default: a readable-by-anyone registry should be a decision.
+  allow_anonymous_read: false
+
+audit:
+  # Record every authenticated package download. Index fetches are never
+  # audited — `dnf makecache` across a fleet would bury the log.
+  log_downloads: true
+  # Entries older than this are pruned hourly. 0 disables pruning.
+  retention_days: 90
+
+metrics:
+  enabled: true
+  # Require a token for /metrics. Off by default because the endpoint
+  # exposes no package contents; turn it on if the HTTP port is reachable
+  # from outside the cluster.
+  require_auth: false
+
+# Optional single sign-on. The CLI runs the device authorization grant
+# directly against the provider, so the server never sees user credentials
+# and a client secret is not required for public clients.
+# oidc:
+#   issuer: "https://id.example.com"
+#   client_id: "silo"
+#   username_claim: "preferred_username"
+#   scopes: ["openid", "profile"]
+#   # Users with this value in `admin_claim` are provisioned as admins.
+#   admin_claim: "groups"
+#   admin_value: "silo-admins"
+#   # Disable local password login entirely once SSO is in place.
+#   exclusive: false
+
+# Optional. Both keys are independent; omit either to publish unsigned.
+# signing:
+#   # Signs RPM packages, and repomd.xml so `repo_gpgcheck=1` works.
+#   gpg:
+#     key_path: "/etc/silo/gpg-key.asc"
+#     passphrase: "${SILO_GPG_PASSPHRASE}"
+#     # Or inline the armored key instead of key_path:
+#     # key: |
+#     #   -----BEGIN PGP PRIVATE KEY BLOCK-----
+#     #   ...
+#
+#   # Signs APKINDEX.tar.gz. `key_name` must match the filename the
+#   # matching public key is deployed to under /etc/apk/keys on clients.
+#   # Generate a pair with `abuild-keygen -a -n`, or:
+#   #   openssl genrsa -out silo.rsa 2048
+#   #   openssl rsa -in silo.rsa -pubout -out silo.rsa.pub
+#   apk:
+#     key_path: "/etc/silo/apk-key.pem"
+#     key_name: "silo@example.com-1a2b3c4d.rsa.pub"

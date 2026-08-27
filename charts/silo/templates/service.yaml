@@ -4,10 +4,16 @@ metadata:
   name: {{ include "silo.fullname" . }}
   labels:
     {{- include "silo.labels" . | nindent 4 }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  # Where an external-dns annotation goes for a LoadBalancer Service, or a
+  # cloud provider's load-balancer settings.
+  {{- include "silo.annotations" (dict "ctx" . "extra" .Values.service.annotations) }}
 spec:
   type: {{ .Values.service.type }}
   selector:
-    {{- include "silo.labels" . | nindent 4 }}
+    {{- include "silo.selectorLabels" . | nindent 4 }}
   ports:
     - name: grpc
       port: {{ .Values.service.grpcPort }}

@@ -5,7 +5,7 @@ use bytes::Bytes;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{Attribute, Attributes, ObjectStore, PutOptions, PutPayload};
 
 use crate::config::StorageConfig;
 
@@ -67,11 +67,61 @@ impl Storage {
         Ok(())
     }
 
+    /// Writes an object with an explicit `Content-Type`.
+    ///
+    /// This matters for the objects clients fetch *directly* from S3 via a
+    /// presigned redirect: the server never sees those requests, so the
+    /// only chance to get the header right is at upload time. npm in
+    /// particular refuses a packument that doesn't come back as JSON.
+    pub async fn put_typed(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> anyhow::Result<()> {
+        let path = ObjectPath::from(key);
+        let mut attributes = Attributes::new();
+        attributes.insert(Attribute::ContentType, content_type.to_string().into());
+        self.store
+            .put_opts(
+                &path,
+                PutPayload::from_bytes(Bytes::from(bytes)),
+                PutOptions {
+                    attributes,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        let path = ObjectPath::from(key);
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let path = ObjectPath::from(key);
         match self.store.get(&path).await {
             Ok(result) => Ok(Some(result.bytes().await?.to_vec())),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether an object exists, without transferring it.
+    ///
+    /// A HEAD rather than a GET matters here: this is used to choose
+    /// between two candidate keys for a package that may be tens of
+    /// megabytes, and the loser would be downloaded for nothing.
+    pub async fn head(&self, key: &str) -> anyhow::Result<bool> {
+        let path = ObjectPath::from(key);
+        match self.store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
@@ -106,6 +156,34 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn put_typed_roundtrips_like_put() {
+        let storage = Storage::in_memory();
+        storage
+            .put_typed(
+                "r/c/npm/foo/packument.json",
+                b"{}".to_vec(),
+                "application/json",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get("r/c/npm/foo/packument.json").await.unwrap(),
+            Some(b"{}".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_an_object_and_tolerates_a_missing_one() {
+        let storage = Storage::in_memory();
+        storage.put("a/b.rpm", b"x".to_vec()).await.unwrap();
+        storage.delete("a/b.rpm").await.unwrap();
+        assert_eq!(storage.get("a/b.rpm").await.unwrap(), None);
+        // Deleting again must not error: index cleanup races with itself
+        // across replicas, and "already gone" is the desired end state.
+        storage.delete("a/b.rpm").await.unwrap();
+    }
 
     #[tokio::test]
     async fn put_get_roundtrip() {

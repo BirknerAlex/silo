@@ -1,0 +1,38 @@
+silo is starting up.
+
+{{- if .Values.postgres.enabled }}
+
+  NOTE: postgres.enabled=true deploys a single-replica Postgres with no
+  replication and no backups. It is for development and evaluation. For
+  production, point externalPostgres at a managed instance.
+{{- end }}
+
+{{- if .Values.config.auth.bootstrap }}
+
+  On the first start against an empty database, silo mints an admin token
+  and an admin user and prints them ONCE to the pod log. Grab them with:
+
+    kubectl logs -n {{ .Release.Namespace }} \
+      -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/name=silo \
+      | grep -A 12 'SILO BOOTSTRAP'
+{{- end }}
+
+Then point the CLI at the gRPC port:
+
+    kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "silo.fullname" . }} {{ .Values.service.grpcPort }}:{{ .Values.service.grpcPort }}
+    silo login --server http://localhost:{{ .Values.service.grpcPort }}
+
+Package managers use the HTTP port ({{ .Values.service.httpPort }}):
+
+    dnf   {{ .Values.config.publicBaseUrl | default "http://<host>" }}/<repo>/<channel>
+    apk   {{ .Values.config.publicBaseUrl | default "http://<host>" }}/<repo>/<channel>/apk/<arch>
+    npm   {{ .Values.config.publicBaseUrl | default "http://<host>" }}/<repo>/<channel>/npm
+
+{{- if not .Values.config.auth.tokenPepper }}
+{{- if not .Values.config.auth.tokenPepperExistingSecret }}
+
+  Consider setting config.auth.tokenPepper (openssl rand -hex 32). It is
+  mixed into token hashes and never stored in the database, so a database
+  dump on its own yields no usable credentials.
+{{- end }}
+{{- end }}
