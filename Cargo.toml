@@ -31,7 +31,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 object_store = { version = "0.11", features = ["aws"] }
-axum = "0.7"
+axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
 bytes = "1"
