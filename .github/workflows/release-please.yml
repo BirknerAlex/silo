@@ -60,4 +60,4 @@ jobs:
           TAG: ${{ steps.release.outputs.tag_name }}
         run: |
           echo "dispatching release.yml for $TAG"
-          gh workflow run release.yml -f tag="$TAG"
+          gh workflow run release.yml -f tag="$TAG" --repo "${{ github.repository }}"
