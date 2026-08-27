@@ -4,8 +4,9 @@ name: release
 # Nothing here decides a version — the tag already did.
 #
 # Publishes:
-#   * CLI binaries for linux/macOS, amd64 and arm64, attached to the
-#     GitHub release
+#   * CLI binaries attached to the GitHub release: linux and macOS for
+#     amd64 and arm64, Windows for amd64 only (there is no meaningful
+#     arm64 Windows demand for this CLI)
 #   * a multi-arch container image, to Docker Hub and GHCR
 #   * the Helm chart, to GHCR as an OCI artifact
 #   * the protobuf schemas, to the Buf Schema Registry
@@ -51,6 +52,8 @@ jobs:
             runner: macos-latest
           - target: aarch64-apple-darwin
             runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,6 +67,8 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install protobuf
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            choco install protoc -y
           else
             sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
           fi
@@ -89,12 +94,23 @@ jobs:
           VERSION="${{ inputs.tag || github.ref_name }}"
           NAME="silo-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/$NAME"
-          cp "target/${{ matrix.target }}/release/silo" "dist/$NAME/"
+          BIN="target/${{ matrix.target }}/release/silo"
+          [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ] && BIN="$BIN.exe"
+          cp "$BIN" "dist/$NAME/"
           cp README.md LICENSE "dist/$NAME/"
+          # tar rather than zip even for the Windows build: bsdtar ships in
+          # every image this matrix uses (Windows 10 1803+ included), so
+          # one archive format covers all three OSes with no extra tool.
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
           # A checksum per artifact rather than one combined file: each is
-          # verifiable on its own, without downloading the others.
-          (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          # verifiable on its own, without downloading the others. shasum
+          # is Perl and macOS-only; sha256sum (coreutils) is what Linux and
+          # Git Bash on Windows both ship instead.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          else
+            (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          fi
 
       - name: the binary reports the version it was tagged with
         shell: bash
@@ -106,7 +122,9 @@ jobs:
             echo "cross-built for x86_64 on arm64; skipping the run check"
             exit 0
           fi
-          reported=$("target/${{ matrix.target }}/release/silo" --version | awk '{print $2}')
+          BIN="target/${{ matrix.target }}/release/silo"
+          [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ] && BIN="$BIN.exe"
+          reported=$("$BIN" --version | awk '{print $2}')
           if [ "v$reported" != "$VERSION" ]; then
             echo "::error::binary reports $reported but the tag is $VERSION"
             exit 1
