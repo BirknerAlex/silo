@@ -1,0 +1,17 @@
+{
+  "name": "@silo-example/hello",
+  "version": "1.2.3",
+  "description": "A tiny package for silo's end-to-end tests",
+  "license": "MIT",
+  "main": "index.js",
+  "bin": {
+    "silo-hello": "index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BirknerAlex/silo"
+  },
+  "files": [
+    "index.js"
+  ]
+}

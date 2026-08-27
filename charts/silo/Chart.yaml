@@ -1,0 +1,24 @@
+apiVersion: v2
+name: silo
+description: Self-hosted package registry for RPM, Alpine APK, and npm
+type: application
+# One number for everything: the chart version, the app version and the
+# workspace's Cargo version are the same, and release-please bumps all
+# three together from the commit history. The `x-release-please-version`
+# markers are what it looks for. ci/check-chart.py asserts they have not
+# drifted.
+#
+# Not upgradable in place from 0.1.x: the hardcoded tokens are gone and a
+# database is now required.
+version: 0.2.0 # x-release-please-version
+appVersion: "0.2.0" # x-release-please-version
+home: https://github.com/BirknerAlex/silo
+sources:
+  - https://github.com/BirknerAlex/silo
+keywords:
+  - rpm
+  - apk
+  - alpine
+  - npm
+  - registry
+  - package-repository

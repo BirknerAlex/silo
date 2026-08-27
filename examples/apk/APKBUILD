@@ -1,0 +1,31 @@
+# Contributor: silo <silo@example.com>
+# Maintainer: silo <silo@example.com>
+#
+# A minimal APKBUILD. abuild builds this into a real .apk — control
+# segment, data segment, datahash and all — which is what silo's
+# end-to-end suite publishes and then installs with real apk-tools.
+pkgname=silo-hello
+pkgver=1.2.3
+pkgrel=0
+pkgdesc="A tiny package for silo's end-to-end tests"
+url="https://github.com/BirknerAlex/silo"
+# noarch, deliberately: apk-tools only ever fetches
+# $repo/$hostarch/APKINDEX.tar.gz, so a noarch package is only reachable
+# because silo lists it in every architecture's index and serves it from
+# every architecture's path. That is the case most likely to regress, so
+# the end-to-end suite covers it rather than the easy one.
+arch="noarch"
+license="MIT"
+# A real dependency, so the APKINDEX has a non-empty D: line to round-trip
+# and apk has something to actually resolve.
+depends="busybox"
+options="!check"
+
+package() {
+	install -d "$pkgdir"/usr/bin
+	cat > "$pkgdir"/usr/bin/silo-hello <<'SCRIPT'
+#!/bin/sh
+echo "hello from silo apk 1.2.3"
+SCRIPT
+	chmod 0755 "$pkgdir"/usr/bin/silo-hello
+}

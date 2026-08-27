@@ -1,0 +1,32 @@
+[package]
+name = "silo-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "silo"
+path = "src/main.rs"
+
+[dependencies]
+silo-proto = { path = "../silo-proto" }
+silo-pkg = { path = "../silo-pkg" }
+silo-core = { path = "../silo-core" }
+tokio.workspace = true
+tonic.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+chrono.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+tokio-stream = "0.1"
+shellexpand = "3"
+rpassword = "7"
+
+[dev-dependencies]
+tempfile.workspace = true
+silo-pkg = { path = "../silo-pkg", features = ["test-util"] }

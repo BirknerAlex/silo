@@ -1,0 +1,71 @@
+{
+  "name": "silo",
+  "dockerComposeFile": "docker-compose.yaml",
+  "service": "dev",
+  "workspaceFolder": "/workspace",
+
+  // The container is a plain Rust image plus a few tools; everything
+  // silo talks to (Postgres, SeaweedFS) is a sibling service in the
+  // compose file, which is the same shape as a real deployment.
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+
+  // Both are set here rather than in the compose file so they apply to
+  // every terminal the editor opens, not just to the entrypoint.
+  "remoteEnv": {
+    // Points the integration tests at the sibling Postgres. Without it
+    // they skip, which on a machine set up for development is a silent
+    // loss of most of the coverage.
+    "SILO_TEST_DATABASE_URL": "postgres://silo:silo@postgres:5432/silo",
+    "SILO_SERVER": "http://localhost:9090",
+    "SILO_CLIENT_CONFIG": "/workspace/.devcontainer/client.yaml",
+    "RUST_BACKTRACE": "1"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb",
+        "zxh404.vscode-proto3",
+        "ms-azuretools.vscode-docker",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        // The whole workspace needs the test-util feature to type-check,
+        // because the fixtures the tests use live behind it. Without this
+        // rust-analyzer reports errors in files that compile fine.
+        "rust-analyzer.cargo.features": [
+          "silo-core/test-util",
+          "silo-pkg/test-util"
+        ],
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.check.allTargets": true,
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      }
+    }
+  },
+
+  // Installs protoc, writes a server config, and warms the build cache so
+  // the first `cargo test` isn't a ten-minute surprise. Postgres and the
+  // bucket are already up: the compose file makes this container wait for
+  // both before it starts.
+  "postCreateCommand": ".devcontainer/setup.sh",
+
+  "forwardPorts": [9090, 8080, 5432, 8333, 8888],
+  "portsAttributes": {
+    "9090": { "label": "silo gRPC" },
+    "8080": { "label": "silo HTTP (dnf/apk/npm)" },
+    "5432": { "label": "postgres" },
+    "8333": { "label": "seaweedfs S3 API" },
+    "8888": { "label": "seaweedfs filer UI" }
+  },
+
+  "remoteUser": "vscode"
+}

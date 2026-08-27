@@ -1,0 +1,15 @@
+# silo CLI config. Defaults to ~/.config/silo/client.yaml; override with
+# SILO_CLIENT_CONFIG or --config.
+#
+# `silo login` writes this file for you (with 0600 permissions), so you
+# rarely need to create it by hand.
+
+server_addr: "http://silo.internal:9090"
+
+# A single scoped token replaces the old publish_token/read_token pair.
+# What it can do — read vs write vs admin, which repos, when it expires —
+# is decided when the token is created, not by which field it sits in.
+#
+# In CI, set SILO_TOKEN in the environment instead; it takes precedence
+# over this file and avoids materializing a credential on disk.
+token: "silo_xxxxxxxxxxxx_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"

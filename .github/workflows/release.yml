@@ -1,0 +1,233 @@
+name: release
+
+# Everything a release publishes, driven by the tag release-please pushes.
+# Nothing here decides a version — the tag already did.
+#
+# Publishes:
+#   * CLI binaries for linux/macOS, amd64 and arm64, attached to the
+#     GitHub release
+#   * a multi-arch container image, to Docker Hub and GHCR
+#   * the Helm chart, to GHCR as an OCI artifact
+#   * the protobuf schemas, to the Buf Schema Registry
+#
+# Every job re-runs the end-to-end suite's ingredients implicitly by using
+# the same Dockerfile CI already exercised; nothing is built here that CI
+# has not already built on main.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  # For rebuilding a release whose publish step failed. The tag has
+  # already been cut, so this is safe to re-run.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.3.0)"
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: cli (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # gnu rather than musl for the x86_64 Linux build would tie the
+          # binary to the glibc of whatever built it. A CLI that people
+          # download and run on an unknown distro should not care.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # build.rs stamps the commit into the binary, so the checkout
+          # has to be a real git repository.
+          fetch-depth: 0
+
+      - name: Install protoc
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install protobuf
+          else
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: build
+        env:
+          # A reproducible build stamp: the same tag built twice produces
+          # the same binary rather than differing by a timestamp.
+          SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p silo-cli
+
+      - name: package
+        shell: bash
+        run: |
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          NAME="silo-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target }}/release/silo" "dist/$NAME/"
+          cp README.md LICENSE "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          # A checksum per artifact rather than one combined file: each is
+          # verifiable on its own, without downloading the others.
+          (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+
+      - name: the binary reports the version it was tagged with
+        shell: bash
+        run: |
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          # Only the native-arch Linux and macOS builds can run here; the
+          # cross-built one is checked by the job that matches its arch.
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+            echo "cross-built for x86_64 on arm64; skipping the run check"
+            exit 0
+          fi
+          reported=$("target/${{ matrix.target }}/release/silo" --version | awk '{print $2}')
+          if [ "v$reported" != "$VERSION" ]; then
+            echo "::error::binary reports $reported but the tag is $VERSION"
+            exit 1
+          fi
+          echo "silo $reported"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silo-${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  attach:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: attach binaries to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ inputs.tag || github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" --clobber
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Both registries, because Docker Hub's pull limits make GHCR
+          # the better default for a Kubernetes cluster.
+          images: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/silo
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # arm64 is not optional: it is what Graviton and Apple silicon
+          # clusters run, and QEMU-emulating a Rust build is slow enough
+          # that it has to happen here rather than on someone's machine.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: azure/setup-helm@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: the chart version matches the tag
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          CHART=$(grep '^version:' charts/silo/Chart.yaml | awk '{print $2}')
+          if [ "v$CHART" != "$TAG" ]; then
+            echo "::error::chart version $CHART does not match tag $TAG"
+            exit 1
+          fi
+
+      - name: Package and push chart
+        run: |
+          helm package charts/silo -d .cr-release-packages
+          # OCI references must be lowercase; the org name is not
+          # guaranteed to be.
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          helm push .cr-release-packages/silo-*.tgz "oci://ghcr.io/$owner/charts"
+
+  protos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: bufbuild/buf-action@v1
+        with:
+          token: ${{ secrets.BUF_TOKEN }}
+          input: proto
+          push: true
+          # There is no pull request on a tag build, but the action would
+          # still try; saying so keeps it from needing a permission this
+          # job has no other use for.
+          pr_comment: false

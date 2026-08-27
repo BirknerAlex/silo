@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package silo.v1;
+
+option go_package = "github.com/BirknerAlex/silo/gen/go/silo/v1;silov1";
+
+// AuthService turns a human identity into a token the rest of the API
+// accepts. It is the only service with unauthenticated methods.
+service AuthService {
+  // Describes how this server expects users to sign in, so the CLI can
+  // pick between prompting for a password and running the OIDC device
+  // flow without being told which to use.
+  rpc GetAuthInfo(GetAuthInfoRequest) returns (GetAuthInfoResponse);
+
+  // Exchanges a username/password for a session token. Rejected when the
+  // server is configured for exclusive OIDC.
+  rpc Login(LoginRequest) returns (LoginResponse);
+
+  // Exchanges an OIDC ID token — obtained by the client through the device
+  // authorization grant, so the server never handles the user's
+  // credentials — for a session token.
+  rpc LoginOidc(LoginOidcRequest) returns (LoginOidcResponse);
+
+  // Reports what the presented credential can do. Used by `silo whoami`.
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+
+  // Reports the server's version and build provenance. Unauthenticated,
+  // and deliberately so: `silo version` has to work before a credential
+  // exists, and version skew between a CLI and a server is one of the
+  // first things to check when something behaves unexpectedly.
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+}
+
+message GetVersionRequest {}
+
+message GetVersionResponse {
+  // Semver, e.g. "0.2.0".
+  string version = 1;
+  // Short git commit, with a "-dirty" suffix when the worktree was not
+  // clean. "unknown" when the binary was built outside a git checkout.
+  string commit = 2;
+  // RFC 3339 timestamp, or a SOURCE_DATE_EPOCH value for reproducible
+  // builds.
+  string built_at = 3;
+  // Package formats this server can accept and index, e.g.
+  // ["rpm", "apk", "npm"]. Lets a client fail a publish early rather than
+  // discovering mid-upload that the server is too old to understand the
+  // format.
+  repeated string formats = 4;
+}
+
+message GetAuthInfoRequest {}
+
+message GetAuthInfoResponse {
+  bool password_login_enabled = 1;
+  bool oidc_enabled = 2;
+  // Everything the client needs to run the device flow itself.
+  string oidc_issuer = 3;
+  string oidc_client_id = 4;
+  repeated string oidc_scopes = 5;
+  string oidc_device_authorization_endpoint = 6;
+  string oidc_token_endpoint = 7;
+  bool anonymous_read_enabled = 8;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginOidcRequest {
+  string id_token = 1;
+}
+
+message LoginResponse {
+  // The full token string. This is the only time it is transmitted.
+  string token = 1;
+  string username = 2;
+  bool is_admin = 3;
+  // Unix seconds.
+  int64 expires_at = 4;
+}
+
+// Identical to LoginResponse today, and deliberately a separate message: the
+// two flows have different things they might later need to report back —
+// LoginOidc has an identity provider behind it and Login does not — and a
+// shared message could not grow a field for one without imposing it on the
+// other.
+message LoginOidcResponse {
+  string token = 1;
+  string username = 2;
+  bool is_admin = 3;
+  // Unix seconds.
+  int64 expires_at = 4;
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIResponse {
+  string token_name = 1;
+  string username = 2;
+  // "read", "write", or "admin".
+  string permission = 3;
+  // Empty when the token is scoped to all repos.
+  repeated string repos = 4;
+  bool all_repos = 5;
+  // 0 when the token never expires.
+  int64 expires_at = 6;
+  bool is_admin = 7;
+}
