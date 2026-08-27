@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0](https://github.com/BirknerAlex/silo/compare/v0.3.0...v0.4.0) (2026-08-27)
+
+
+### Features
+
+* **ci:** build a Windows CLI binary and fix the release dispatch ([41ecb7c](https://github.com/BirknerAlex/silo/commit/41ecb7c777df6c6e2357fce65252e541328fc13d))
+
+
+### Bug fixes
+
+* **ci:** use a real Unix epoch for SOURCE_DATE_EPOCH ([ee2357c](https://github.com/BirknerAlex/silo/commit/ee2357cf8047dc95fd86e46dc9be77719ce35469))
+
+
+### Documentation
+
+* **ci:** correct the release-please strategy comment ([0c0ac73](https://github.com/BirknerAlex/silo/commit/0c0ac7383af1309dfdfb8f5fcda73469922c35f5))
+
 ## [0.3.0](https://github.com/BirknerAlex/silo/compare/v0.2.0...v0.3.0) (2026-08-27)
 
 
