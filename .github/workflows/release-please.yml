@@ -18,6 +18,11 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+# These are a ceiling, not a grant: the repository's own Actions setting
+# (Settings -> Actions -> General -> Workflow permissions) has to allow
+# read *and* write, and allow Actions to create pull requests. Left at the
+# read-only default, this job fails on the API call rather than on
+# anything in the config below.
 permissions:
   contents: write
   pull-requests: write
@@ -31,10 +36,12 @@ jobs:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
-          # `rust` understands a Cargo workspace: it bumps
-          # `[workspace.package] version` and re-resolves Cargo.lock, which
-          # is what keeps `silo_core::VERSION` — and therefore every
-          # surface that reports a version — correct.
+          # The config uses `release-type: simple` with explicit
+          # `extra-files` rather than `rust`. `rust` looks like the right
+          # choice and is not: it applies a `[package]` updater to the root
+          # Cargo.toml, which here is a virtual workspace with no
+          # `[package]` section, and the whole run fails. See
+          # .release-please-config.json and AGENTS.md.
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json
 
