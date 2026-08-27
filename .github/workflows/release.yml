@@ -82,11 +82,17 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: build
-        env:
+        shell: bash
+        run: |
           # A reproducible build stamp: the same tag built twice produces
-          # the same binary rather than differing by a timestamp.
-          SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
-        run: cargo build --release --locked --target ${{ matrix.target }} -p silo-cli
+          # the same binary rather than differing by a timestamp. Derived
+          # from the built commit itself, as a plain Unix epoch integer —
+          # `github.event.repository.pushed_at` is an ISO 8601 string in
+          # this event context (and workflow_dispatch reruns have no push
+          # event at all), and cc/ring reject anything but a decimal int.
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          cargo build --release --locked --target ${{ matrix.target }} -p silo-cli
 
       - name: package
         shell: bash
