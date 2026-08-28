@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0](https://github.com/BirknerAlex/silo/compare/v0.4.2...v0.5.0) (2026-08-28)
+
+
+### Features
+
+* **server:** serve gRPC and HTTP on one port ([0ef6663](https://github.com/BirknerAlex/silo/commit/0ef6663bee151ecf79515397c525e6612b8233a6))
+
+
+### Bug fixes
+
+* **ci:** build release image binaries natively instead of under QEMU ([980296e](https://github.com/BirknerAlex/silo/commit/980296eb4b94e8a21b19645f100ae064ce4461c7))
+
 ## [0.4.2](https://github.com/BirknerAlex/silo/compare/v0.4.1...v0.4.2) (2026-08-28)
 
 
