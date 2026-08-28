@@ -31,7 +31,7 @@ use silo_proto::v1::{
     RebuildIndexRequest, RevokeTokenRequest, SetUserDisabledRequest, SetUserPasswordRequest,
     TokenScope, WhoAmIRequest,
 };
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 
 const DEFAULT_CONFIG: &str = "~/.config/silo/client.yaml";
 
@@ -326,19 +326,28 @@ fn resolve_addr(config: &ClientConfig, override_addr: Option<&str>) -> anyhow::R
 
 /// Adds a scheme when the user omitted one. `host:9090` is what people
 /// type; tonic requires a full URI and its error for a bare authority is
-/// not self-explanatory.
+/// not self-explanatory. Defaults to `https://` since that's what every
+/// real deployment (including `SILO_SERVER` in CI) actually uses.
 fn normalize_addr(addr: &str) -> String {
     let addr = addr.trim().trim_end_matches('/');
     if addr.contains("://") {
         addr.to_string()
     } else {
-        format!("http://{addr}")
+        format!("https://{addr}")
     }
 }
 
 async fn connect(addr: &str) -> anyhow::Result<Channel> {
-    Channel::from_shared(addr.to_string())
-        .map_err(|e| anyhow::anyhow!("`{addr}` is not a valid server address: {e}"))?
+    let endpoint = Channel::from_shared(addr.to_string())
+        .map_err(|e| anyhow::anyhow!("`{addr}` is not a valid server address: {e}"))?;
+    let endpoint = if addr.starts_with("https://") {
+        endpoint
+            .tls_config(ClientTlsConfig::new().with_webpki_roots())
+            .map_err(|e| anyhow::anyhow!("failed to configure TLS for {addr}: {e}"))?
+    } else {
+        endpoint
+    };
+    endpoint
         .connect()
         .await
         .map_err(|e| anyhow::anyhow!("failed to connect to {addr}: {e}"))
@@ -1314,7 +1323,7 @@ mod tests {
     fn bare_host_ports_get_a_scheme() {
         assert_eq!(
             normalize_addr("silo.internal:9090"),
-            "http://silo.internal:9090"
+            "https://silo.internal:9090"
         );
         assert_eq!(
             normalize_addr("https://silo.example.com"),
@@ -1324,7 +1333,7 @@ mod tests {
             normalize_addr("http://silo.internal:9090/"),
             "http://silo.internal:9090"
         );
-        assert_eq!(normalize_addr("  silo:9090  "), "http://silo:9090");
+        assert_eq!(normalize_addr("  silo:9090  "), "https://silo:9090");
     }
 
     #[test]
@@ -1335,7 +1344,7 @@ mod tests {
         };
         assert_eq!(
             resolve_addr(&config, Some("override:1234")).unwrap(),
-            "http://override:1234"
+            "https://override:1234"
         );
         assert_eq!(
             resolve_addr(&config, None).unwrap(),
