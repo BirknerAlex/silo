@@ -1,0 +1,27 @@
+FROM debian:bookworm-slim
+# Set by buildx per platform in the multi-arch build (linux/amd64,
+# linux/arm64). The binaries below are built natively on a matching
+# runner for each — see the image-binaries job in release.yml — so this
+# stage never runs a QEMU-emulated cargo build; it only copies a file.
+ARG TARGETPLATFORM
+
+# ca-certificates is the only runtime dependency: outbound TLS to S3 and to
+# the OIDC issuer. All three index formats — repodata, APKINDEX, packuments
+# — are generated in-process, so there is no package tooling to install.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ${TARGETPLATFORM}/silo-server /usr/local/bin/silo-server
+# The CLI ships in the same image so `kubectl exec` can manage tokens and
+# users without a second image or a local install.
+COPY ${TARGETPLATFORM}/silo /usr/local/bin/silo
+
+# Runs unprivileged, and with nothing to write to: index generation is
+# entirely in-memory, and everything durable lives in object storage and
+# Postgres.
+RUN useradd --system --uid 10001 --create-home silo
+USER 10001
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/silo-server"]
