@@ -465,7 +465,7 @@ selector still matches the pods it is supposed to.
 plus `ca-certificates`, running as an unprivileged user with nothing on
 disk to write to. The `silo` CLI ships
 in the same image, so `kubectl exec` can manage tokens without a second
-image. Published to Docker Hub as `birkneralex/silo`.
+image. Published to Docker Hub as `tyrola/silo`.
 
 ### Migrations
 
