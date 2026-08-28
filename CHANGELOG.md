@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/BirknerAlex/silo/compare/v0.5.0...v0.5.1) (2026-08-28)
+
+
+### Bug fixes
+
+* **docker:** ensure copied binaries are executable ([e745eeb](https://github.com/BirknerAlex/silo/commit/e745eebac19a00e20ff5f115871c65cbe067abaf))
+
 ## [0.5.0](https://github.com/BirknerAlex/silo/compare/v0.4.2...v0.5.0) (2026-08-28)
 
 
