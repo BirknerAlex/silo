@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/BirknerAlex/silo/compare/v0.4.0...v0.4.1) (2026-08-28)
+
+
+### Bug fixes
+
+* **ci:** tag the released image with its version, not just latest ([614c6a5](https://github.com/BirknerAlex/silo/commit/614c6a5629f106b7fdba2a89830e24debcde44ec))
+
 ## [0.4.0](https://github.com/BirknerAlex/silo/compare/v0.3.0...v0.4.0) (2026-08-27)
 
 
