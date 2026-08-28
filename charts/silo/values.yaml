@@ -9,7 +9,7 @@
 replicaCount: 1
 
 image:
-  repository: birkneralex/silo
+  repository: tyrola/silo
   # Defaults to the chart's appVersion, so `helm upgrade` to a new chart
   # version moves the image with it. Override to pin, or to track `latest`.
   tag: ""
