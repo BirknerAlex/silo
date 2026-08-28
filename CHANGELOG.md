@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/BirknerAlex/silo/compare/v0.4.1...v0.4.2) (2026-08-28)
+
+
+### Bug fixes
+
+* **chart:** default image.repository to the real Docker Hub org ([bfcce74](https://github.com/BirknerAlex/silo/commit/bfcce74c48ca677c12564f6ca9ad379a05357f21))
+
 ## [0.4.1](https://github.com/BirknerAlex/silo/compare/v0.4.0...v0.4.1) (2026-08-28)
 
 
