@@ -183,6 +183,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: version
+        id: version
+        shell: bash
+        run: |
+          # docker/metadata-action's type=semver tags read the git ref,
+          # not the commit — they need GITHUB_REF to be refs/tags/vX.Y.Z.
+          # This job only ever runs via workflow_dispatch (release-please
+          # dispatches it because a GITHUB_TOKEN-pushed tag cannot trigger
+          # a workflow itself), where GITHUB_REF is refs/heads/main. So
+          # type=semver silently matched nothing and every push only ever
+          # got tagged `latest`. Computing the version ourselves and using
+          # type=raw sidesteps the ref-detection entirely.
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${VERSION%.*}" >> "$GITHUB_OUTPUT"
+
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -193,8 +210,8 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/silo
             ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.major_minor }}
             type=raw,value=latest
 
       - name: Build and push
