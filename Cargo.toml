@@ -19,7 +19,7 @@ members = [
 # configured with `release-type: simple` and explicit `extra-files` rather
 # than `rust`: the Rust strategy applies a `[package]` updater to this
 # file, and this file is a virtual workspace root with no `[package]`.
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/BirknerAlex/silo"
