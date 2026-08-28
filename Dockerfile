@@ -15,10 +15,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /build/target/release/silo-server /usr/local/bin/silo-server
+COPY --from=build --chmod=755 /build/target/release/silo-server /usr/local/bin/silo-server
 # The CLI ships in the same image so `kubectl exec` can manage tokens and
 # users without a second image or a local install.
-COPY --from=build /build/target/release/silo /usr/local/bin/silo
+COPY --from=build --chmod=755 /build/target/release/silo /usr/local/bin/silo
 
 # Runs unprivileged, and with nothing to write to: index generation is
 # entirely in-memory, and everything durable lives in object storage and
