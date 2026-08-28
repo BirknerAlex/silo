@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/BirknerAlex/silo/compare/v0.5.1...v0.5.2) (2026-08-28)
+
+
+### Bug fixes
+
+* **ci:** scope release artifact download to silo-* binaries ([4cbc4a3](https://github.com/BirknerAlex/silo/commit/4cbc4a30dc67fe273e7f995fd2278743e5663adb))
+
 ## [0.5.1](https://github.com/BirknerAlex/silo/compare/v0.5.0...v0.5.1) (2026-08-28)
 
 
