@@ -79,7 +79,6 @@ def database_modes() -> None:
 EVERYTHING = [
     "--set", "postgres.enabled=true",
     "--set", "ingress.enabled=true",
-    "--set", "ingress.grpc.enabled=true",
     "--set", "serviceMonitor.enabled=true",
     "--set", r"serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:test",
     "--set", "commonLabels.team=platform",
@@ -102,9 +101,10 @@ def every_optional_feature() -> None:
     for expected in ("Deployment", "Service", "Ingress", "ServiceAccount",
                      "ServiceMonitor", "StatefulSet", "Secret"):
         assert expected in kinds, f"{expected} was not rendered: {kinds}"
-    # Two Ingresses: the dnf/apk/npm surface and the gRPC one, which cannot
-    # share an object because the HTTP/2-to-backend annotation is per-Ingress.
-    assert kinds.count("Ingress") == 2, kinds
+    # One Ingress covers both gRPC and HTTP: they share a Service port and
+    # silo dispatches between them itself, so the controller only needs to
+    # speak real HTTP/2 to the backend, not understand gRPC specifically.
+    assert kinds.count("Ingress") == 1, kinds
 
 
 def common_metadata_reaches_everything() -> None:
@@ -216,8 +216,7 @@ def a_hand_written_config_needs_nothing_else() -> None:
     shape none of the other checks here would notice."""
     override = textwrap.dedent(
         """\
-        grpc_addr: "0.0.0.0:9090"
-        http_addr: "0.0.0.0:8080"
+        addr: "0.0.0.0:8080"
         database:
           url: "postgres://silo:silo@my-own-pg:5432/silo"
         storage:

@@ -1,9 +1,9 @@
 {{- if .Values.ingress.enabled }}
-# Only the HTTP surface (dnf/apk/npm) is templated here. gRPC needs an
-# ingress with HTTP/2 to the backend and controller-specific annotations,
-# which vary too much between controllers to guess at — set
-# `ingress.grpc.enabled` for a second Ingress you supply the annotations
-# for, or expose it with a Service of type LoadBalancer.
+# One Ingress for both gRPC (the `silo` CLI) and HTTP (dnf/apk/npm): they
+# share a Service port, and silo dispatches between them itself, so the
+# controller only needs to speak real HTTP/2 to the backend rather than
+# understanding gRPC. See the comment on `ingress` in values.yaml for how
+# to get that out of your controller.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -37,50 +37,6 @@ spec:
                 name: {{ include "silo.fullname" $ }}
                 port:
                   name: http
-          {{- end }}
-    {{- end }}
-{{- end }}
-
-{{- if .Values.ingress.grpc.enabled }}
----
-# A separate Ingress for the gRPC port, because the two cannot share one:
-# the annotation that tells a controller to speak HTTP/2 to the backend is
-# per-Ingress, and turning it on for the dnf/apk/npm surface would break
-# it. The annotations are left entirely to the operator — every controller
-# spells this differently (`nginx.ingress.kubernetes.io/backend-protocol:
-# GRPC`, `traefik.ingress.kubernetes.io/service.serversscheme: h2c`, ...)
-# and guessing wrong fails in a way that is tedious to diagnose.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: {{ include "silo.fullname" . }}-grpc
-  labels:
-    {{- include "silo.labels" . | nindent 4 }}
-    {{- with .Values.ingress.grpc.labels }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-  {{- include "silo.annotations" (dict "ctx" . "extra" .Values.ingress.grpc.annotations) }}
-spec:
-  {{- with (.Values.ingress.grpc.className | default .Values.ingress.className) }}
-  ingressClassName: {{ . }}
-  {{- end }}
-  {{- with .Values.ingress.grpc.tls }}
-  tls:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  rules:
-    {{- range .Values.ingress.grpc.hosts }}
-    - host: {{ .host | quote }}
-      http:
-        paths:
-          {{- range .paths }}
-          - path: {{ .path }}
-            pathType: {{ .pathType }}
-            backend:
-              service:
-                name: {{ include "silo.fullname" $ }}
-                port:
-                  name: grpc
           {{- end }}
     {{- end }}
 {{- end }}

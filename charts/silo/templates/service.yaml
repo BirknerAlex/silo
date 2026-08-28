@@ -15,9 +15,6 @@ spec:
   selector:
     {{- include "silo.selectorLabels" . | nindent 4 }}
   ports:
-    - name: grpc
-      port: {{ .Values.service.grpcPort }}
-      targetPort: grpc
     - name: http
-      port: {{ .Values.service.httpPort }}
+      port: {{ .Values.service.port }}
       targetPort: http

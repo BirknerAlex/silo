@@ -52,8 +52,9 @@ serviceAccount:
 
 service:
   type: ClusterIP
-  grpcPort: 9090
-  httpPort: 8080
+  # gRPC and HTTP share this port; silo dispatches by path and by
+  # per-connection protocol sniffing, not by a separate port.
+  port: 8080
   labels: {}
   # e.g. external-dns.alpha.kubernetes.io/hostname, or a cloud
   # load-balancer class, when type is LoadBalancer.
@@ -229,8 +230,31 @@ serviceMonitor:
   annotations: {}
 
 ingress:
-  # The HTTP surface: dnf, apk and npm. This is the one most deployments
-  # need — the gRPC port below is only used by the `silo` CLI.
+  # One Ingress for everything: gRPC (the `silo` CLI) and HTTP (dnf, apk,
+  # npm) share the same Service port, and silo dispatches between them by
+  # path and by per-connection protocol detection, not by anything the
+  # ingress needs to understand. All the controller has to do is speak
+  # real HTTP/2 to the backend rather than downgrading to HTTP/1.1 — no
+  # gRPC-aware proxying required.
+  #
+  # Traefik does this by default: point it at the Service with
+  #   traefik.ingress.kubernetes.io/service.serversscheme: h2c
+  # and it forwards HTTP/2 frames as-is, gRPC or not. We recommend Traefik
+  # for this reason.
+  #
+  # nginx can also do it, but only via plain `proxy_pass` with
+  # `proxy_http_version 2`, which nginx open source has only supported
+  # since 1.29.4 (December 2025) — earlier versions could speak HTTP/2 to
+  # a backend solely through the gRPC-specific `grpc_pass` module, which
+  # cannot carry the dnf/apk/npm traffic and would need a second Ingress.
+  # If your ingress-nginx build doesn't yet expose `proxy_http_version 2`
+  # through an annotation, force it with a snippet:
+  #   nginx.ingress.kubernetes.io/configuration-snippet: |
+  #     proxy_http_version 2;
+  # If you're stuck on an older nginx and can't take the snippet, switch
+  # ingress controllers — nginx's gRPC story here is effectively
+  # deprecated in favor of controllers (Traefik, and others built on
+  # generic HTTP/2 proxying) that never needed the special case.
   enabled: false
   className: ""
   labels: {}
@@ -247,25 +271,3 @@ ingress:
   # e.g. [{secretName: silo-tls, hosts: [silo.example.com]}]. With
   # cert-manager, naming a secret here is what triggers issuance.
   tls: []
-
-  # A second Ingress for the gRPC port. Separate because the annotation
-  # that makes a controller speak HTTP/2 to the backend is per-Ingress, and
-  # applying it to the dnf/apk/npm surface would break it.
-  #
-  # No annotations are guessed at: every controller spells this
-  # differently. nginx wants
-  #   nginx.ingress.kubernetes.io/backend-protocol: GRPC
-  # Traefik wants
-  #   traefik.ingress.kubernetes.io/service.serversscheme: h2c
-  grpc:
-    enabled: false
-    # Falls back to ingress.className when empty.
-    className: ""
-    labels: {}
-    annotations: {}
-    hosts:
-      - host: silo-grpc.example.com
-        paths:
-          - path: /
-            pathType: Prefix
-    tls: []

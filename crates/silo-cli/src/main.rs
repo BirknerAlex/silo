@@ -97,7 +97,7 @@ enum Command {
 
 #[derive(Args)]
 struct LoginArgs {
-    /// Server address, e.g. `http://silo.internal:9090`. Required the
+    /// Server address, e.g. `http://silo.internal:8080`. Required the
     /// first time; remembered afterwards.
     #[arg(long)]
     server: Option<String>,

@@ -17,12 +17,12 @@ silo is starting up.
       | grep -A 12 'SILO BOOTSTRAP'
 {{- end }}
 
-Then point the CLI at the gRPC port:
+Then point the CLI at it:
 
-    kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "silo.fullname" . }} {{ .Values.service.grpcPort }}:{{ .Values.service.grpcPort }}
-    silo login --server http://localhost:{{ .Values.service.grpcPort }}
+    kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "silo.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+    silo login --server http://localhost:{{ .Values.service.port }}
 
-Package managers use the HTTP port ({{ .Values.service.httpPort }}):
+Package managers use the same port ({{ .Values.service.port }}):
 
     dnf   {{ .Values.config.publicBaseUrl | default "http://<host>" }}/<repo>/<channel>
     apk   {{ .Values.config.publicBaseUrl | default "http://<host>" }}/<repo>/<channel>/apk/<arch>

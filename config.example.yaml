@@ -6,8 +6,10 @@
 # secrets can be injected without being written into this file. An unset
 # variable with no default is a startup error, never an empty string.
 
-grpc_addr: "0.0.0.0:9090"
-http_addr: "0.0.0.0:8080"
+# gRPC and HTTP both listen here — the port is shared, with requests
+# dispatched by path (gRPC methods live under their fully-qualified
+# service name) and by protocol (HTTP/1.1 vs h2c), not by a separate port.
+addr: "0.0.0.0:8080"
 
 # Absolute URL clients reach this server on. Only npm strictly needs it
 # (packuments must embed absolute tarball URLs); when omitted it is derived
@@ -63,8 +65,8 @@ audit:
 metrics:
   enabled: true
   # Require a token for /metrics. Off by default because the endpoint
-  # exposes no package contents; turn it on if the HTTP port is reachable
-  # from outside the cluster.
+  # exposes no package contents; turn it on if the port is reachable from
+  # outside the cluster.
   require_auth: false
 
 # Optional single sign-on. The CLI runs the device authorization grant

@@ -31,17 +31,15 @@ PROJECT=silo-e2e
 WORK=${WORK:-$ROOT/target/e2e}
 COMPOSE="docker compose -f ci/e2e/docker-compose.yaml -p $PROJECT"
 
-# The host ports the stack binds. Deliberately not 8080/9090: a developer
-# running this locally very likely has something on those already.
+# The host port the stack binds. Deliberately not 8080: a developer
+# running this locally very likely has something on that already.
 HTTP_PORT=18190
-GRPC_PORT=19190
 
 # Exported before anything can fail, because the EXIT trap runs
 # `docker compose down` and compose refuses to parse its own file with
 # these unset.
 export SILO_E2E_CONFIG_DIR="$WORK/config"
 export SILO_E2E_HTTP_PORT="$HTTP_PORT"
-export SILO_E2E_GRPC_PORT="$GRPC_PORT"
 
 REPO=example
 CHANNEL=stable
@@ -54,7 +52,7 @@ cleanup() {
     local status=$?
     if [ -n "${KEEP:-}" ]; then
         printf '\nKEEP is set; leaving the stack up.\n'
-        printf '  http  http://localhost:%s\n  grpc  http://localhost:%s\n' "$HTTP_PORT" "$GRPC_PORT"
+        printf '  silo  http://localhost:%s  (gRPC and HTTP share the port)\n' "$HTTP_PORT"
         printf '  tear down with: %s down -v\n' "$COMPOSE"
         return
     fi
@@ -163,8 +161,7 @@ mkdir -p "$WORK/config"
 cp "$WORK/keys/apk.pem" "$WORK/config/apk.pem"
 cp "$WORK/keys/gpg-private.asc" "$WORK/config/gpg-private.asc"
 cat > "$WORK/config/config.yaml" <<EOF
-grpc_addr: "0.0.0.0:9090"
-http_addr: "0.0.0.0:8080"
+addr: "0.0.0.0:8080"
 # npm packuments embed absolute tarball URLs, so the server has to know
 # the address the *client* reaches it on, not its own.
 public_base_url: "http://silo:8080"
@@ -240,14 +237,14 @@ silo() { $COMPOSE exec -T silo /usr/local/bin/silo "$@"; }
 # token on stdout, nothing written to disk.
 ADMIN_TOKEN=$($COMPOSE exec -T \
     -e SILO_USERNAME=admin -e "SILO_PASSWORD=$BOOTSTRAP_PASSWORD" \
-    silo /usr/local/bin/silo login --server http://localhost:9090 --print-token 2>/dev/null | tr -d '\r')
+    silo /usr/local/bin/silo login --server http://localhost:8080 --print-token 2>/dev/null | tr -d '\r')
 [ -n "$ADMIN_TOKEN" ] || fail "login produced no token"
 ok "logged in as admin"
 
 # A scoped write token, so publishing exercises the same permission path a
 # real CI job would rather than admin's blanket access.
 PUBLISH_TOKEN=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" silo \
-    /usr/local/bin/silo --server http://localhost:9090 \
+    /usr/local/bin/silo --server http://localhost:8080 \
     token create --name e2e-publisher --permission write --repo "$REPO" --json 2>/dev/null \
     | tr -d '\r' | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
 [ -n "$PUBLISH_TOKEN" ] || fail "token create produced no token"
@@ -255,7 +252,7 @@ ok "created a write token scoped to $REPO"
 
 # A read token for the package managers, which authenticate over HTTP.
 READ_TOKEN=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" silo \
-    /usr/local/bin/silo --server http://localhost:9090 \
+    /usr/local/bin/silo --server http://localhost:8080 \
     token create --name e2e-reader --permission read --repo "$REPO" --json 2>/dev/null \
     | tr -d '\r' | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
 [ -n "$READ_TOKEN" ] || fail "read token create produced no token"
@@ -270,7 +267,7 @@ docker cp "$WORK/packages/." "$($COMPOSE ps -q silo)":/tmp/packages/ 2>/dev/null
 
 publish() {
     local file=$1
-    $COMPOSE exec -T -e "SILO_TOKEN=$PUBLISH_TOKEN" -e SILO_SERVER=http://localhost:9090 silo \
+    $COMPOSE exec -T -e "SILO_TOKEN=$PUBLISH_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
         /usr/local/bin/silo publish "/tmp/packages/$file" --repo "$REPO" --channel "$CHANNEL"
 }
 
@@ -279,7 +276,7 @@ publish "$(basename "$APK_FILE")" | sed 's/^/    /'
 publish "$(basename "$NPM_FILE")" | sed 's/^/    /'
 
 # Three packages, three formats, all in one repo/channel.
-LISTED=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:9090 silo \
+LISTED=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
     /usr/local/bin/silo list --repo "$REPO" --channel "$CHANNEL" --json | tr -d '\r')
 for format in rpm apk npm; do
     echo "$LISTED" | grep -q "\"format\": \"$format\"" \
@@ -318,7 +315,7 @@ log "verifying index repair"
 # `silo index rebuild` is the documented recovery path after a bucket
 # restore. It has to produce an index good enough for a real client, not
 # just one that renders — so it is checked the same way as the rest.
-$COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:9090 silo \
+$COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
     /usr/local/bin/silo index rebuild --repo "$REPO" --channel "$CHANNEL" --format rpm \
     | sed 's/^/    /'
 verify "dnf (after an index rebuild)" fedora:41 verify-dnf.sh

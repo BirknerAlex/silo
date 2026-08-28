@@ -105,7 +105,7 @@ empty database, Silo mints an admin token and an admin user and prints
 them **once** — they're stored only as hashes.
 
 ```sh
-silo login --server http://localhost:9090
+silo login --server http://localhost:8080
 silo publish ./my-package-1.0.0-1.x86_64.rpm --repo myrepo --channel stable
 silo publish ./hello-1.0-r0.apk             --repo myrepo --channel edge
 silo publish ./widget-1.0.0.tgz             --repo myrepo --channel stable
@@ -226,7 +226,7 @@ outlives the job it belongs to.
 **An API token is the simplest option.** No login step at all:
 
 ```sh
-export SILO_SERVER=https://silo.example.com:9090
+export SILO_SERVER=https://silo.example.com:8080
 export SILO_TOKEN="$SILO_PUBLISH_TOKEN"     # from your CI secret store
 silo publish ./dist/mypkg-1.0.0-1.x86_64.rpm --repo myrepo --channel stable
 ```
@@ -239,7 +239,7 @@ than a standing token:
 
 ```sh
 export SILO_TOKEN=$(SILO_USERNAME=ci SILO_PASSWORD="$SILO_CI_PASSWORD" \
-  silo login --server https://silo.example.com:9090 --print-token)
+  silo login --server https://silo.example.com:8080 --print-token)
 ```
 
 `--print-token` writes only the token to stdout and nothing to disk;
@@ -290,7 +290,7 @@ are pruned hourly.
 
 ## Metrics
 
-Prometheus metrics on `/metrics` (HTTP port): publish counts and latency
+Prometheus metrics on `/metrics`: publish counts and latency
 by format, download counts split by redirect vs proxy, auth failures by
 reason, package counts and bytes per repo/channel/format, and a
 `silo_database_up` gauge. Labels are deliberately low-cardinality — no
@@ -401,38 +401,51 @@ string.
 
 #### Ingress
 
-Two, because they cannot be one. The dnf/apk/npm surface is plain HTTP;
-the CLI's gRPC port needs a controller configured to speak HTTP/2 to the
-backend, and that annotation is per-Ingress. Both are off by default.
+One Ingress covers both the CLI's gRPC calls and the dnf/apk/npm HTTP
+surface — they share a Service port, and silo tells them apart itself
+(by path, and by per-connection protocol detection), so the only thing
+the ingress controller needs to do is speak real HTTP/2 to the backend
+instead of downgrading to HTTP/1.1. Off by default.
 
 ```yaml
 ingress:
   enabled: true
-  className: nginx
+  className: traefik
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     external-dns.alpha.kubernetes.io/hostname: packages.example.com
+    traefik.ingress.kubernetes.io/service.serversscheme: h2c
   hosts:
     - host: packages.example.com
       paths: [{path: /, pathType: Prefix}]
   tls:
     - secretName: silo-tls
       hosts: [packages.example.com]
-
-  grpc:
-    enabled: true
-    annotations:
-      # nginx; Traefik wants
-      # traefik.ingress.kubernetes.io/service.serversscheme: h2c
-      nginx.ingress.kubernetes.io/backend-protocol: GRPC
-    hosts:
-      - host: silo.example.com
-        paths: [{path: /, pathType: Prefix}]
 ```
 
-No gRPC annotations are guessed at. Every controller spells this
-differently, and getting it wrong fails in a way that is tedious to
-diagnose.
+**Traefik** is what we recommend, and the annotation above is all it
+needs: `h2c` just tells Traefik to dial the backend over cleartext HTTP/2,
+and it forwards whatever it gets — gRPC or plain REST — without caring
+which.
+
+**nginx** can do the same thing, but only through plain `proxy_pass` with
+`proxy_http_version 2`, which nginx open source has supported only since
+**1.29.4** (December 2025). Earlier versions could reach a backend over
+HTTP/2 solely through the gRPC-specific `grpc_pass` module, which cannot
+carry the dnf/apk/npm traffic and would force a second Ingress back. If
+your ingress-nginx build doesn't expose `proxy_http_version 2` through a
+plain annotation yet, force it with a snippet:
+
+```yaml
+annotations:
+  nginx.ingress.kubernetes.io/configuration-snippet: |
+    proxy_http_version 2;
+```
+
+If you're stuck on an nginx older than 1.29.4 and can't take the snippet,
+we'd consider nginx's gRPC-to-backend story effectively deprecated here —
+switch controllers rather than reintroduce a second Ingress. Traefik
+(above) needs no version floor for this.
 
 #### Labels and annotations
 

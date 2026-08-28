@@ -74,7 +74,6 @@ services:
       # Published so the suite's own curl checks can reach it from the
       # host. The package-manager containers use the service name instead.
       - "${SILO_E2E_HTTP_PORT}:8080"
-      - "${SILO_E2E_GRPC_PORT}:9090"
     networks: [silo]
 
 networks:

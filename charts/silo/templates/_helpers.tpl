@@ -134,8 +134,7 @@ this entirely for setups that would rather hand-write the file.
 {{- if .Values.configOverride -}}
 {{ .Values.configOverride }}
 {{- else -}}
-grpc_addr: "0.0.0.0:{{ .Values.service.grpcPort }}"
-http_addr: "0.0.0.0:{{ .Values.service.httpPort }}"
+addr: "0.0.0.0:{{ .Values.service.port }}"
 {{- with .Values.config.publicBaseUrl }}
 public_base_url: {{ . | quote }}
 {{- end }}
