@@ -83,7 +83,6 @@ services:
       SILO_DATABASE_URL: postgres://silo:silo@postgres:5432/silo
       RUST_LOG: info
     ports:
-      - "9090:9090"
       - "8080:8080"
     volumes:
       - ./config.example.yaml:/etc/silo/config.yaml:ro

@@ -11,8 +11,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
-    pub grpc_addr: String,
-    pub http_addr: String,
+    /// The single address gRPC and HTTP both listen on. Requests are
+    /// dispatched by path, not by a separate port: gRPC methods live
+    /// under their fully-qualified service name (`/silo.v1.*`), which
+    /// never collides with the package-manager routes, and the
+    /// underlying connection is protocol-sniffed per request so HTTP/1.1
+    /// and h2c share one listener.
+    pub addr: String,
 
     /// Absolute URL clients reach this server on, e.g.
     /// `https://silo.example.com`. Only npm strictly needs it (packuments
@@ -458,8 +463,7 @@ mod tests {
     use super::*;
 
     const MINIMAL: &str = r#"
-grpc_addr: "0.0.0.0:9090"
-http_addr: "0.0.0.0:8080"
+addr: "0.0.0.0:8080"
 database:
   url: "postgres://silo:silo@localhost/silo"
 storage:
@@ -606,7 +610,7 @@ metrics:
 
     #[test]
     fn text_without_placeholders_passes_through_unchanged() {
-        let yaml = "grpc_addr: \"0.0.0.0:9090\"\npassword: \"has$dollar\"\n";
+        let yaml = "addr: \"0.0.0.0:8080\"\npassword: \"has$dollar\"\n";
         assert_eq!(expand_env_vars(yaml).unwrap(), yaml);
         // An unterminated placeholder is literal text, not a parse error.
         assert_eq!(expand_env_vars("cost: ${100").unwrap(), "cost: ${100");

@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::{ConnectInfo, Request};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use clap::Parser;
 use silo_core::oidc::Verifier;
 use silo_core::{Config, PublishContext, Signers, Storage};
@@ -66,8 +69,7 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let grpc_addr: SocketAddr = config.grpc_addr.parse()?;
-    let http_addr = config.http_addr.clone();
+    let addr = config.addr.clone();
 
     let state = Arc::new(AppState {
         publish: PublishContext {
@@ -83,7 +85,15 @@ async fn main() -> anyhow::Result<()> {
         metrics: Metrics::new()?,
     });
 
-    let grpc_server = tonic::transport::Server::builder()
+    // gRPC and the package-manager HTTP surface share one listener. They
+    // never collide on path (gRPC methods live under their
+    // fully-qualified service name, e.g. `/silo.v1.PublishService/*`,
+    // which no HTTP route shape matches) or on protocol (hyper's
+    // connection builder sniffs the HTTP/2 client preface per connection,
+    // so plain HTTP/1.1 requests and prior-knowledge h2c gRPC calls are
+    // dispatched to the right stack automatically).
+    let mut grpc_routes = tonic::service::Routes::builder();
+    grpc_routes
         .add_service(PublishServiceServer::new(grpc::PublishServiceImpl {
             state: state.clone(),
         }))
@@ -95,30 +105,48 @@ async fn main() -> anyhow::Result<()> {
         }))
         .add_service(AdminServiceServer::new(admin::AdminServiceImpl {
             state: state.clone(),
-        }))
-        .serve(grpc_addr);
+        }));
+    let grpc_routes = grpc_routes.routes().into_axum_router();
 
-    let http_router = http::router(state.clone());
-    let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
+    let app = http::router(state.clone())
+        .merge(grpc_routes)
+        // gRPC handlers read the peer IP via `tonic::Request::remote_addr`,
+        // which looks for a `TcpConnectInfo` extension that tonic's own
+        // transport normally inserts. Serving through plain axum/hyper
+        // instead, this bridges it from the `ConnectInfo` extension that
+        // `into_make_service_with_connect_info` inserts below.
+        .layer(middleware::from_fn(inject_tcp_connect_info));
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     // `into_make_service_with_connect_info` is what makes the client IP
     // available to handlers, which the audit log records.
-    let http_server = axum::serve(
-        http_listener,
-        http_router.into_make_service_with_connect_info::<SocketAddr>(),
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
     );
 
     tokio::spawn(maintenance::run(state.clone()));
 
     tracing::info!(
         version = %silo_core::BuildInfo::current().short(),
-        grpc_addr = %grpc_addr,
-        http_addr = %http_addr,
+        addr = %addr,
         formats = "rpm,apk,npm",
         "silo-server starting"
     );
 
-    tokio::select! {
-        res = grpc_server => res.map_err(anyhow::Error::from),
-        res = http_server => res.map_err(anyhow::Error::from),
-    }
+    server.await.map_err(anyhow::Error::from)
+}
+
+async fn inject_tcp_connect_info(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    request
+        .extensions_mut()
+        .insert(tonic::transport::server::TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(addr),
+        });
+    next.run(request).await
 }

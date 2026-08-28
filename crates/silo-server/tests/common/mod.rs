@@ -84,8 +84,7 @@ impl Harness {
         .expect("connect to the test database");
 
         let mut config = Config {
-            grpc_addr: "127.0.0.1:0".into(),
-            http_addr: "127.0.0.1:0".into(),
+            addr: "127.0.0.1:0".into(),
             public_base_url: Some("https://silo.test".into()),
             database: DatabaseConfig {
                 url: url.to_string(),

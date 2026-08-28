@@ -4,7 +4,7 @@
 # `silo login` writes this file for you (with 0600 permissions), so you
 # rarely need to create it by hand.
 
-server_addr: "http://silo.internal:9090"
+server_addr: "http://silo.internal:8080"
 
 # One token covers everything this client does. What it can do — read vs
 # write vs admin, which repos, when it expires — is decided when the token

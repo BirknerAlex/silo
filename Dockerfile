@@ -26,5 +26,5 @@ COPY --from=build /build/target/release/silo /usr/local/bin/silo
 RUN useradd --system --uid 10001 --create-home silo
 USER 10001
 
-EXPOSE 9090 8080
+EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/silo-server"]

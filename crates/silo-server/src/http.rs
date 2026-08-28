@@ -604,8 +604,7 @@ pub(crate) mod tests {
     /// which take one.
     pub(crate) fn test_state_with(tweak: impl FnOnce(&mut Config)) -> AppState {
         let mut config = Config {
-            grpc_addr: "127.0.0.1:0".into(),
-            http_addr: "127.0.0.1:0".into(),
+            addr: "127.0.0.1:0".into(),
             public_base_url: None,
             database: DatabaseConfig {
                 url: "postgres://unused".into(),

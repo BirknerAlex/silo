@@ -54,10 +54,8 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           ports:
-            - name: grpc
-              containerPort: {{ .Values.service.grpcPort }}
             - name: http
-              containerPort: {{ .Values.service.httpPort }}
+              containerPort: {{ .Values.service.port }}
           env:
             - name: SILO_CONFIG
               value: /etc/silo/config.yaml
