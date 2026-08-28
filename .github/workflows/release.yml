@@ -159,13 +159,69 @@ jobs:
           gh release upload "${{ inputs.tag || github.ref_name }}" dist/* \
             --repo "${{ github.repository }}" --clobber
 
+  image-binaries:
+    name: image binaries (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: image-${{ matrix.target }}
+
+      - name: build
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          cargo build --release --locked --target ${{ matrix.target }} -p silo-server -p silo-cli
+
+      # Staged under linux/<arch> so it matches buildx's TARGETPLATFORM
+      # exactly, and Dockerfile.release can COPY it with no arch mapping.
+      - name: stage for the image build
+        run: |
+          mkdir -p "image-bin/linux/${{ matrix.arch }}"
+          cp target/${{ matrix.target }}/release/silo-server \
+             target/${{ matrix.target }}/release/silo \
+             "image-bin/linux/${{ matrix.arch }}/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-bin-${{ matrix.arch }}
+          path: image-bin
+
   image:
+    needs: image-binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-bin-*
+          path: image-ctx
+          merge-multiple: true
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -217,10 +273,13 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: image-ctx
+          file: Dockerfile.release
           # arm64 is not optional: it is what Graviton and Apple silicon
-          # clusters run, and QEMU-emulating a Rust build is slow enough
-          # that it has to happen here rather than on someone's machine.
+          # clusters run. Both binaries are cross-compiled natively by the
+          # image-binaries job above (real arm64/amd64 runners, no QEMU),
+          # so this step only copies a prebuilt binary into the image
+          # rather than compiling Rust under emulation.
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
