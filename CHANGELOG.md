@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/BirknerAlex/silo/compare/v0.5.2...v0.5.3) (2026-08-28)
+
+
+### Bug fixes
+
+* **cli:** support real TLS for https:// server addresses ([36a7275](https://github.com/BirknerAlex/silo/commit/36a72751ba1e12713a13cbba5772c44d30419ad0))
+
 ## [0.5.2](https://github.com/BirknerAlex/silo/compare/v0.5.1...v0.5.2) (2026-08-28)
 
 
