@@ -188,16 +188,21 @@ fn default_scopes() -> Vec<String> {
     vec!["openid".to_string(), "profile".to_string()]
 }
 
-/// Signing keys. Both are optional and independent: RPM package signatures
-/// and apk index signatures use different algorithms and different key
-/// material, and a registry may reasonably serve one signed and the other
-/// not.
+/// Signing keys. All are optional and independent: RPM package signatures,
+/// apk index signatures, and the pacman database signature use different
+/// algorithms and/or different key material, and a registry may reasonably
+/// serve some formats signed and others not.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SigningConfig {
     #[serde(default)]
     pub gpg: Option<GpgConfig>,
     #[serde(default)]
     pub apk: Option<ApkSigningConfig>,
+    /// Signs the pacman repo database. Deliberately its own `GpgConfig`
+    /// rather than reusing `gpg`, so RPM and pacman repos can be signed
+    /// with different keys.
+    #[serde(default)]
+    pub pacman: Option<GpgConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

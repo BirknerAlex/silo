@@ -1,6 +1,6 @@
 apiVersion: v2
 name: silo
-description: Self-hosted package registry for RPM, Alpine APK, and npm
+description: Self-hosted package registry for RPM, Alpine APK, npm, and pacman
 type: application
 # One number for everything: the chart version, the app version and the
 # workspace's Cargo version are the same, and release-please bumps all
@@ -17,5 +17,7 @@ keywords:
   - apk
   - alpine
   - npm
+  - pacman
+  - arch-linux
   - registry
   - package-repository

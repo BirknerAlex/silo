@@ -2,10 +2,11 @@
 
 <p align="center"><img src="https://raw.githubusercontent.com/BirknerAlex/silo/main/assets/silo-logo.png"/></p>
 
-Self-hosted package registry for **RPM**, **Alpine APK**, and **npm**.
-Publish over gRPC; `dnf`, `apk` and `npm` consume the results as real
-repositories over plain HTTP. Packages live in S3-compatible object
-storage, everything else lives in Postgres.
+Self-hosted package registry for **RPM**, **Alpine APK**, **npm**, and
+**pacman** (Arch Linux). Publish over gRPC; `dnf`, `apk`, `npm` and
+`pacman` consume the results as real repositories over plain HTTP.
+Packages live in S3-compatible object storage, everything else lives in
+Postgres.
 
 ## Why
 
@@ -19,7 +20,7 @@ interchangeable and horizontal scaling is just `replicaCount`.
 ```
 crates/
   silo-proto   generated tonic/prost code from proto/silo/v1
-  silo-pkg     the format seam: rpm | apk | npm parsing, layout, index rendering
+  silo-pkg     the format seam: rpm | apk | npm | pacman parsing, layout, index rendering
   silo-db      Postgres: package index, tokens, users, audit log, advisory locks
   silo-core    config, object storage, publish orchestration, signing, OIDC
   silo-server  gRPC (publish/read/auth/admin) + HTTP (package-manager-facing)
@@ -35,18 +36,19 @@ Nothing else in the codebase matches on which format it's handling.
 |---|---|---|
 | rpm | `{repo}/{ch}/Packages/{file}` | the whole channel |
 | apk | `{repo}/{ch}/apk/{arch}/{file}` | one architecture |
+| pacman | `{repo}/{ch}/pacman/{arch}/{file}` | one architecture |
 | npm | `{repo}/{ch}/npm/{name}/-/{file}` | one package name |
 
-The **index group** is what makes those three the same shape: a publish
+The **index group** is what makes those the same shape: a publish
 invalidates exactly one group, and a group is the unit that gets locked.
-Two apk architectures, or two npm packages, publish concurrently without
-ever contending.
+Two apk architectures, two pacman architectures, or two npm packages,
+publish concurrently without ever contending.
 
-apk has the one wrinkle: a `noarch` package belongs in *every*
-architecture's index, because apk-tools only ever fetches its own. So
-`noarch` is a group that other groups read from, and publishing into it
-rewrites them all — the single case where one publish touches more than
-one index.
+apk and pacman share one wrinkle: an architecture-independent package
+(`noarch` for apk, `any` for pacman) belongs in *every* architecture's
+index, because neither client ever fetches anywhere but its own. So that
+group is one other groups read from, and publishing into it rewrites them
+all — the one case where a single publish touches more than one index.
 
 **Every index is a pure function of the database.** Whatever a format's
 index needs beyond the common columns — APKINDEX records, an npm
@@ -89,9 +91,13 @@ aren't there — a 404 for real clients, which is worse.
 
 Index regeneration reads rows, never a bucket listing, so a publish never
 has to GET every package already in the repo just to learn what is there.
-For apk and npm the publish path touches object storage exactly twice
-(write the package, write the index), and `silo list` never touches it at
-all.
+For apk, pacman and npm, publishing an architecture-specific package
+touches object storage twice (write the package, write the index — three
+for a signed pacman database, which writes its detached signature
+alongside it); a `noarch`/`any` package touches every architecture's index
+in the channel, since that's the one case a publish invalidates more than
+one group (see The format seam, above). `silo list` never touches object
+storage at all.
 
 ## Quickstart
 
@@ -109,6 +115,7 @@ silo login --server http://localhost:8080
 silo publish ./my-package-1.0.0-1.x86_64.rpm --repo myrepo --channel stable
 silo publish ./hello-1.0-r0.apk             --repo myrepo --channel edge
 silo publish ./widget-1.0.0.tgz             --repo myrepo --channel stable
+silo publish ./hello-1.0-1-x86_64.pkg.tar.zst --repo myrepo --channel arch
 silo list --repo myrepo --channel stable
 ```
 
@@ -143,6 +150,33 @@ whichever architecture asks: every architecture's index lists the
 channel's noarch packages, a channel holding *only* noarch packages still
 serves an index to any architecture, and the package file itself is stored
 once rather than copied into every prefix.
+
+```ini
+# /etc/pacman.conf
+[myrepo]
+# DatabaseRequired without PackageRequired: silo signs the repo database,
+# not individual packages — see Signing. Drop DatabaseRequired entirely
+# (or set SigLevel = Never) if signing.pacman isn't configured.
+SigLevel = PackageOptional DatabaseRequired
+Server = http://silo.internal:8080/myrepo/stable/pacman/$arch
+```
+
+`$arch` is expanded by pacman itself, the same as `$repo` in the section
+name above it — silo just needs an `Server =` line ending in `/pacman`,
+one directory per architecture underneath. `any` packages need no special
+handling, for the same reason apk's `noarch` doesn't: pacman only ever
+fetches its own architecture's database, so silo answers for `any` content
+under whichever architecture asks.
+
+No `user:pass@` in the `Server =` line, unlike the yum/apk examples above:
+pacman's downloader does not send credentials embedded in the URL, so a
+token there is silently never sent — this isn't a silo limitation, there
+is simply no repo credential pacman will present. A pacman-consumed repo
+therefore has to be **public** (`silo repo set myrepo --mode=public`); a
+private repo just 404s for pacman the same way it would for a caller with
+no credential at all. If you need pacman to authenticate anyway, point
+`XferCommand` at a wrapper that adds the header/credential yourself —
+pacman.conf has no other hook for it.
 
 ```sh
 # npm
@@ -308,6 +342,14 @@ errors.
   SHA-1 and prepends the `.SIGN.RSA.<key_name>` member apk-tools expects.
   `key_name` must match the filename the public key is deployed to under
   `/etc/apk/keys`.
+- **pacman database** — `signing.pacman` signs the repo database
+  (`db.tar.gz`) with an OpenPGP key, the same scheme as RPM, but as a
+  detached *binary* signature in a sibling `db.tar.gz.sig` object — the
+  shape `pacman-key`/`repo-add -s` produce and expect — rather than
+  embedded or prepended. Deliberately a separate key from `signing.gpg`,
+  so RPM and pacman repos can be signed independently; reuse the same
+  armored key under both if one key signing both is fine. Packages
+  themselves are not signed, only the database.
 - **npm** — nothing to sign. npm clients verify the `integrity` hashes in
   the packument, which Silo computes at publish time and serves over TLS.
 
@@ -337,6 +379,13 @@ outside the credentialed repo session, so a token requirement here would
 break `repo_gpgcheck=1` for everyone. It is global, not per-repo, because
 `signing.gpg` is: one key signs every repo this server serves. With no
 signing key configured it returns 404.
+
+`GET /pacman-signing-key` is the same idea for `signing.pacman`:
+
+```sh
+curl -fsS https://silo.example.com/pacman-signing-key | pacman-key --add -
+pacman-key --lsign-key <fingerprint>
+```
 
 ## Administration
 
@@ -570,19 +619,20 @@ KEEP=1 ci/e2e.sh     # leave the stack up afterwards
 
 This is the only suite that tests silo against software we do not control.
 It builds a package per format with that ecosystem's own tooling
-(`rpmbuild`, `abuild`, `npm pack`), publishes all three to a real silo
-backed by a real Postgres and a real SeaweedFS, and then installs them with
-real `dnf`, `apk` and `npm` in their own distro containers.
+(`rpmbuild`, `abuild`, `npm pack`, `makepkg`), publishes all four to a real
+silo backed by a real Postgres and a real SeaweedFS, and then installs
+them with real `dnf`, `apk`, `npm` and `pacman` in their own distro
+containers.
 
-Signing is on throughout: `gpgcheck=1` **and** `repo_gpgcheck=1` for dnf,
-and a signed APKINDEX for apk — which is not optional anyway, since
-apk-tools will not use an unsigned index and cannot be talked out of it.
-The suite reads the signature back off the installed RPM rather than
-trusting that the install succeeded.
+Signing is on throughout: `gpgcheck=1` **and** `repo_gpgcheck=1` for dnf, a
+signed APKINDEX for apk — which is not optional anyway, since apk-tools
+will not use an unsigned index and cannot be talked out of it — and a
+signed database for pacman. The suite reads the signature back off the
+installed RPM rather than trusting that the install succeeded.
 
-It also re-runs the dnf half after `silo index rebuild`, because the
-documented recovery path has to produce an index a real client accepts,
-not merely one that renders.
+It also re-runs the dnf and pacman halves after `silo index rebuild`,
+because the documented recovery path has to produce an index a real
+client accepts, not merely one that renders.
 
 The example packages live in [`examples/`](examples/).
 
@@ -640,5 +690,5 @@ kept as well, for tags pushed by a human.
 
 ## Out of scope
 
-Web UI; package formats beyond rpm/apk/npm; retention and dedup policies;
-mirroring or upstream proxying; per-package ACLs finer than repo scope.
+Web UI; retention and dedup policies; mirroring or upstream proxying;
+per-package ACLs finer than repo scope.

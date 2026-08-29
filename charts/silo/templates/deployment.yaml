@@ -86,7 +86,7 @@ spec:
             - name: config
               mountPath: /etc/silo
               readOnly: true
-            {{- if or .Values.config.signing.gpg.existingSecret .Values.config.signing.apk.existingSecret }}
+            {{- if or .Values.config.signing.gpg.existingSecret .Values.config.signing.apk.existingSecret .Values.config.signing.pacman.existingSecret }}
             - name: signing
               mountPath: /etc/silo/signing
               readOnly: true
@@ -105,7 +105,7 @@ spec:
         - name: config
           secret:
             secretName: {{ include "silo.configSecretName" . }}
-        {{- if or .Values.config.signing.gpg.existingSecret .Values.config.signing.apk.existingSecret }}
+        {{- if or .Values.config.signing.gpg.existingSecret .Values.config.signing.apk.existingSecret .Values.config.signing.pacman.existingSecret }}
         - name: signing
           projected:
             sources:
@@ -122,6 +122,13 @@ spec:
                   items:
                     - key: key
                       path: apk-key.pem
+              {{- end }}
+              {{- with .Values.config.signing.pacman.existingSecret }}
+              - secret:
+                  name: {{ . }}
+                  items:
+                    - key: key
+                      path: pacman-key.asc
               {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}

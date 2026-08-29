@@ -1,18 +1,19 @@
 //! Package format parsing, storage layout, and index rendering.
 //!
-//! Three formats are supported: RPM (`dnf`/`yum`), Alpine APK (`apk`), and
-//! npm. Everything format-specific lives behind the [`Format`] trait so the
-//! rest of the codebase — publish flow, HTTP surface, database index —
-//! never matches on a format enum except to dispatch through
-//! [`PackageFormat::handler`].
+//! Four formats are supported: RPM (`dnf`/`yum`), Alpine APK (`apk`), npm,
+//! and pacman (Arch Linux). Everything format-specific lives behind the
+//! [`Format`] trait so the rest of the codebase — publish flow, HTTP
+//! surface, database index — never matches on a format enum except to
+//! dispatch through [`PackageFormat::handler`].
 //!
-//! The three formats differ in every dimension that matters, which is why
-//! the trait is shaped the way it is:
+//! The formats differ in every dimension that matters, which is why the
+//! trait is shaped the way it is:
 //!
 //! | | storage layout | index unit ("group") |
 //! |---|---|---|
 //! | rpm | `{repo}/{ch}/Packages/{file}` | the whole channel |
 //! | apk | `{repo}/{ch}/apk/{arch}/{file}` | one architecture |
+//! | pacman | `{repo}/{ch}/pacman/{arch}/{file}` | one architecture |
 //! | npm | `{repo}/{ch}/npm/{name}/-/{file}` | one package name |
 //!
 //! All three indexes are pure functions of the database. Whatever a
@@ -26,6 +27,7 @@
 
 pub mod apk;
 pub mod npm;
+pub mod pacman;
 pub mod repodata;
 pub mod rpm;
 
@@ -44,17 +46,23 @@ pub enum PackageFormat {
     Rpm,
     Apk,
     Npm,
+    Pacman,
 }
 
 impl PackageFormat {
-    pub const ALL: [PackageFormat; 3] =
-        [PackageFormat::Rpm, PackageFormat::Apk, PackageFormat::Npm];
+    pub const ALL: [PackageFormat; 4] = [
+        PackageFormat::Rpm,
+        PackageFormat::Apk,
+        PackageFormat::Npm,
+        PackageFormat::Pacman,
+    ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             PackageFormat::Rpm => "rpm",
             PackageFormat::Apk => "apk",
             PackageFormat::Npm => "npm",
+            PackageFormat::Pacman => "pacman",
         }
     }
 
@@ -64,6 +72,7 @@ impl PackageFormat {
             PackageFormat::Rpm => &rpm::RpmFormat,
             PackageFormat::Apk => &apk::ApkFormat,
             PackageFormat::Npm => &npm::NpmFormat,
+            PackageFormat::Pacman => &pacman::PacmanFormat,
         }
     }
 
@@ -75,6 +84,11 @@ impl PackageFormat {
             Some(PackageFormat::Rpm)
         } else if lower.ends_with(".apk") {
             Some(PackageFormat::Apk)
+        } else if lower.ends_with(".pkg.tar.zst")
+            || lower.ends_with(".pkg.tar.xz")
+            || lower.ends_with(".pkg.tar.gz")
+        {
+            Some(PackageFormat::Pacman)
         } else if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
             Some(PackageFormat::Npm)
         } else {
@@ -97,6 +111,7 @@ impl FromStr for PackageFormat {
             "rpm" => Ok(PackageFormat::Rpm),
             "apk" | "alpine" => Ok(PackageFormat::Apk),
             "npm" | "node" => Ok(PackageFormat::Npm),
+            "pacman" | "aur" | "arch" => Ok(PackageFormat::Pacman),
             other => Err(ParseError::UnknownFormat(other.to_string())),
         }
     }
@@ -142,6 +157,19 @@ impl ParsedPackage {
             }
             PackageFormat::Apk => format!("{}-{}.{}", self.name, self.version, self.arch),
             PackageFormat::Npm => format!("{}@{}", self.name, self.version),
+            PackageFormat::Pacman => {
+                if self.epoch == 0 {
+                    format!(
+                        "{}-{}-{}-{}",
+                        self.name, self.version, self.release, self.arch
+                    )
+                } else {
+                    format!(
+                        "{}-{}:{}-{}-{}",
+                        self.name, self.epoch, self.version, self.release, self.arch
+                    )
+                }
+            }
         }
     }
 }
@@ -346,6 +374,14 @@ mod tests {
         assert_eq!(
             PackageFormat::from_filename("foo-1.0.0.tgz"),
             Some(PackageFormat::Npm)
+        );
+        assert_eq!(
+            PackageFormat::from_filename("foo-1.0-1-x86_64.pkg.tar.zst"),
+            Some(PackageFormat::Pacman)
+        );
+        assert_eq!(
+            PackageFormat::from_filename("foo-1.0-1-any.pkg.tar.xz"),
+            Some(PackageFormat::Pacman)
         );
         assert_eq!(PackageFormat::from_filename("foo.txt"), None);
     }

@@ -4,14 +4,15 @@ package silo.v1;
 
 option go_package = "github.com/BirknerAlex/silo/gen/go/silo/v1;silov1";
 
-// PackageFormat identifies the package format a package is in. Silo
-// supports three; adding a fourth is a new enum value plus a server-side
-// Format implementation, with no wire-compatibility break.
+// PackageFormat identifies the package format a package is in. Adding a
+// new one is a new enum value plus a server-side Format implementation,
+// with no wire-compatibility break.
 enum PackageFormat {
   PACKAGE_FORMAT_UNSPECIFIED = 0;
   PACKAGE_FORMAT_RPM = 1;
   PACKAGE_FORMAT_APK = 2;
   PACKAGE_FORMAT_NPM = 3;
+  PACKAGE_FORMAT_PACMAN = 4;
 }
 
 // PublishService lets authorized clients push packages into a repo/channel.

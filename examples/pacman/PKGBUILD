@@ -1,0 +1,29 @@
+# Maintainer: silo <silo@example.com>
+#
+# A minimal PKGBUILD. makepkg builds this into a real .pkg.tar.zst, which
+# is what silo's end-to-end suite publishes and then installs with real
+# pacman.
+pkgname=silo-hello
+pkgver=1.2.3
+pkgrel=1
+pkgdesc="A tiny package for silo's end-to-end tests"
+url="https://github.com/BirknerAlex/silo"
+# any, deliberately: pacman only ever fetches its own architecture's
+# database, so an `any` package is only reachable because silo lists it in
+# every architecture's database and serves it from every architecture's
+# path. That is the case most likely to regress, so the end-to-end suite
+# covers it rather than the easy one.
+arch=('any')
+license=('MIT')
+# A real dependency, so the desc file has a non-empty %DEPENDS% block to
+# round-trip and pacman has something to actually resolve.
+depends=('bash')
+
+package() {
+	install -d "$pkgdir"/usr/bin
+	cat > "$pkgdir"/usr/bin/silo-hello <<'SCRIPT'
+#!/bin/bash
+echo "hello from silo pacman 1.2.3"
+SCRIPT
+	chmod 0755 "$pkgdir"/usr/bin/silo-hello
+}

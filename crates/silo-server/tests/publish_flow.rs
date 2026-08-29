@@ -10,7 +10,7 @@ use std::io::Read;
 use common::{unique_repo, Harness};
 use silo_db::audit::{Actor, ActorKind, AuditQuery};
 use silo_db::tokens::{Permission, Scope};
-use silo_pkg::testutil::{build_test_apk, build_test_npm, build_test_rpm};
+use silo_pkg::testutil::{build_test_apk, build_test_npm, build_test_pacman, build_test_rpm};
 use silo_pkg::PackageFormat;
 
 /// Reads one architecture's APKINDEX back out of storage as text.
@@ -346,6 +346,162 @@ async fn an_architecture_published_after_a_noarch_package_still_lists_it() {
         index.contains("P:portable"),
         "a new architecture's first index must already include noarch"
     );
+}
+
+#[tokio::test]
+async fn pacman_publish_records_the_package_and_builds_a_database() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("pacman");
+
+    let outcome = silo_core::repo::publish(
+        &harness.state.publish,
+        &repo,
+        "edge",
+        PackageFormat::Pacman,
+        build_test_pacman("hello", "1.0-1", "x86_64", "zst"),
+        &actor(),
+    )
+    .await
+    .expect("publish pacman package");
+
+    assert_eq!(
+        outcome.storage_path,
+        format!("{repo}/edge/pacman/x86_64/hello-1.0-1-x86_64.pkg.tar.zst")
+    );
+    assert_eq!(outcome.index_group, "x86_64");
+    assert!(
+        !outcome.signed,
+        "pacman packages themselves are not signed by silo, only the database"
+    );
+
+    let rows = harness
+        .db
+        .list_packages(&repo, "edge", Some(PackageFormat::Pacman))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "hello");
+    assert_eq!(rows[0].index_group, "x86_64");
+
+    let db = harness
+        .state
+        .storage
+        .get(&format!("{repo}/edge/pacman/x86_64/db.tar.gz"))
+        .await
+        .unwrap()
+        .expect("db.tar.gz was written");
+    let mut inflated = Vec::new();
+    flate2::bufread::GzDecoder::new(db.as_slice())
+        .read_to_end(&mut inflated)
+        .unwrap();
+    let mut archive = tar::Archive::new(inflated.as_slice());
+    let names: Vec<String> = archive
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["hello-1.0-1/desc"]);
+}
+
+#[tokio::test]
+async fn pacman_arches_get_independent_databases() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("pacman-multiarch");
+
+    for arch in ["x86_64", "aarch64"] {
+        silo_core::repo::publish(
+            &harness.state.publish,
+            &repo,
+            "edge",
+            PackageFormat::Pacman,
+            build_test_pacman("hello", "1.0-1", arch, "zst"),
+            &actor(),
+        )
+        .await
+        .expect("publish pacman package");
+    }
+
+    // Publishing aarch64 must not have rewritten the x86_64 database into
+    // something that omits its own package.
+    for arch in ["x86_64", "aarch64"] {
+        let db = harness
+            .state
+            .storage
+            .get(&format!("{repo}/edge/pacman/{arch}/db.tar.gz"))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no database for {arch}"));
+        let mut inflated = Vec::new();
+        flate2::bufread::GzDecoder::new(db.as_slice())
+            .read_to_end(&mut inflated)
+            .unwrap();
+        let text = String::from_utf8_lossy(&inflated);
+        assert!(
+            text.contains(&format!("%ARCH%\n{arch}\n")),
+            "{arch} database is wrong"
+        );
+    }
+}
+
+#[tokio::test]
+async fn any_pacman_packages_appear_in_every_architecture_database() {
+    // pacman only ever fetches its own architecture's database, so an
+    // `any` package that lived only in an `any` database would be
+    // invisible to every client — same reasoning as apk's `noarch`.
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("pacman-any");
+
+    for arch in ["x86_64", "aarch64"] {
+        silo_core::repo::publish(
+            &harness.state.publish,
+            &repo,
+            "edge",
+            PackageFormat::Pacman,
+            build_test_pacman(&format!("native-{arch}"), "1.0-1", arch, "zst"),
+            &actor(),
+        )
+        .await
+        .expect("publish an arch-specific pacman package");
+    }
+
+    let outcome = silo_core::repo::publish(
+        &harness.state.publish,
+        &repo,
+        "edge",
+        PackageFormat::Pacman,
+        build_test_pacman("portable", "2.0-1", "any", "zst"),
+        &actor(),
+    )
+    .await
+    .expect("publish an any pacman package");
+    assert_eq!(outcome.index_group, "any");
+
+    for arch in ["x86_64", "aarch64", "any"] {
+        let db = harness
+            .state
+            .storage
+            .get(&format!("{repo}/edge/pacman/{arch}/db.tar.gz"))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut inflated = Vec::new();
+        flate2::bufread::GzDecoder::new(db.as_slice())
+            .read_to_end(&mut inflated)
+            .unwrap();
+        let mut archive = tar::Archive::new(inflated.as_slice());
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"portable-2.0-1/desc".to_string()),
+            "the any package is missing from the {arch} database"
+        );
+    }
 }
 
 #[tokio::test]

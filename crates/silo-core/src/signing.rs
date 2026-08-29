@@ -9,6 +9,10 @@
 //!   The signature covers a fresh index every time and is verified against
 //!   a pinned public key, so SHA-1 collision resistance isn't what's
 //!   protecting it — key possession is.
+//! - **The pacman database** is signed with an OpenPGP key, the same
+//!   scheme as RPM, but as a detached *binary* (non-armored) signature in
+//!   a sibling `.sig` object — the shape `repo-add -s`/`pacman-key` expect
+//!   — rather than embedded or prepended into the database itself.
 //!
 //! npm has no signing story here: npm clients verify `integrity` hashes
 //! from the packument, which the registry serves over TLS, and there is no
@@ -18,6 +22,7 @@ use std::sync::Arc;
 
 use pgp::composed::{ArmorOptions, Deserializable, DetachedSignature, SignedSecretKey};
 use pgp::crypto::hash::HashAlgorithm;
+use pgp::ser::Serialize as _;
 use pgp::types::Password;
 use rsa::pkcs1v15::SigningKey;
 use rsa::signature::{SignatureEncoding, Signer as _};
@@ -33,6 +38,10 @@ use crate::config::{ApkSigningConfig, GpgConfig, SigningConfig};
 pub struct Signers {
     pub gpg: Option<Arc<GpgSigner>>,
     pub apk: Option<Arc<ApkSigner>>,
+    /// Deliberately a separate key from `gpg`: a server signing both RPM
+    /// and pacman repos may reasonably want distinct keys, and reusing
+    /// `gpg` would take that choice away.
+    pub pacman: Option<Arc<PacmanSigner>>,
 }
 
 impl Signers {
@@ -49,17 +58,27 @@ impl Signers {
             .map(ApkSigner::from_config)
             .transpose()?
             .map(Arc::new);
-        Ok(Self { gpg, apk })
+        let pacman = cfg
+            .pacman
+            .as_ref()
+            .map(PacmanSigner::from_config)
+            .transpose()?
+            .map(Arc::new);
+        Ok(Self { gpg, apk, pacman })
     }
 
     /// The index signer for a format, if one is configured. RPM's repomd
-    /// signature and apk's index signature use different keys, so the
-    /// lookup is per-format rather than a single "the" signer.
+    /// signature, apk's index signature, and pacman's database signature
+    /// each use their own key, so the lookup is per-format rather than a
+    /// single "the" signer.
     pub fn for_format(&self, format: silo_pkg::PackageFormat) -> Option<&dyn IndexSigner> {
         match format {
             silo_pkg::PackageFormat::Rpm => self.gpg.as_deref().map(|s| s as &dyn IndexSigner),
             silo_pkg::PackageFormat::Apk => self.apk.as_deref().map(|s| s as &dyn IndexSigner),
             silo_pkg::PackageFormat::Npm => None,
+            silo_pkg::PackageFormat::Pacman => {
+                self.pacman.as_deref().map(|s| s as &dyn IndexSigner)
+            }
         }
     }
 }
@@ -129,9 +148,11 @@ impl GpgSigner {
         )?)
     }
 
-    /// Detached, armored signature over arbitrary bytes — used for
-    /// `repomd.xml.asc`, which is what `repo_gpgcheck=1` verifies.
-    fn detached_armored_signature(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    /// Common to both detached-signature forms below: only the final
+    /// serialization (armored vs. raw bytes) differs between them, so the
+    /// key parsing, passphrase handling and hash algorithm live here once
+    /// rather than risking drift between the RPM and pacman paths.
+    fn detached_signature(&self, data: &[u8]) -> anyhow::Result<DetachedSignature> {
         let (key, _) = SignedSecretKey::from_string(&self.armored_key)
             .map_err(|e| anyhow::anyhow!("failed to parse the gpg secret key: {e}"))?;
 
@@ -142,18 +163,30 @@ impl GpgSigner {
 
         // `&*key` derefs the signed key down to the primary secret key,
         // which is what implements the signing trait.
-        let signature = DetachedSignature::sign_binary_data(
+        DetachedSignature::sign_binary_data(
             rand::thread_rng(),
             &*key,
             &password,
             HashAlgorithm::Sha256,
             data,
         )
-        .map_err(|e| anyhow::anyhow!("failed to sign data: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to sign data: {e}"))
+    }
 
-        signature
+    /// Detached, armored signature over arbitrary bytes — used for
+    /// `repomd.xml.asc`, which is what `repo_gpgcheck=1` verifies.
+    fn detached_armored_signature(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.detached_signature(data)?
             .to_armored_bytes(Default::default())
             .map_err(|e| anyhow::anyhow!("failed to armor the signature: {e}"))
+    }
+
+    /// A raw (non-armored) detached signature — the shape `repo-add -s`
+    /// produces and `pacman`/`pacman-key` expect for a `<db>.sig` file.
+    fn detached_binary_signature(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.detached_signature(data)?
+            .to_bytes()
+            .map_err(|e| anyhow::anyhow!("failed to serialize the signature: {e}"))
     }
 }
 
@@ -164,6 +197,39 @@ impl IndexSigner for GpgSigner {
 
     fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.detached_armored_signature(data)
+    }
+}
+
+/// Wraps a [`GpgSigner`] to sign the pacman database with a raw detached
+/// signature instead of the armored form RPM/apk-adjacent code uses —
+/// `pacman-key`/`repo-add -s` expect a binary `.sig`, not an armored one.
+pub struct PacmanSigner(GpgSigner);
+
+impl std::fmt::Debug for PacmanSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacmanSigner").finish_non_exhaustive()
+    }
+}
+
+impl PacmanSigner {
+    pub fn from_config(cfg: &GpgConfig) -> anyhow::Result<Self> {
+        Ok(Self(GpgSigner::from_config(cfg)?))
+    }
+
+    /// The armored **public** key, served so `pacman-key --add` can import
+    /// it without the key having to reach clients out of band.
+    pub fn armored_public_key(&self) -> &str {
+        self.0.armored_public_key()
+    }
+}
+
+impl IndexSigner for PacmanSigner {
+    fn key_name(&self) -> &str {
+        "pacman"
+    }
+
+    fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.0.detached_binary_signature(data)
     }
 }
 
@@ -313,11 +379,58 @@ mod tests {
                 key_path: None,
                 key_name: "k.rsa.pub".to_string(),
             }),
+            pacman: None,
         })
         .unwrap();
         assert!(signers.for_format(PackageFormat::Apk).is_some());
         assert!(signers.for_format(PackageFormat::Rpm).is_none());
         assert!(signers.for_format(PackageFormat::Npm).is_none());
+        assert!(signers.for_format(PackageFormat::Pacman).is_none());
+    }
+
+    #[test]
+    fn pacman_signer_is_wired_up_for_the_pacman_format_only_and_signs_binary() {
+        let signers = Signers::from_config(&SigningConfig {
+            gpg: None,
+            apk: None,
+            pacman: Some(GpgConfig {
+                key: Some(TEST_GPG_SECRET_KEY.to_string()),
+                key_path: None,
+                passphrase: None,
+            }),
+        })
+        .unwrap();
+        assert!(signers.for_format(PackageFormat::Pacman).is_some());
+        assert!(signers.for_format(PackageFormat::Rpm).is_none());
+
+        let sig = signers
+            .for_format(PackageFormat::Pacman)
+            .unwrap()
+            .sign(b"db.tar.gz bytes")
+            .unwrap();
+        // A raw detached OpenPGP signature packet, not an armored block —
+        // what `pacman-key`/`repo-add -s` expect for a `.sig` file.
+        assert!(!sig.starts_with(b"-----BEGIN"));
+        assert!(!sig.is_empty());
+    }
+
+    #[test]
+    fn pacman_and_rpm_keys_are_independent() {
+        let signers = Signers::from_config(&SigningConfig {
+            gpg: Some(GpgConfig {
+                key: Some(TEST_GPG_SECRET_KEY.to_string()),
+                key_path: None,
+                passphrase: None,
+            }),
+            apk: None,
+            pacman: None,
+        })
+        .unwrap();
+        assert!(signers.for_format(PackageFormat::Rpm).is_some());
+        assert!(
+            signers.for_format(PackageFormat::Pacman).is_none(),
+            "configuring signing.gpg must not implicitly sign pacman repos"
+        );
     }
 
     #[test]

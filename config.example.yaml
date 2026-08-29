@@ -98,3 +98,11 @@ metrics:
 #   apk:
 #     key_path: "/etc/silo/apk-key.pem"
 #     key_name: "silo@example.com-1a2b3c4d.rsa.pub"
+#
+#   # Signs the pacman repo database (a detached db.tar.gz.sig, the shape
+#   # `pacman-key`/`repo-add -s` expect). gpg, apk and pacman are three
+#   # independent keys — this one is never implied by `gpg` above; reuse
+#   # the same armored key here explicitly if one key signing both is fine.
+#   pacman:
+#     key_path: "/etc/silo/pacman-key.asc"
+#     passphrase: "${SILO_PACMAN_GPG_PASSPHRASE}"

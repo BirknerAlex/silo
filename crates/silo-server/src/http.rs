@@ -38,11 +38,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/version", get(version))
         // Unauthenticated on purpose — see `gpg_public_key`.
         .route("/RPM-GPG-KEY-silo", get(gpg_public_key))
+        // Unauthenticated on purpose — see `pacman_public_key`.
+        .route("/pacman-signing-key", get(pacman_public_key))
         // dnf/yum
         .route("/:repo/:channel/repodata/*file", get(get_repodata))
         .route("/:repo/:channel/Packages/*file", get(get_rpm_package))
         // apk
         .route("/:repo/:channel/apk/:arch/*file", get(get_apk_file))
+        // pacman
+        .route("/:repo/:channel/pacman/:arch/*file", get(get_pacman_file))
         // npm — one catch-all because scoped names (`@acme/widget`) put a
         // slash inside what npm considers a single path segment.
         .route("/:repo/:channel/npm/*path", get(get_npm))
@@ -119,6 +123,23 @@ async fn gpg_public_key(State(state): State<Arc<AppState>>) -> Response {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/pgp-keys")],
         gpg.armored_public_key().to_string(),
+    )
+        .into_response()
+}
+
+/// The armored public half of the configured `signing.pacman` key, for
+/// `pacman-key --add <(curl .../pacman-signing-key) && pacman-key --lsign-key <fingerprint>`.
+///
+/// Unauthenticated for the same reason as `gpg_public_key`: it is a public
+/// key, and requiring a token here would defeat the point of publishing it.
+async fn pacman_public_key(State(state): State<Arc<AppState>>) -> Response {
+    let Some(pacman) = &state.publish.signers.pacman else {
+        return (StatusCode::NOT_FOUND, "no signing key is configured").into_response();
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/pgp-keys")],
+        pacman.armored_public_key().to_string(),
     )
         .into_response()
 }
@@ -437,6 +458,95 @@ async fn apk_key(
     key
 }
 
+// ----------------------------------------------------------------- pacman
+
+async fn get_pacman_file(
+    State(state): State<Arc<AppState>>,
+    Path((repo, channel, arch, file)): Path<(String, String, String, String)>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let auth =
+        match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
+            Ok(auth) => auth,
+            Err(resp) => return resp,
+        };
+    if let Err(resp) = reject_traversal(&file) {
+        return resp;
+    }
+    if let Err(resp) = reject_traversal(&arch) {
+        return resp;
+    }
+
+    if let Some(object) = pacman_db_object(&file) {
+        let key = pacman_key(&state, &repo, &channel, &arch, object).await;
+        let content_type = if object.ends_with(".sig") {
+            "application/octet-stream"
+        } else {
+            "application/gzip"
+        };
+        return serve_index(&state, &key, content_type, "pacman-db").await;
+    }
+
+    let key = pacman_key(&state, &repo, &channel, &arch, &file).await;
+    serve_package(&state, &key, PackageFormat::Pacman, &auth, &repo, &channel).await
+}
+
+/// Maps a requested filename to the fixed database (or signature) object
+/// name, regardless of what `[section]` name a client's `pacman.conf`
+/// happens to use.
+///
+/// pacman always requests `$section.db` (occasionally `$section.db.tar.gz`
+/// / `.tar.zst` / `.tar.xz` depending on client version), and `$section`
+/// is a name only the client's config knows — silo cannot predict it, so
+/// any filename with the right shape is treated as "the database".
+fn pacman_db_object(file: &str) -> Option<&'static str> {
+    let (base, is_sig) = match file.strip_suffix(".sig") {
+        Some(base) => (base, true),
+        None => (file, false),
+    };
+    let is_db = base.ends_with(".db")
+        || base.ends_with(".db.tar.gz")
+        || base.ends_with(".db.tar.zst")
+        || base.ends_with(".db.tar.xz");
+    if !is_db {
+        return None;
+    }
+    Some(if is_sig {
+        silo_pkg::pacman::DB_SIG_OBJECT
+    } else {
+        silo_pkg::pacman::DB_OBJECT
+    })
+}
+
+/// Resolves a pacman request to a storage key, falling back to `any` —
+/// the same reasoning as [`apk_key`], since pacman never asks for an
+/// `any` tree of its own accord any more than apk asks for `noarch`.
+async fn pacman_key(
+    state: &Arc<AppState>,
+    repo: &str,
+    channel: &str,
+    arch: &str,
+    file: &str,
+) -> String {
+    let key = format!(
+        "{}/{file}",
+        silo_pkg::pacman::arch_prefix(repo, channel, arch)
+    );
+    if arch == silo_pkg::pacman::ANY || state.storage.head(&key).await.unwrap_or(false) {
+        return key;
+    }
+
+    let any = format!(
+        "{}/{file}",
+        silo_pkg::pacman::arch_prefix(repo, channel, silo_pkg::pacman::ANY)
+    );
+    if state.storage.head(&any).await.unwrap_or(false) {
+        return any;
+    }
+    key
+}
+
 // -------------------------------------------------------------------- npm
 
 async fn get_npm(
@@ -677,6 +787,26 @@ pub(crate) mod tests {
                 passphrase: None,
             }),
             apk: None,
+            pacman: None,
+        })
+        .expect("load the test signing key");
+        state.publish.signers = signers;
+        state
+    }
+
+    /// Like `test_state_with_gpg`, but loads the key under `signing.pacman`
+    /// instead, so the pacman key-serving endpoint is exercised against a
+    /// real key rather than a stub.
+    fn test_state_with_pacman_key(tweak: impl FnOnce(&mut Config)) -> AppState {
+        let mut state = test_state_with(tweak);
+        let signers = silo_core::Signers::from_config(&SigningConfig {
+            gpg: None,
+            apk: None,
+            pacman: Some(silo_core::config::GpgConfig {
+                key: Some(silo_core::signing::TEST_GPG_SECRET_KEY.to_string()),
+                key_path: None,
+                passphrase: None,
+            }),
         })
         .expect("load the test signing key");
         state.publish.signers = signers;
@@ -831,6 +961,28 @@ pub(crate) mod tests {
         // that signs nothing is a misconfiguration the client should see
         // as "not there", which is what dnf reports usefully.
         let resp = get(anonymous_state(), "/RPM-GPG-KEY-silo").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_pacman_public_key_is_served_without_a_credential() {
+        let state = Arc::new(test_state_with_pacman_key(|_| {}));
+
+        let resp = get(state, "/pacman-signing-key").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/pgp-keys"
+        );
+
+        let body = body_string(resp).await;
+        assert!(body.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
+        assert!(!body.contains("PRIVATE KEY"));
+    }
+
+    #[tokio::test]
+    async fn the_pacman_public_key_is_404_when_no_key_is_configured() {
+        let resp = get(anonymous_state(), "/pacman-signing-key").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1053,6 +1205,111 @@ pub(crate) mod tests {
         // ...and noarch still serves itself.
         let resp = get(state, "/myrepo/edge/apk/noarch/APKINDEX.tar.gz").await;
         assert_eq!(body_string(resp).await, "noarch-index");
+    }
+
+    #[tokio::test]
+    async fn pacman_db_and_packages_are_served_per_arch() {
+        let state = require_public_repo_state!();
+        state
+            .storage
+            .put("myrepo/edge/pacman/x86_64/db.tar.gz", b"dbbytes".to_vec())
+            .await
+            .unwrap();
+        state
+            .storage
+            .put(
+                "myrepo/edge/pacman/x86_64/hello-1.0-1-x86_64.pkg.tar.zst",
+                b"pkgbytes".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        // Whatever `[section]` name a client's pacman.conf uses, the fixed
+        // database object answers for it.
+        for requested in ["myrepo.db", "myrepo.db.tar.gz", "myrepo.db.tar.zst"] {
+            let resp = get(
+                state.clone(),
+                &format!("/myrepo/edge/pacman/x86_64/{requested}"),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{requested}");
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/gzip"
+            );
+            assert_eq!(body_string(resp).await, "dbbytes");
+        }
+
+        let resp = get(
+            state.clone(),
+            "/myrepo/edge/pacman/x86_64/hello-1.0-1-x86_64.pkg.tar.zst",
+        )
+        .await;
+        assert_eq!(body_string(resp).await, "pkgbytes");
+
+        // A different arch is a different database and must not be served.
+        let resp = get(state, "/myrepo/edge/pacman/aarch64/myrepo.db").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pacman_db_signature_is_served_alongside_the_database() {
+        let state = require_public_repo_state!();
+        state
+            .storage
+            .put(
+                "myrepo/edge/pacman/x86_64/db.tar.gz.sig",
+                b"sigbytes".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let resp = get(state, "/myrepo/edge/pacman/x86_64/myrepo.db.sig").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(body_string(resp).await, "sigbytes");
+    }
+
+    #[tokio::test]
+    async fn any_pacman_content_is_served_under_whatever_arch_asks_for_it() {
+        // Mirrors apk's `noarch` fallback: pacman only ever requests
+        // $repo/$hostarch/..., so `any` content has to answer under every
+        // architecture even though it is stored once.
+        let state = require_public_repo_state!();
+        for (key, body) in [
+            ("myrepo/edge/pacman/any/db.tar.gz", "any-db"),
+            (
+                "myrepo/edge/pacman/any/portable-1.0-1-any.pkg.tar.zst",
+                "any-pkg",
+            ),
+        ] {
+            state
+                .storage
+                .put(key, body.as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+
+        let resp = get(state.clone(), "/myrepo/edge/pacman/x86_64/myrepo.db").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, "any-db");
+
+        let resp = get(
+            state.clone(),
+            "/myrepo/edge/pacman/x86_64/portable-1.0-1-any.pkg.tar.zst",
+        )
+        .await;
+        assert_eq!(body_string(resp).await, "any-pkg");
+
+        let resp = get(
+            state,
+            "/myrepo/edge/pacman/x86_64/absent-1.0-1-any.pkg.tar.zst",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
