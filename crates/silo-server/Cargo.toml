@@ -17,6 +17,7 @@ silo-pkg = { path = "../silo-pkg" }
 tokio.workspace = true
 tonic.workspace = true
 axum.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
