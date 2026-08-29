@@ -7,7 +7,7 @@
 # part most likely to break.
 set -eu
 
-: "${SILO_TOKEN:?}" "${REPO:?}" "${CHANNEL:?}"
+: "${SILO_TOKEN:?}" "${REPO:?}" "${CHANNEL:?}" "${SILO_PUBLISH_TOKEN:?}"
 
 REGISTRY="http://silo:8080/$REPO/$CHANNEL/npm/"
 
@@ -65,5 +65,47 @@ echo "  $output"
 echo "== the scope survived into the installed tree"
 [ -f node_modules/@silo-example/hello/package.json ] || {
     echo "the scoped package did not install under its scope" >&2; exit 1; }
+
+# Everything above proves silo's *reads* satisfy a real npm client, using a
+# fixture published through the `silo` CLI's gRPC path. This proves the
+# other direction: a real `npm publish` writing straight to silo's HTTP
+# endpoint, not the CLI. It gets its own package name so it can't collide
+# with the fixture, and its own npmrc so the write-scoped token used here
+# never mixes with the read-scoped one used above.
+echo "== publish: can a real npm client publish over HTTP?"
+cat > /root/.npmrc-publish <<EOF
+//silo:8080/$REPO/$CHANNEL/npm/:_authToken=$SILO_PUBLISH_TOKEN
+EOF
+export NPM_CONFIG_USERCONFIG=/root/.npmrc-publish
+
+mkdir -p /tmp/publisher && cd /tmp/publisher
+npm init -y >/dev/null 2>&1
+npm pkg set name=silo-e2e-http-publish version=1.0.0 >/dev/null 2>&1
+if ! publish_out=$(npm publish --registry "$REGISTRY" 2>&1); then
+    echo "$publish_out" | tail -20
+    echo "npm publish failed" >&2
+    exit 1
+fi
+echo "$publish_out" | tail -5
+
+echo "== the http-published package is indexed"
+published_version=$(npm view silo-e2e-http-publish version --registry "$REGISTRY")
+echo "  version $published_version"
+[ "$published_version" = "1.0.0" ] || {
+    echo "unexpected version after an http publish: $published_version" >&2
+    exit 1
+}
+
+echo "== the http-published package installs, same as any other"
+mkdir -p /tmp/consumer-http && cd /tmp/consumer-http
+npm init -y >/dev/null 2>&1
+if ! install_out=$(npm install silo-e2e-http-publish --registry "$REGISTRY" 2>&1); then
+    echo "$install_out" | tail -20
+    echo "npm install of the http-published package failed" >&2
+    exit 1
+fi
+echo "$install_out" | tail -3
+[ -f node_modules/silo-e2e-http-publish/package.json ] || {
+    echo "the http-published package did not install" >&2; exit 1; }
 
 echo "npm verification passed"

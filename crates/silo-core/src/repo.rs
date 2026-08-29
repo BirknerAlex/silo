@@ -40,6 +40,39 @@ use crate::config::validate_repo_name;
 use crate::signing::{maybe_sign_rpm, Signers};
 use crate::storage::Storage;
 
+/// Ceiling on a single upload, shared by every transport. Without one, a
+/// client can drive the server out of memory by streaming forever — the
+/// bytes are reassembled in RAM because every format's parser needs the
+/// whole archive to validate it.
+pub const MAX_PACKAGE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Coarse classification of a [`publish`] error, shared by every transport
+/// so their status codes stay in sync without each re-deriving "you sent
+/// us something invalid" from the error message independently.
+pub enum PublishErrorKind {
+    InvalidArgument,
+    Timeout,
+    Internal,
+}
+
+/// Distinguishes "you sent us something invalid" from "we failed".
+/// Everything the parsers reject is the client's fault, and reporting it
+/// as an internal error would make a bad upload look like a server outage.
+pub fn classify_publish_error(error: &anyhow::Error) -> PublishErrorKind {
+    let message = error.to_string();
+    if message.starts_with("invalid ")
+        || message.contains("is not a valid")
+        || message.contains("name must be")
+        || message.contains("may only contain")
+    {
+        return PublishErrorKind::InvalidArgument;
+    }
+    if message.contains("timed out waiting for the lock") {
+        return PublishErrorKind::Timeout;
+    }
+    PublishErrorKind::Internal
+}
+
 /// Everything the publish flow needs, assembled once at startup.
 #[derive(Clone)]
 pub struct PublishContext {

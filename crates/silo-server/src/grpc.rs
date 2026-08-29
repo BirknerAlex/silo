@@ -16,13 +16,10 @@ use silo_proto::v1::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
+use silo_core::repo::MAX_PACKAGE_BYTES;
+
 use crate::auth;
 use crate::AppState;
-
-/// Ceiling on a single upload. Without one, a client can drive the server
-/// out of memory by streaming forever — the bytes are reassembled in RAM
-/// because every format's parser needs the whole archive to validate it.
-const MAX_PACKAGE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 pub struct PublishServiceImpl {
     pub state: Arc<AppState>,
@@ -141,23 +138,19 @@ impl PublishService for PublishServiceImpl {
     }
 }
 
-/// Distinguishes "you sent us something invalid" from "we failed".
-/// Everything the parsers reject is the client's fault, and reporting it
-/// as `internal` would make a bad upload look like a server outage.
+/// Maps a [`silo_core::repo::classify_publish_error`] verdict to a gRPC
+/// status.
 fn publish_error_to_status(error: anyhow::Error) -> Status {
+    use silo_core::repo::PublishErrorKind;
     let message = error.to_string();
-    if message.starts_with("invalid ")
-        || message.contains("is not a valid")
-        || message.contains("name must be")
-        || message.contains("may only contain")
-    {
-        return Status::invalid_argument(message);
+    match silo_core::repo::classify_publish_error(&error) {
+        PublishErrorKind::InvalidArgument => Status::invalid_argument(message),
+        PublishErrorKind::Timeout => Status::deadline_exceeded(message),
+        PublishErrorKind::Internal => {
+            tracing::error!(error = %error, "publish failed");
+            Status::internal(message)
+        }
     }
-    if message.contains("timed out waiting for the lock") {
-        return Status::deadline_exceeded(message);
-    }
-    tracing::error!(error = %error, "publish failed");
-    Status::internal(message)
 }
 
 pub struct ReadServiceImpl {

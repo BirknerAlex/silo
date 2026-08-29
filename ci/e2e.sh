@@ -345,6 +345,7 @@ verify() {
     docker run --rm \
         --network "${PROJECT}_silo" \
         -e "SILO_TOKEN=$READ_TOKEN" \
+        -e "SILO_PUBLISH_TOKEN=$PUBLISH_TOKEN" \
         -e "REPO=$REPO" -e "CHANNEL=$CHANNEL" \
         -e "APK_KEY_NAME=$APK_KEY_NAME" \
         -v "$ROOT/ci/e2e:/verify:ro" \

@@ -16,19 +16,32 @@
 //! keeping bulk bandwidth off the server, and fall back to proxying bytes
 //! otherwise (e.g. the in-memory backend used in tests).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use base64::Engine;
+use serde::Deserialize;
+use silo_core::repo::{classify_publish_error, PublishErrorKind, MAX_PACKAGE_BYTES};
 use silo_db::audit::{self, AuditEntry};
 use silo_db::tokens::Permission;
 use silo_pkg::PackageFormat;
 
 use crate::auth::{self, Authenticated};
 use crate::AppState;
+
+/// Ceiling on the JSON body of an `npm publish` request, enforced by hand
+/// in [`publish_npm`] (see its doc comment for why it can't just be a
+/// [`axum::extract::DefaultBodyLimit`] layer). The tarball inside the body
+/// is base64-encoded (~33% overhead), so this has to be larger than
+/// [`MAX_PACKAGE_BYTES`] itself; the extra 1 MiB covers the envelope
+/// (manifest, dist-tags, etc.) around the attachment.
+const NPM_PUBLISH_BODY_LIMIT: usize = MAX_PACKAGE_BYTES * 4 / 3 + 1024 * 1024;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -48,8 +61,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // pacman
         .route("/:repo/:channel/pacman/:arch/*file", get(get_pacman_file))
         // npm — one catch-all because scoped names (`@acme/widget`) put a
-        // slash inside what npm considers a single path segment.
-        .route("/:repo/:channel/npm/*path", get(get_npm))
+        // slash inside what npm considers a single path segment. `PUT` is
+        // how `npm publish`/`yarn publish` send a new version.
+        .route("/:repo/:channel/npm/*path", get(get_npm).put(publish_npm))
         .with_state(state)
 }
 
@@ -216,6 +230,45 @@ async fn authorize_read(
             // that a private repo exists.
             return Err((StatusCode::NOT_FOUND, "not found").into_response());
         }
+    }
+    Ok(authenticated)
+}
+
+/// Authenticates a write against one repo, or returns the response to
+/// send. Unlike [`authorize_read`], a repo's public bit never widens this
+/// — write access always has to come from the token's own scope, mirroring
+/// `auth::require_repo(..., Permission::Write)` on the gRPC side. Errors
+/// are npm's expected JSON shape rather than a bare status, since npm/yarn
+/// print the `error` field verbatim.
+async fn authorize_write(
+    state: &AppState,
+    headers: &HeaderMap,
+    remote_addr: Option<String>,
+    repo: &str,
+) -> Result<Authenticated, Response> {
+    let authenticated = auth::authenticate_http(state, headers, remote_addr)
+        .await
+        .map_err(|e| {
+            let reason = match &e {
+                silo_db::tokens::AuthError::Expired(_) => "expired",
+                silo_db::tokens::AuthError::Revoked => "revoked",
+                silo_db::tokens::AuthError::UserDisabled => "user_disabled",
+                silo_db::tokens::AuthError::Db(_) => "database",
+                _ => "unknown",
+            };
+            state
+                .metrics
+                .auth_failures
+                .with_label_values(&[reason])
+                .inc();
+            npm_error(StatusCode::UNAUTHORIZED, "authentication required")
+        })?;
+
+    if !authenticated.allows(repo, Permission::Write) {
+        return Err(npm_error(
+            StatusCode::FORBIDDEN,
+            "insufficient permission to publish to this repo",
+        ));
     }
     Ok(authenticated)
 }
@@ -626,6 +679,184 @@ fn npm_not_found(state: &AppState) -> Response {
         r#"{"error":"Not found"}"#,
     )
         .into_response()
+}
+
+/// npm's error envelope — the client prints `error` verbatim.
+fn npm_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "error": message }).to_string(),
+    )
+        .into_response()
+}
+
+/// The publish JSON body `npm publish`/`yarn publish` PUT to a package's
+/// URL. Only `_attachments` is read — everything else (manifest fields,
+/// `dist-tags`, `_id`) is re-derived from the tarball itself by
+/// [`silo_pkg::npm::NpmFormat::parse`], so trusting client-sent copies of
+/// it would just be an extra way for the two to disagree.
+///
+/// `data` borrows from the request body rather than owning a `String`: at
+/// the size ceiling this envelope allows, an owned copy would mean two
+/// multi-gigabyte buffers (the raw body and the copy) alive at once for no
+/// reason, on top of the decoded bytes built from it a moment later.
+#[derive(Deserialize)]
+struct NpmPublishRequest<'a> {
+    #[serde(default, rename = "_attachments", borrow)]
+    attachments: BTreeMap<String, NpmAttachment<'a>>,
+}
+
+#[derive(Deserialize)]
+struct NpmAttachment<'a> {
+    #[serde(borrow)]
+    data: &'a str,
+}
+
+/// Handles `PUT /:repo/:channel/npm/*path` — the wire protocol
+/// `npm publish`/`yarn publish` speak. `path` is the package name (npm
+/// puts it in the URL); it isn't otherwise consulted since the tarball's
+/// own `package.json` is the source of truth for name and version, exactly
+/// as it is for a publish that arrives over gRPC.
+///
+/// The body is read by hand with [`Request`], rather than a `Json<T>`
+/// extractor, deliberately: extractors all run before the handler body
+/// does, so a `Json<T>` argument would buffer and deserialize the whole
+/// request — up to [`NPM_PUBLISH_BODY_LIMIT`] of it — before
+/// `authorize_write` below ever runs, letting an unauthenticated caller
+/// force that work on every request. Reading the body explicitly, after
+/// the permission check, keeps that cost behind authorization the way the
+/// gRPC handler's own check does before it reads a single byte off its
+/// stream (`grpc.rs`).
+async fn publish_npm(
+    State(state): State<Arc<AppState>>,
+    Path((repo, channel, path)): Path<(String, String, String)>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    request: Request,
+) -> Response {
+    let auth =
+        match authorize_write(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
+            Ok(auth) => auth,
+            Err(resp) => return resp,
+        };
+    if let Err(resp) = reject_traversal(&path) {
+        return resp;
+    }
+
+    let body_bytes = match axum::body::to_bytes(request.into_body(), NPM_PUBLISH_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return npm_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds the publish size limit",
+            )
+        }
+    };
+    let body: NpmPublishRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(body) => body,
+        Err(_) => return npm_error(StatusCode::BAD_REQUEST, "invalid publish request body"),
+    };
+
+    let mut attachments = body.attachments.into_values();
+    let attachment = match (attachments.next(), attachments.next()) {
+        (Some(attachment), None) => attachment,
+        (None, _) => return npm_error(StatusCode::BAD_REQUEST, "no attachment in publish request"),
+        (Some(_), Some(_)) => {
+            return npm_error(
+                StatusCode::BAD_REQUEST,
+                "only one attachment per publish is supported",
+            )
+        }
+    };
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(attachment.data.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return npm_error(
+                StatusCode::BAD_REQUEST,
+                "attachment data is not valid base64",
+            )
+        }
+    };
+    // The body-size layer only bounds the base64 text, which is ~33%
+    // larger than what it decodes to — so a body under that ceiling can
+    // still decode past `MAX_PACKAGE_BYTES`. Check the decoded size too,
+    // same ceiling gRPC enforces on its raw chunks.
+    if bytes.len() > MAX_PACKAGE_BYTES {
+        return npm_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "package exceeds the {} GiB upload limit",
+                MAX_PACKAGE_BYTES / (1024 * 1024 * 1024)
+            ),
+        );
+    }
+
+    let started = Instant::now();
+    let outcome = silo_core::repo::publish(
+        &state.publish,
+        &repo,
+        &channel,
+        PackageFormat::Npm,
+        bytes,
+        &auth.actor,
+    )
+    .await;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    state
+        .metrics
+        .record_publish(PackageFormat::Npm.as_str(), outcome.is_ok(), elapsed);
+
+    match outcome {
+        Ok(outcome) => {
+            state
+                .metrics
+                .http_requests
+                .with_label_values(&["npm-publish", "200"])
+                .inc();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "ok": true, "id": outcome.name, "rev": outcome.sha256 })
+                    .to_string(),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            // A rejected publish leaves no other trace, so the audit log
+            // is the only place it can be seen afterwards — mirrors the
+            // gRPC handler's failure path.
+            state
+                .db
+                .record_audit(
+                    AuditEntry::new(audit::action::PACKAGE_PUBLISH, &auth.actor)
+                        .repo(&repo)
+                        .channel(&channel)
+                        .detail(serde_json::json!({ "format": PackageFormat::Npm.as_str() }))
+                        .failed(&e),
+                )
+                .await;
+            publish_error_response(e)
+        }
+    }
+}
+
+/// Maps a [`classify_publish_error`] verdict to an HTTP status, same
+/// classification the gRPC handler uses to pick a `Status`.
+fn publish_error_response(error: anyhow::Error) -> Response {
+    match classify_publish_error(&error) {
+        PublishErrorKind::InvalidArgument => npm_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        PublishErrorKind::Timeout => npm_error(StatusCode::GATEWAY_TIMEOUT, &error.to_string()),
+        // Unlike the two branches above, this one isn't the client's own
+        // mistake — it's a storage/database failure, and its `Display`
+        // can carry backend detail (connection strings, paths) a caller
+        // has no business seeing. Full detail still reaches the log.
+        PublishErrorKind::Internal => {
+            tracing::error!(error = %error, "publish failed");
+            npm_error(StatusCode::INTERNAL_SERVER_ERROR, "internal publish error")
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
