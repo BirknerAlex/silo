@@ -34,5 +34,7 @@ base64.workspace = true
 tower = "0.5"
 silo-core = { path = "../silo-core", features = ["test-util"] }
 silo-pkg = { path = "../silo-pkg", features = ["test-util"] }
-# The integration tests inflate APKINDEX payloads to assert their contents.
+# The integration tests inflate APKINDEX/pacman-db payloads to assert their
+# contents.
 flate2 = "1"
+tar = "0.4"

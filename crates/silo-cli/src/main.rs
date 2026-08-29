@@ -425,6 +425,7 @@ fn to_proto_format(format: PackageFormat) -> ProtoFormat {
         PackageFormat::Rpm => ProtoFormat::Rpm,
         PackageFormat::Apk => ProtoFormat::Apk,
         PackageFormat::Npm => ProtoFormat::Npm,
+        PackageFormat::Pacman => ProtoFormat::Pacman,
     }
 }
 
@@ -433,6 +434,7 @@ fn format_name(value: i32) -> String {
         Ok(ProtoFormat::Rpm) => "rpm".into(),
         Ok(ProtoFormat::Apk) => "apk".into(),
         Ok(ProtoFormat::Npm) => "npm".into(),
+        Ok(ProtoFormat::Pacman) => "pacman".into(),
         _ => "-".into(),
     }
 }

@@ -250,6 +250,7 @@ pub fn from_proto_format(value: i32) -> Option<PackageFormat> {
         ProtoFormat::Rpm => Some(PackageFormat::Rpm),
         ProtoFormat::Apk => Some(PackageFormat::Apk),
         ProtoFormat::Npm => Some(PackageFormat::Npm),
+        ProtoFormat::Pacman => Some(PackageFormat::Pacman),
         ProtoFormat::Unspecified => None,
     }
 }
@@ -259,6 +260,7 @@ pub fn to_proto_format(format: PackageFormat) -> ProtoFormat {
         PackageFormat::Rpm => ProtoFormat::Rpm,
         PackageFormat::Apk => ProtoFormat::Apk,
         PackageFormat::Npm => ProtoFormat::Npm,
+        PackageFormat::Pacman => ProtoFormat::Pacman,
     }
 }
 

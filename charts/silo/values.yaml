@@ -5,7 +5,7 @@
 # Concurrent publishes are safe at any replica count — publishes take a
 # Postgres advisory lock scoped to the index they'd rewrite, so two
 # replicas publishing to the same repo/channel serialize, while unrelated
-# repos, apk architectures and npm packages proceed in parallel.
+# repos, apk/pacman architectures and npm packages proceed in parallel.
 replicaCount: 1
 
 image:
@@ -190,6 +190,13 @@ config:
       key: ""
       keyName: ""
       existingSecret: ""
+    # pacman repo database signature (a detached db.tar.gz.sig). A
+    # separate key from `gpg` above — reuse the same armored key here if
+    # one key signing both RPM and pacman repos is fine.
+    pacman:
+      key: ""
+      passphrase: ""
+      existingSecret: ""
 
 # Supply the whole config.yaml verbatim instead of having the chart render
 # it from the structured values above. Everything under `config:` is
@@ -229,7 +236,7 @@ serviceMonitor:
 
 ingress:
   # One Ingress for everything: gRPC (the `silo` CLI) and HTTP (dnf, apk,
-  # npm) share the same Service port, and silo dispatches between them by
+  # npm, pacman) share the same Service port, and silo dispatches between them by
   # path and by per-connection protocol detection, not by anything the
   # ingress needs to understand. All the controller has to do is speak
   # real HTTP/2 to the backend rather than downgrading to HTTP/1.1 — no
@@ -244,7 +251,7 @@ ingress:
   # `proxy_http_version 2`, which nginx open source has only supported
   # since 1.29.4 (December 2025) — earlier versions could speak HTTP/2 to
   # a backend solely through the gRPC-specific `grpc_pass` module, which
-  # cannot carry the dnf/apk/npm traffic and would need a second Ingress.
+  # cannot carry the dnf/apk/npm/pacman traffic and would need a second Ingress.
   # If your ingress-nginx build doesn't yet expose `proxy_http_version 2`
   # through an annotation, force it with a snippet:
   #   nginx.ingress.kubernetes.io/configuration-snippet: |

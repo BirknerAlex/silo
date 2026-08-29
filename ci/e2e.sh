@@ -3,21 +3,23 @@
 # install them with the real package managers.
 #
 # What this covers that the unit and integration tests cannot: whether
-# `dnf`, `apk` and `npm` — none of which we control — actually accept what
-# silo serves. Everything below the wire is already tested elsewhere; this
-# is about the wire.
+# `dnf`, `apk`, `npm` and `pacman` — none of which we control — actually
+# accept what silo serves. Everything below the wire is already tested
+# elsewhere; this is about the wire.
 #
 # The shape is deliberate at both ends:
 #
-#   * Packages are built by rpmbuild, abuild and npm pack, not by silo's
-#     own fixtures. Testing our encoder against our decoder proves nothing.
-#   * Packages are installed by dnf, apk and npm in their own distro
-#     containers, not by parsing the index ourselves.
+#   * Packages are built by rpmbuild, abuild, npm pack and makepkg, not by
+#     silo's own fixtures. Testing our encoder against our decoder proves
+#     nothing.
+#   * Packages are installed by dnf, apk, npm and pacman in their own
+#     distro containers, not by parsing the index ourselves.
 #
-# Signing is on for both formats that support it. apk-tools requires a
+# Signing is on for every format that supports it. apk-tools requires a
 # signed index and cannot be talked out of it, so an unsigned run would not
-# resemble any real deployment; and RPM's gpgcheck/repo_gpgcheck path is
-# only reachable with a real key.
+# resemble any real deployment; RPM's gpgcheck/repo_gpgcheck path and
+# pacman's database signature check are each only reachable with a real
+# key.
 #
 # Usage:
 #   ci/e2e.sh              # build, run, verify, tear down
@@ -100,6 +102,22 @@ grep -q "BEGIN PGP PRIVATE KEY BLOCK" "$WORK/keys/gpg-private.asc" \
     || fail "gpg key generation produced no private key"
 ok "rpm OpenPGP keypair"
 
+# pacman: its own OpenPGP key, deliberately separate from RPM's — silo
+# supports signing the two with different keys, and using the same one
+# here would not exercise that.
+docker run --rm -v "$WORK/keys:/keys" alpine:3.20 sh -c '
+    apk add --no-cache gnupg >/dev/null
+    export GNUPGHOME=/tmp/gnupg && mkdir -p $GNUPGHOME && chmod 700 $GNUPGHOME
+    gpg --batch --pinentry-mode loopback --passphrase "" \
+        --quick-gen-key "silo e2e pacman <silo@example.com>" rsa2048 sign never >/dev/null 2>&1
+    gpg --batch --pinentry-mode loopback --passphrase "" \
+        --armor --export-secret-keys > /keys/pacman-gpg-private.asc
+    chmod 644 /keys/pacman-gpg-private.asc
+'
+grep -q "BEGIN PGP PRIVATE KEY BLOCK" "$WORK/keys/pacman-gpg-private.asc" \
+    || fail "pacman gpg key generation produced no private key"
+ok "pacman OpenPGP keypair"
+
 # ------------------------------------------------------- example packages
 
 log "building example packages with their native tooling"
@@ -151,6 +169,26 @@ docker run --rm -v "$ROOT/examples/npm:/src:ro" -v "$WORK/packages:/out" node:22
 NPM_FILE=$(ls "$WORK"/packages/*.tgz)
 ok "npm  $(basename "$NPM_FILE")"
 
+# pacman, via makepkg in Arch Linux. makepkg refuses to run as root, so it
+# gets its own throwaway builder user, same as abuild above.
+docker run --rm -v "$ROOT/examples/pacman:/src:ro" -v "$WORK/packages:/out" archlinux:base-devel sh -c '
+    set -e
+    useradd -m builder
+    mkdir -p /home/builder/pkg && cp /src/PKGBUILD /home/builder/pkg/
+    chown -R builder:builder /home/builder
+    su builder -c "cd /home/builder/pkg && makepkg --nosign" >/dev/null 2>&1
+    cp /home/builder/pkg/*.pkg.tar.zst /out/
+' >/dev/null 2>&1 || fail "makepkg failed (rerun with bash -x ci/e2e.sh to see why)"
+# Exactly one expected: PKGBUILD declares no split packages, so more than
+# one *.pkg.tar.zst here means makepkg picked up something unexpected
+# (e.g. a stale file from a previous run) rather than a real ambiguity to
+# silently pick the first of.
+PACMAN_CANDIDATES=$(ls "$WORK"/packages/*.pkg.tar.zst)
+[ "$(echo "$PACMAN_CANDIDATES" | wc -l)" -eq 1 ] \
+    || fail "expected exactly one pacman package, found: $PACMAN_CANDIDATES"
+PACMAN_FILE=$PACMAN_CANDIDATES
+ok "pacman  $(basename "$PACMAN_FILE")"
+
 # ------------------------------------------------------------- the server
 
 log "starting silo (postgres + seaweedfs + server)"
@@ -160,6 +198,7 @@ log "starting silo (postgres + seaweedfs + server)"
 mkdir -p "$WORK/config"
 cp "$WORK/keys/apk.pem" "$WORK/config/apk.pem"
 cp "$WORK/keys/gpg-private.asc" "$WORK/config/gpg-private.asc"
+cp "$WORK/keys/pacman-gpg-private.asc" "$WORK/config/pacman-gpg-private.asc"
 cat > "$WORK/config/config.yaml" <<EOF
 addr: "0.0.0.0:8080"
 # npm packuments embed absolute tarball URLs, so the server has to know
@@ -194,6 +233,8 @@ signing:
   apk:
     key_path: /etc/silo/apk.pem
     key_name: "$APK_KEY_NAME"
+  pacman:
+    key_path: /etc/silo/pacman-gpg-private.asc
 EOF
 
 $COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true
@@ -273,15 +314,25 @@ publish() {
 publish "$(basename "$RPM_FILE")" | sed 's/^/    /'
 publish "$(basename "$APK_FILE")" | sed 's/^/    /'
 publish "$(basename "$NPM_FILE")" | sed 's/^/    /'
+publish "$(basename "$PACMAN_FILE")" | sed 's/^/    /'
 
-# Three packages, three formats, all in one repo/channel.
+# Four packages, four formats, all in one repo/channel.
 LISTED=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
     /usr/local/bin/silo list --repo "$REPO" --channel "$CHANNEL" --json | tr -d '\r')
-for format in rpm apk npm; do
+for format in rpm apk npm pacman; do
     echo "$LISTED" | grep -q "\"format\": \"$format\"" \
         || fail "$format is missing from the package list"
 done
-ok "all three formats are indexed"
+ok "all four formats are indexed"
+
+# pacman's downloader does not send Basic-auth credentials embedded in a
+# Server URL the way dnf's and apk's do (verified empirically — it just
+# never presents one), so a private repo is unreachable for it no matter
+# what's in pacman.conf. Every other verifier below still authenticates
+# with a real token regardless of this.
+$COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+    /usr/local/bin/silo repo set "$REPO" --mode=public | sed 's/^/    /'
+ok "repo is public (required for the pacman verifier)"
 
 # -------------------------------------------------------------- consume
 
@@ -303,9 +354,10 @@ verify() {
     ok "$name installed and ran the package silo served"
 }
 
-verify dnf fedora:41       verify-dnf.sh
-verify apk alpine:3.20     verify-apk.sh
-verify npm node:22-alpine  verify-npm.sh
+verify dnf    fedora:41        verify-dnf.sh
+verify apk    alpine:3.20      verify-apk.sh
+verify npm    node:22-alpine   verify-npm.sh
+verify pacman archlinux:base   verify-pacman.sh
 
 # ---------------------------------------------------------------- repair
 
@@ -318,5 +370,10 @@ $COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:80
     /usr/local/bin/silo index rebuild --repo "$REPO" --channel "$CHANNEL" --format rpm \
     | sed 's/^/    /'
 verify "dnf (after an index rebuild)" fedora:41 verify-dnf.sh
+
+$COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+    /usr/local/bin/silo index rebuild --repo "$REPO" --channel "$CHANNEL" --format pacman \
+    | sed 's/^/    /'
+verify "pacman (after an index rebuild)" archlinux:base verify-pacman.sh
 
 log "end-to-end suite passed"

@@ -3395,6 +3395,7 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "hex",
+ "liblzma",
  "rpm",
  "semver",
  "serde",
@@ -3404,6 +3405,7 @@ dependencies = [
  "tar",
  "thiserror 2.0.20",
  "tokio",
+ "zstd",
 ]
 
 [[package]]
@@ -3434,6 +3436,7 @@ dependencies = [
  "silo-pkg",
  "silo-proto",
  "sqlx",
+ "tar",
  "tokio",
  "tonic",
  "tower 0.5.3",

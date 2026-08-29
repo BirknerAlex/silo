@@ -196,7 +196,7 @@ oidc:
   exclusive: {{ .Values.config.oidc.exclusive }}
 {{- end }}
 
-{{- if or .Values.config.signing.gpg.key .Values.config.signing.gpg.existingSecret .Values.config.signing.apk.key .Values.config.signing.apk.existingSecret }}
+{{- if or .Values.config.signing.gpg.key .Values.config.signing.gpg.existingSecret .Values.config.signing.apk.key .Values.config.signing.apk.existingSecret .Values.config.signing.pacman.key .Values.config.signing.pacman.existingSecret }}
 
 signing:
   {{- if .Values.config.signing.gpg.existingSecret }}
@@ -222,6 +222,20 @@ signing:
     key: |
 {{ .Values.config.signing.apk.key | indent 6 }}
     key_name: {{ .Values.config.signing.apk.keyName | quote }}
+  {{- end }}
+  {{- if .Values.config.signing.pacman.existingSecret }}
+  pacman:
+    key_path: /etc/silo/signing/pacman-key.asc
+    {{- with .Values.config.signing.pacman.passphrase }}
+    passphrase: {{ . | quote }}
+    {{- end }}
+  {{- else if .Values.config.signing.pacman.key }}
+  pacman:
+    key: |
+{{ .Values.config.signing.pacman.key | indent 6 }}
+    {{- with .Values.config.signing.pacman.passphrase }}
+    passphrase: {{ . | quote }}
+    {{- end }}
   {{- end }}
 {{- end }}
 {{- end -}}

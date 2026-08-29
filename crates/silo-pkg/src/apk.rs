@@ -253,7 +253,10 @@ fn read_pkginfo(compressed: &[u8]) -> Option<String> {
 
 /// `.PKGINFO` is `key = value` lines; keys like `depend` legitimately
 /// repeat, so every key maps to a list.
-fn parse_pkginfo(text: &str) -> BTreeMap<String, Vec<String>> {
+///
+/// `pub(crate)`: pacman's `.PKGINFO` is the same `key = value` shape, so
+/// `pacman.rs` reuses this rather than re-implementing it.
+pub(crate) fn parse_pkginfo(text: &str) -> BTreeMap<String, Vec<String>> {
     let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();
