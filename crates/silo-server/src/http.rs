@@ -127,12 +127,16 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     if !state.config.metrics.enabled {
         return (StatusCode::NOT_FOUND, "metrics are disabled").into_response();
     }
-    if state.config.metrics.require_auth
-        && auth::authenticate_http(&state, &headers, None)
+    if state.config.metrics.require_auth {
+        // `authenticate_http` no longer errors on a missing credential —
+        // that's an anonymous caller now, not a failure — so the gate has
+        // to check for an actual token rather than just success.
+        let has_token = auth::authenticate_http(&state, &headers, None)
             .await
-            .is_err()
-    {
-        return unauthorized();
+            .is_ok_and(|a| a.token.is_some());
+        if !has_token {
+            return unauthorized();
+        }
     }
 
     match state.metrics.render() {
@@ -180,9 +184,17 @@ async fn authorize_read(
         })?;
 
     if !authenticated.allows(repo, Permission::Read) {
-        // 404 rather than 403: a token scoped to other repos shouldn't be
-        // able to enumerate which repos exist by watching status codes.
-        return Err((StatusCode::NOT_FOUND, "not found").into_response());
+        let public = state.db.is_repo_public(repo).await.map_err(|e| {
+            tracing::error!(error = %e, repo, "failed to look up repo visibility");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        })?;
+        if !public {
+            // 404 rather than 403: a token scoped to other repos shouldn't
+            // be able to enumerate which repos exist by watching status
+            // codes, and neither should an unauthenticated caller learn
+            // that a private repo exists.
+            return Err((StatusCode::NOT_FOUND, "not found").into_response());
+        }
     }
     Ok(authenticated)
 }
@@ -671,13 +683,84 @@ pub(crate) mod tests {
         state
     }
 
+    /// A state that never touches the database — fine for routes that
+    /// answer without a repo-level authorization check at all
+    /// (`/healthz`, `/version`, the gpg key, `/metrics`).
     fn anonymous_state() -> Arc<AppState> {
         Arc::new(test_state_with(|cfg| {
-            cfg.auth.allow_anonymous_read = true;
             // The audit write would need a database; downloads in these
             // tests are about serving bytes, not about auditing.
             cfg.audit.log_downloads = false;
         }))
+    }
+
+    /// A state backed by a real database, with `myrepo` marked public.
+    ///
+    /// Every `/{repo}/{channel}/...` route now asks the database whether
+    /// the repo is public before serving an unauthenticated request, so
+    /// the tests that exercise that serving logic (content types, path
+    /// traversal, redirect fallbacks, 404 shapes) need one — unlike the
+    /// rest of this module, which deliberately never does (see
+    /// `test_state_with`). The repo name is fixed and shared across
+    /// tests: they only ever mark it public (idempotent), never private,
+    /// and each test gets its own in-memory storage, so concurrent tests
+    /// sharing the one test database can't interfere with each other.
+    async fn test_db() -> Option<silo_db::Db> {
+        let url = std::env::var("SILO_TEST_DATABASE_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())?;
+        Some(
+            silo_db::Db::connect(&silo_db::DbConfig {
+                url,
+                max_connections: 4,
+                connect_timeout: std::time::Duration::from_secs(30),
+                token_pepper: None,
+            })
+            .await
+            .expect("connect to the test database"),
+        )
+    }
+
+    async fn public_myrepo_state() -> Option<Arc<AppState>> {
+        let db = test_db().await?;
+        db.set_repo_public("myrepo", true)
+            .await
+            .expect("mark the test repo public");
+
+        let mut state = test_state_with(|cfg| cfg.audit.log_downloads = false);
+        state.db = db.clone();
+        state.publish.db = db;
+        Some(Arc::new(state))
+    }
+
+    /// Skips (rather than fails) when there's no database to connect to,
+    /// consistent with the integration suite's `require_db!`.
+    macro_rules! require_public_repo_state {
+        () => {
+            match public_myrepo_state().await {
+                Some(state) => state,
+                None => {
+                    eprintln!(
+                        "skipping: set SILO_TEST_DATABASE_URL to run this database-backed test"
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
+    macro_rules! require_test_db {
+        () => {
+            match test_db().await {
+                Some(db) => db,
+                None => {
+                    eprintln!(
+                        "skipping: set SILO_TEST_DATABASE_URL to run this database-backed test"
+                    );
+                    return;
+                }
+            }
+        };
     }
 
     async fn get(state: Arc<AppState>, uri: &str) -> Response {
@@ -702,13 +785,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn version_is_served_without_a_credential() {
-        // Deliberately checked against a state with anonymous read *off*:
-        // an operator has to be able to ask what is running before they
+        // An operator has to be able to ask what is running before they
         // have a token, and a `curl` against a locked-down registry is
-        // exactly that situation.
-        let state = Arc::new(test_state_with(|cfg| {
-            cfg.auth.allow_anonymous_read = false;
-        }));
+        // exactly that situation — this route takes no credential at all,
+        // regardless of any repo's mode.
+        let state = Arc::new(test_state_with(|_| {}));
         let resp = get(state, "/version").await;
         assert_eq!(resp.status(), StatusCode::OK);
 
@@ -725,12 +806,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn the_gpg_public_key_is_served_without_a_credential() {
-        // Anonymous read is off: dnf fetches `gpgkey=` outside the
-        // credentialed repo session, so this endpoint has to answer
-        // before the client has proved anything.
-        let state = Arc::new(test_state_with_gpg(|cfg| {
-            cfg.auth.allow_anonymous_read = false;
-        }));
+        // dnf fetches `gpgkey=` outside the credentialed repo session, so
+        // this endpoint has to answer before the client has proved
+        // anything — it takes no credential at all.
+        let state = Arc::new(test_state_with_gpg(|_| {}));
 
         let resp = get(state, "/RPM-GPG-KEY-silo").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -770,18 +849,32 @@ pub(crate) mod tests {
     async fn metrics_can_be_put_behind_a_credential() {
         let state = Arc::new(test_state_with(|cfg| {
             cfg.metrics.require_auth = true;
-            cfg.auth.allow_anonymous_read = false;
         }));
         let resp = get(state, "/metrics").await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn reads_require_a_credential_unless_anonymous_read_is_on() {
-        let locked = Arc::new(test_state_with(|_| {}));
-        let resp = get(locked, "/myrepo/stable/repodata/repomd.xml").await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
+    async fn a_credential_less_read_of_a_private_repo_is_404_not_401() {
+        // No credential is never an auth error by itself now — it's an
+        // anonymous caller, and what an anonymous caller can reach is
+        // decided per repo. A private repo has to look exactly like one
+        // that doesn't exist, which rules out both 401 (that would
+        // confirm "a credential would help here, so this repo is real")
+        // and 403.
+        let db = require_test_db!();
+        let mut state = test_state_with(|cfg| cfg.audit.log_downloads = false);
+        state.db = db.clone();
+        state.publish.db = db;
+        let repo = format!("private-{}", uuid::Uuid::new_v4().simple());
+
+        let resp = get(
+            Arc::new(state),
+            &format!("/{repo}/stable/repodata/repomd.xml"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(!resp.headers().contains_key(header::WWW_AUTHENTICATE));
     }
 
     #[tokio::test]
@@ -804,7 +897,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn repodata_is_proxied_with_the_right_content_type() {
-        let state = anonymous_state();
+        let state = require_public_repo_state!();
         state
             .storage
             .put("myrepo/stable/repodata/repomd.xml", b"<repomd/>".to_vec())
@@ -822,7 +915,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn missing_objects_are_404() {
-        let resp = get(anonymous_state(), "/myrepo/stable/repodata/repomd.xml").await;
+        let state = require_public_repo_state!();
+        let resp = get(state, "/myrepo/stable/repodata/repomd.xml").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -830,7 +924,7 @@ pub(crate) mod tests {
     async fn rpm_packages_fall_back_to_proxying_without_a_signer() {
         // The in-memory backend can't presign, which exercises the
         // proxy fallback that real S3 never takes.
-        let state = anonymous_state();
+        let state = require_public_repo_state!();
         state
             .storage
             .put(
@@ -847,7 +941,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn apk_index_and_packages_are_served_per_arch() {
-        let state = anonymous_state();
+        let state = require_public_repo_state!();
         state
             .storage
             .put(
@@ -886,7 +980,7 @@ pub(crate) mod tests {
         // apk-tools only ever requests $repo/$hostarch/..., so noarch
         // content has to answer under every architecture even though it is
         // stored once.
-        let state = anonymous_state();
+        let state = require_public_repo_state!();
         for (key, body) in [
             ("myrepo/edge/apk/noarch/APKINDEX.tar.gz", "noarch-index"),
             ("myrepo/edge/apk/noarch/portable-1.0-r0.apk", "noarch-apk"),
@@ -919,7 +1013,7 @@ pub(crate) mod tests {
         // The fallback is a fallback: once an architecture has its own
         // index — which already includes the noarch packages — serving the
         // noarch one instead would hide that architecture's packages.
-        let state = anonymous_state();
+        let state = require_public_repo_state!();
         for (key, body) in [
             ("myrepo/edge/apk/noarch/APKINDEX.tar.gz", "noarch-index"),
             ("myrepo/edge/apk/x86_64/APKINDEX.tar.gz", "x86_64-index"),
@@ -941,7 +1035,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn npm_packument_gets_its_tarball_urls_rewritten() {
-        let state = anonymous_state();
+        let state = require_public_repo_state!();
         state
             .storage
             .put(
@@ -975,7 +1069,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn npm_scoped_packuments_work_encoded_and_unencoded() {
-        let state = anonymous_state();
+        let state = require_public_repo_state!();
         state
             .storage
             .put(
@@ -997,7 +1091,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn npm_tarballs_are_served_from_the_dash_path() {
-        let state = anonymous_state();
+        let state = require_public_repo_state!();
         state
             .storage
             .put(
@@ -1014,7 +1108,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn npm_404s_are_json_because_npm_parses_them() {
-        let resp = get(anonymous_state(), "/myrepo/stable/npm/nope").await;
+        let state = require_public_repo_state!();
+        let resp = get(state, "/myrepo/stable/npm/nope").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -1025,12 +1120,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn path_traversal_is_refused() {
+        let state = require_public_repo_state!();
         for uri in [
             "/myrepo/stable/repodata/../../../etc/passwd",
             "/myrepo/stable/Packages/..%2f..%2fsecret",
             "/myrepo/edge/apk/x86_64/../../other/APKINDEX.tar.gz",
         ] {
-            let resp = get(anonymous_state(), uri).await;
+            let resp = get(state.clone(), uri).await;
             assert!(
                 resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::NOT_FOUND,
                 "{uri} returned {}",

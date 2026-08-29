@@ -28,8 +28,8 @@ use silo_proto::v1::{
     GetAuthInfoRequest, GetVersionRequest, ListPackagesRequest, ListReposRequest,
     ListTokensRequest, ListUsersRequest, LoginOidcRequest, LoginRequest,
     PackageFormat as ProtoFormat, PublishMetadata, PublishRequest, QueryAuditRequest,
-    RebuildIndexRequest, RevokeTokenRequest, SetUserDisabledRequest, SetUserPasswordRequest,
-    TokenScope, WhoAmIRequest,
+    RebuildIndexRequest, RepoMode, RevokeTokenRequest, SetRepoModeRequest, SetUserDisabledRequest,
+    SetUserPasswordRequest, TokenScope, WhoAmIRequest,
 };
 use tonic::transport::{Channel, ClientTlsConfig};
 
@@ -65,11 +65,15 @@ enum Command {
     Publish(PublishArgs),
     /// List packages in a repo/channel.
     List(ListArgs),
-    /// List repos and channels this credential can see.
+    /// List repos and channels this credential can see, plus any public
+    /// repos. Works without signing in.
     Repos {
         #[arg(long)]
         json: bool,
     },
+    /// Manage a repo's mode.
+    #[command(subcommand)]
+    Repo(RepoCommand),
 
     /// Manage API tokens.
     #[command(subcommand)]
@@ -150,6 +154,19 @@ struct ListArgs {
     format: Option<String>,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Set a repo's mode. Public adds unauthenticated read; it never
+    /// changes who can write, and never revokes or deletes any token.
+    /// Admin only.
+    Set {
+        repo: String,
+        /// "public" or "private".
+        #[arg(long)]
+        mode: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -276,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Publish(args) => cmd_publish(&config_path, cli.server.as_deref(), args).await,
         Command::List(args) => cmd_list(&config_path, cli.server.as_deref(), args).await,
         Command::Repos { json } => cmd_repos(&config_path, cli.server.as_deref(), json).await,
+        Command::Repo(cmd) => cmd_repo(&config_path, cli.server.as_deref(), cmd).await,
         Command::Token(cmd) => cmd_token(&config_path, cli.server.as_deref(), cmd).await,
         Command::User(cmd) => cmd_user(&config_path, cli.server.as_deref(), cmd).await,
         Command::Audit(args) => cmd_audit(&config_path, cli.server.as_deref(), args).await,
@@ -311,6 +329,35 @@ fn session(config_path: &str, server_override: Option<&str>) -> anyhow::Result<S
         addr,
         token,
     })
+}
+
+/// Like [`session`], but tolerates having no credential at all — for the
+/// reads that work anonymously against public repos (`silo repos`, `silo
+/// list`). A missing/expired token becomes `None` rather than an error;
+/// the server decides what an uncredentialed caller can actually see.
+struct OptionalSession {
+    addr: String,
+    token: Option<String>,
+}
+
+fn session_optional_auth(
+    config_path: &str,
+    server_override: Option<&str>,
+) -> anyhow::Result<OptionalSession> {
+    let config = ClientConfig::load_or_default(config_path)?;
+    let addr = resolve_addr(&config, server_override)?;
+    let token = config.resolve_token().ok();
+    Ok(OptionalSession { addr, token })
+}
+
+/// Attaches the bearer token when there is one; leaves the request
+/// uncredentialed otherwise, for calls that work anonymously.
+fn maybe_auth<T>(message: T, token: Option<&str>) -> anyhow::Result<tonic::Request<T>> {
+    let mut request = tonic::Request::new(message);
+    if let Some(token) = token {
+        authorize(&mut request, token)?;
+    }
+    Ok(request)
 }
 
 fn resolve_addr(config: &ClientConfig, override_addr: Option<&str>) -> anyhow::Result<String> {
@@ -766,18 +813,18 @@ async fn cmd_publish(
 }
 
 async fn cmd_list(config_path: &str, server: Option<&str>, args: ListArgs) -> anyhow::Result<()> {
-    let session = session(config_path, server)?;
+    let session = session_optional_auth(config_path, server)?;
     let format = args.format.as_deref().map(parse_format).transpose()?;
 
     let mut client = ReadServiceClient::new(connect(&session.addr).await?);
     let response = client
-        .list_packages(with_auth(
+        .list_packages(maybe_auth(
             ListPackagesRequest {
                 repo: args.repo.clone(),
                 channel: args.channel.clone(),
                 format: format.map(|f| to_proto_format(f) as i32).unwrap_or(0),
             },
-            &session.token,
+            session.token.as_deref(),
         )?)
         .await?
         .into_inner();
@@ -834,10 +881,10 @@ async fn cmd_list(config_path: &str, server: Option<&str>, args: ListArgs) -> an
 }
 
 async fn cmd_repos(config_path: &str, server: Option<&str>, json: bool) -> anyhow::Result<()> {
-    let session = session(config_path, server)?;
+    let session = session_optional_auth(config_path, server)?;
     let mut client = ReadServiceClient::new(connect(&session.addr).await?);
     let response = client
-        .list_repos(with_auth(ListReposRequest {}, &session.token)?)
+        .list_repos(maybe_auth(ListReposRequest {}, session.token.as_deref())?)
         .await?
         .into_inner();
 
@@ -850,6 +897,7 @@ async fn cmd_repos(config_path: &str, server: Option<&str>, json: bool) -> anyho
                     "repo": r.repo,
                     "channel": r.channel,
                     "format": format_name(r.format),
+                    "mode": mode_name(r.mode),
                     "packages": r.package_count,
                     "total_bytes": r.total_bytes,
                 })
@@ -858,17 +906,53 @@ async fn cmd_repos(config_path: &str, server: Option<&str>, json: bool) -> anyho
         return print_json(&json!(repos));
     }
 
-    let mut table = Table::new(&["REPO", "CHANNEL", "FORMAT", "PACKAGES", "SIZE"]);
+    let mut table = Table::new(&["REPO", "CHANNEL", "FORMAT", "MODE", "PACKAGES", "SIZE"]);
     for repo in &response.repos {
         table.row(vec![
             repo.repo.clone(),
             repo.channel.clone(),
             format_name(repo.format),
+            mode_name(repo.mode),
             repo.package_count.to_string(),
             fmt_bytes(repo.total_bytes),
         ]);
     }
     table.print("no repos yet — publish something to create one");
+    Ok(())
+}
+
+fn mode_name(value: i32) -> String {
+    match RepoMode::try_from(value) {
+        Ok(RepoMode::Public) => "public".into(),
+        Ok(RepoMode::Private) => "private".into(),
+        _ => "-".into(),
+    }
+}
+
+async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> anyhow::Result<()> {
+    let session = session(config_path, server)?;
+    let mut client = AdminServiceClient::new(connect(&session.addr).await?);
+
+    match cmd {
+        RepoCommand::Set { repo, mode } => {
+            let mode = match mode.to_ascii_lowercase().as_str() {
+                "public" => RepoMode::Public,
+                "private" => RepoMode::Private,
+                other => anyhow::bail!("mode must be `public` or `private`, got `{other}`"),
+            };
+            let response = client
+                .set_repo_mode(with_auth(
+                    SetRepoModeRequest {
+                        repo,
+                        mode: mode as i32,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            println!("{}: {}", response.repo, mode_name(response.mode));
+        }
+    }
     Ok(())
 }
 

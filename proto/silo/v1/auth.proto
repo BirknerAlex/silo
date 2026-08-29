@@ -60,7 +60,11 @@ message GetAuthInfoResponse {
   repeated string oidc_scopes = 5;
   string oidc_device_authorization_endpoint = 6;
   string oidc_token_endpoint = 7;
-  bool anonymous_read_enabled = 8;
+  // The global anonymous-read switch this used to describe has been
+  // replaced by per-repo public/private mode (see RepoInfo.mode in
+  // publish.proto). Always false; kept only because a field's number and
+  // name are never reused once shipped.
+  bool anonymous_read_enabled = 8 [deprecated = true];
 }
 
 message LoginRequest {

@@ -62,7 +62,11 @@ impl AuthService for AuthServiceImpl {
             oidc_token_endpoint: oidc
                 .map(|v| v.discovery().token_endpoint.clone())
                 .unwrap_or_default(),
-            anonymous_read_enabled: self.state.config.auth.allow_anonymous_read,
+            // Deprecated: the global switch this described has been
+            // replaced by per-repo public/private mode. See
+            // `ReadService::ListRepos`'s `RepoInfo.mode`.
+            #[allow(deprecated)]
+            anonymous_read_enabled: false,
         }))
     }
 

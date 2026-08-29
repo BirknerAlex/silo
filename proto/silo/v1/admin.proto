@@ -26,6 +26,10 @@ service AdminService {
   // backup, or an index left stale by a crash mid-publish.
   rpc RebuildIndex(RebuildIndexRequest) returns (RebuildIndexResponse);
   rpc DeletePackage(DeletePackageRequest) returns (DeletePackageResponse);
+
+  // Sets a repo's mode. Public adds unauthenticated read; it never
+  // changes who can write, and never revokes or deletes any token.
+  rpc SetRepoMode(SetRepoModeRequest) returns (SetRepoModeResponse);
 }
 
 // Which repos a token may act on.
@@ -192,4 +196,14 @@ message DeletePackageRequest {
 message DeletePackageResponse {
   bool deleted = 1;
   string storage_path = 2;
+}
+
+message SetRepoModeRequest {
+  string repo = 1;
+  RepoMode mode = 2;
+}
+
+message SetRepoModeResponse {
+  string repo = 1;
+  RepoMode mode = 2;
 }

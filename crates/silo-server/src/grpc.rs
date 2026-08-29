@@ -12,7 +12,7 @@ use silo_proto::v1::publish_service_server::PublishService;
 use silo_proto::v1::read_service_server::ReadService;
 use silo_proto::v1::{
     ListPackagesRequest, ListPackagesResponse, ListReposRequest, ListReposResponse,
-    PackageFormat as ProtoFormat, PackageInfo, PublishRequest, PublishResponse, RepoInfo,
+    PackageFormat as ProtoFormat, PackageInfo, PublishRequest, PublishResponse, RepoInfo, RepoMode,
 };
 use tonic::{Request, Response, Status, Streaming};
 
@@ -58,7 +58,13 @@ impl PublishService for PublishServiceImpl {
 
         // Authorize before reading the body: a client with no write access
         // shouldn't get to stream a gigabyte before being told no.
-        auth::require_repo(&authenticated, &metadata.repo, Permission::Write)?;
+        auth::require_repo(
+            &self.state,
+            &authenticated,
+            &metadata.repo,
+            Permission::Write,
+        )
+        .await?;
 
         let mut bytes = Vec::new();
         while let Some(msg) = stream.next().await {
@@ -169,7 +175,7 @@ impl ReadService for ReadServiceImpl {
         if req.repo.is_empty() || req.channel.is_empty() {
             return Err(Status::invalid_argument("repo and channel are required"));
         }
-        auth::require_repo(&authenticated, &req.repo, Permission::Read)?;
+        auth::require_repo(&self.state, &authenticated, &req.repo, Permission::Read).await?;
 
         // Listing reads the database, not the bucket: no LIST call, and
         // metadata that a filename could never carry (size, checksum,
@@ -213,16 +219,23 @@ impl ReadService for ReadServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // A repo-scoped token shouldn't learn which other repos exist.
+        // A repo-scoped token shouldn't learn which other repos exist —
+        // unless the repo is public, in which case everyone gets to see
+        // it, credential or not.
         let repos = summaries
             .into_iter()
-            .filter(|s| authenticated.allows(&s.repo, Permission::Read))
+            .filter(|s| authenticated.allows(&s.repo, Permission::Read) || s.public)
             .map(|s| RepoInfo {
                 format: to_proto_format(s.format.parse().unwrap_or(PackageFormat::Rpm)) as i32,
                 repo: s.repo,
                 channel: s.channel,
                 package_count: s.packages,
                 total_bytes: s.total_bytes,
+                mode: if s.public {
+                    RepoMode::Public
+                } else {
+                    RepoMode::Private
+                } as i32,
             })
             .collect();
 

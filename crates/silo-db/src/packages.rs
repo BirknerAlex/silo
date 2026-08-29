@@ -259,11 +259,17 @@ impl Db {
     pub async fn list_repos(&self) -> anyhow::Result<Vec<RepoSummary>> {
         // `sum()` over a bigint returns NUMERIC in Postgres, which will
         // not decode into i64 — hence the explicit cast. `count(*)` is
-        // already bigint and needs none.
+        // already bigint and needs none. The join is left rather than
+        // inner so a repo that predates the `repos` table backfill (or
+        // was published to before `ensure_repo` ran, in theory) still
+        // lists — just as private, via `coalesce`.
         Ok(sqlx::query_as(
-            "SELECT repo, channel, format, count(*) AS packages, \
-                    coalesce(sum(size_bytes), 0)::bigint AS total_bytes \
-             FROM packages GROUP BY repo, channel, format ORDER BY repo, channel, format",
+            "SELECT p.repo, p.channel, p.format, count(*) AS packages, \
+                    coalesce(sum(p.size_bytes), 0)::bigint AS total_bytes, \
+                    coalesce(r.public, false) AS public \
+             FROM packages p LEFT JOIN repos r ON r.repo = p.repo \
+             GROUP BY p.repo, p.channel, p.format, r.public \
+             ORDER BY p.repo, p.channel, p.format",
         )
         .fetch_all(self.pool())
         .await?)
@@ -277,6 +283,7 @@ pub struct RepoSummary {
     pub format: String,
     pub packages: i64,
     pub total_bytes: i64,
+    pub public: bool,
 }
 
 #[cfg(test)]

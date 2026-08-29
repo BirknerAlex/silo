@@ -174,6 +174,7 @@ mod tests {
             format: "rpm".into(),
             packages,
             total_bytes: bytes,
+            public: false,
         }
     }
 
