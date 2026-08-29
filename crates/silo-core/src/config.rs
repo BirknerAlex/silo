@@ -119,12 +119,6 @@ pub struct AuthConfig {
     /// Lifetime of the tokens `silo login` issues.
     #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: i64,
-
-    /// When true, `dnf`/`apk`/`npm` may read without a token. Publishing
-    /// always requires one. Off by default: a registry that's readable by
-    /// anyone who can reach the port should be an explicit decision.
-    #[serde(default)]
-    pub allow_anonymous_read: bool,
 }
 
 // Written out rather than derived: `#[serde(default)]` on the `auth` field
@@ -139,7 +133,6 @@ impl Default for AuthConfig {
             bootstrap_token_name: default_bootstrap_token_name(),
             bootstrap_username: default_bootstrap_username(),
             session_ttl_hours: default_session_ttl_hours(),
-            allow_anonymous_read: false,
         }
     }
 }
@@ -480,7 +473,6 @@ storage:
         assert_eq!(cfg.storage.bucket, "silo");
         assert_eq!(cfg.database.max_connections, 10);
         assert!(cfg.auth.bootstrap);
-        assert!(!cfg.auth.allow_anonymous_read);
         assert!(cfg.metrics.enabled);
         assert!(cfg.audit.log_downloads);
         assert_eq!(cfg.audit.retention_days, 90);
@@ -502,7 +494,6 @@ storage:
 public_base_url: "https://silo.example.com"
 auth:
   token_pepper: "pepper"
-  allow_anonymous_read: true
   session_ttl_hours: 24
 oidc:
   issuer: "https://id.example.com"
@@ -526,7 +517,6 @@ metrics:
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.auth.session_ttl_hours, 24);
-        assert!(cfg.auth.allow_anonymous_read);
         assert_eq!(
             cfg.oidc.as_ref().unwrap().username_claim,
             "preferred_username"

@@ -25,6 +25,7 @@ pub mod action {
     pub const PACKAGE_DOWNLOAD: &str = "package.download";
     pub const PACKAGE_DELETE: &str = "package.delete";
     pub const INDEX_REGENERATE: &str = "index.regenerate";
+    pub const REPO_SET_MODE: &str = "repo.set_mode";
     pub const TOKEN_CREATE: &str = "token.create";
     pub const TOKEN_REVOKE: &str = "token.revoke";
     pub const USER_CREATE: &str = "user.create";

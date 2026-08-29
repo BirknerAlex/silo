@@ -179,7 +179,6 @@ storage:
 
 auth:
   bootstrap: true
-  allow_anonymous_read: false
 
 audit:
   log_downloads: true

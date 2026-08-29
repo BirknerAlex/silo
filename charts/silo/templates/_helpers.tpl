@@ -163,7 +163,6 @@ storage:
 auth:
   bootstrap: {{ .Values.config.auth.bootstrap }}
   session_ttl_hours: {{ .Values.config.auth.sessionTtlHours }}
-  allow_anonymous_read: {{ .Values.config.auth.allowAnonymousRead }}
   {{- if .Values.config.auth.tokenPepperExistingSecret }}
   token_pepper: "${SILO_TOKEN_PEPPER}"
   {{- else if .Values.config.auth.tokenPepper }}

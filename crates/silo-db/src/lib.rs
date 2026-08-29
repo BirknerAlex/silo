@@ -14,6 +14,7 @@
 pub mod audit;
 pub mod lock;
 pub mod packages;
+pub mod repos;
 pub mod tokens;
 pub mod users;
 

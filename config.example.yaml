@@ -51,10 +51,6 @@ auth:
   # Lifetime of the tokens `silo login` issues. 720h = 30 days.
   session_ttl_hours: 720
 
-  # Let dnf/apk/npm read without a credential. Publishing always needs one.
-  # Off by default: a readable-by-anyone registry should be a decision.
-  allow_anonymous_read: false
-
 audit:
   # Record every authenticated package download. Index fetches are never
   # audited — `dnf makecache` across a fleet would bury the log.

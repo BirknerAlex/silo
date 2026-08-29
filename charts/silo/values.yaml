@@ -154,8 +154,6 @@ config:
     tokenPepper: ""
     tokenPepperExistingSecret: ""
     sessionTtlHours: 720
-    # Let dnf/apk/npm read without a credential. Publishing always needs one.
-    allowAnonymousRead: false
 
   audit:
     logDownloads: true

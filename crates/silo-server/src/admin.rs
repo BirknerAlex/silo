@@ -16,9 +16,10 @@ use silo_proto::v1::{
     AuditEntry as ProtoAuditEntry, CreateTokenRequest, CreateTokenResponse, CreateUserRequest,
     CreateUserResponse, DeletePackageRequest, DeletePackageResponse, DeleteUserRequest,
     DeleteUserResponse, ListTokensRequest, ListTokensResponse, ListUsersRequest, ListUsersResponse,
-    QueryAuditRequest, QueryAuditResponse, RebuildIndexRequest, RebuildIndexResponse,
-    RevokeTokenRequest, RevokeTokenResponse, SetUserDisabledRequest, SetUserDisabledResponse,
-    SetUserPasswordRequest, SetUserPasswordResponse, TokenInfo, TokenScope as ProtoScope, UserInfo,
+    QueryAuditRequest, QueryAuditResponse, RebuildIndexRequest, RebuildIndexResponse, RepoMode,
+    RevokeTokenRequest, RevokeTokenResponse, SetRepoModeRequest, SetRepoModeResponse,
+    SetUserDisabledRequest, SetUserDisabledResponse, SetUserPasswordRequest,
+    SetUserPasswordResponse, TokenInfo, TokenScope as ProtoScope, UserInfo,
 };
 use tonic::{Request, Response, Status};
 
@@ -399,7 +400,7 @@ impl AdminService for AdminServiceImpl {
         auth::require_admin(&caller)?;
         let req = request.into_inner();
 
-        auth::require_repo(&caller, &req.repo, Permission::Write)?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
         let format = from_proto_format(req.format)
             .ok_or_else(|| Status::invalid_argument("format is required"))?;
 
@@ -471,6 +472,51 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(DeletePackageResponse {
             deleted: storage_path.is_some(),
             storage_path: storage_path.unwrap_or_default(),
+        }))
+    }
+
+    async fn set_repo_mode(
+        &self,
+        request: Request<SetRepoModeRequest>,
+    ) -> Result<Response<SetRepoModeResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let public = match RepoMode::try_from(req.mode).unwrap_or(RepoMode::Unspecified) {
+            RepoMode::Public => true,
+            RepoMode::Private => false,
+            RepoMode::Unspecified => {
+                return Err(Status::invalid_argument("mode must be public or private"))
+            }
+        };
+
+        self.state
+            .db
+            .set_repo_public(&req.repo, public)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        self.state
+            .db
+            .record_audit(
+                AuditEntry::new(audit::action::REPO_SET_MODE, &caller.actor)
+                    .repo(&req.repo)
+                    .detail(serde_json::json!({ "public": public })),
+            )
+            .await;
+
+        let mode = if public {
+            RepoMode::Public
+        } else {
+            RepoMode::Private
+        };
+        Ok(Response::new(SetRepoModeResponse {
+            repo: req.repo,
+            mode: mode as i32,
         }))
     }
 }

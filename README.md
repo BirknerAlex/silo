@@ -341,7 +341,7 @@ signing key configured it returns 404.
 ## Administration
 
 ```sh
-silo repos                                              # what exists
+silo repos                                              # what exists, and its MODE
 silo delete --id 42                                     # remove a package
 silo index rebuild --repo myrepo --channel stable --format apk
 ```
@@ -349,6 +349,29 @@ silo index rebuild --repo myrepo --channel stable --format apk
 `index rebuild` regenerates from the database alone, which is the repair
 path after restoring a bucket from backup or a crash mid-publish. Omit
 `--group` to rebuild every group of that format.
+
+### Repo mode
+
+Every repo is **private** by default: reading or writing it needs a token
+scoped to it, same as always. An admin can flip a repo to **public**:
+
+```sh
+silo repo set myrepo --mode=public
+silo repo set myrepo --mode=private
+```
+
+Public only adds unauthenticated *read* — `dnf`/`apk`/`npm` can pull from
+it with no credential, and `silo repos`/`silo list` work against it
+without `silo login`. It changes nothing about who can write: a token
+that already had write access keeps it, public or not, and an
+uncredentialed caller can still never publish. Going private again simply
+removes the unauthenticated-read allowance; no token is ever revoked or
+deleted by a mode change in either direction.
+
+A repo you have no access to — private and outside your token's scope, or
+nonexistent — behaves identically either way: `silo repos` never lists
+it, and `silo list`/a direct pull 404s, so there's nothing to tell the two
+apart from the outside.
 
 ### Versions
 

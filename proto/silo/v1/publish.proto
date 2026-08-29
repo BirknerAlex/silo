@@ -98,4 +98,15 @@ message RepoInfo {
   PackageFormat format = 3;
   int64 package_count = 4;
   int64 total_bytes = 5;
+  RepoMode mode = 6;
+}
+
+// Whether a repo is readable without a credential. Writes are never
+// affected by this — a token with write access to a repo keeps it
+// regardless of the repo's mode; "public" only means reads no longer
+// require a credential too.
+enum RepoMode {
+  REPO_MODE_UNSPECIFIED = 0;
+  REPO_MODE_PRIVATE = 1;
+  REPO_MODE_PUBLIC = 2;
 }

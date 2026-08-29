@@ -26,8 +26,10 @@ use crate::AppState;
 /// A successfully authenticated caller.
 #[derive(Debug, Clone)]
 pub struct Authenticated {
-    /// `None` for anonymous readers, which only exist when
-    /// `auth.allow_anonymous_read` is on.
+    /// `None` for a caller that presented no credential at all. Any
+    /// gRPC or HTTP request may arrive this way now; what an anonymous
+    /// caller can actually do is decided per repo (see [`require_repo`]
+    /// and `http::authorize_read`), not here.
     pub token: Option<Token>,
     pub actor: Actor,
 }
@@ -40,15 +42,17 @@ impl Authenticated {
         }
     }
 
-    /// Whether this caller may act on `repo` at `required`.
+    /// Whether this caller's *token* grants `required` on `repo`.
     ///
-    /// Anonymous callers can only ever read, and only because the operator
-    /// turned that on — the anonymous branch never grants write, so a
-    /// misconfiguration can't escalate past what it says on the tin.
+    /// This is scope-and-permission only — it says nothing about a repo's
+    /// public bit. A caller with no token always gets `false` here; a
+    /// public repo's unauthenticated-read allowance is layered on
+    /// separately by [`require_repo`] and `http::authorize_read`, which
+    /// both need a database lookup this method has no access to.
     pub fn allows(&self, repo: &str, required: Permission) -> bool {
         match &self.token {
             Some(token) => token.allows(repo, required),
-            None => required == Permission::Read,
+            None => false,
         }
     }
 
@@ -74,6 +78,12 @@ impl Authenticated {
 pub enum CredentialSource {
     Bearer,
     Basic,
+    /// An `Authorization` header was present but its scheme is neither
+    /// `Bearer` nor `Basic` (e.g. `Digest ...`). Distinct from `None` so
+    /// it's never mistaken for "no credential was presented" — a caller
+    /// who tried to authenticate and failed must be rejected, not quietly
+    /// downgraded to anonymous.
+    Unsupported,
     None,
 }
 
@@ -105,7 +115,7 @@ pub fn extract_credential(headers: &HeaderMap) -> (Option<String>, CredentialSou
         }
         return (Some(password.to_string()), CredentialSource::Basic);
     }
-    (None, CredentialSource::None)
+    (None, CredentialSource::Unsupported)
 }
 
 /// Verifies a presented token and builds the [`Actor`] used for auditing.
@@ -147,8 +157,12 @@ pub async fn authenticate(
     })
 }
 
-/// Authenticates an HTTP request, falling back to anonymous when the
-/// server allows unauthenticated reads.
+/// Authenticates an HTTP request. A request with no credential at all
+/// becomes an anonymous caller rather than an error — what that caller
+/// can actually reach is decided per repo by the caller of this function
+/// (see `authorize_read`), not here. A credential that *was* presented but
+/// doesn't parse (garbled Basic, an empty Bearer) still errors: silently
+/// downgrading that to anonymous would hide a client misconfiguration.
 pub async fn authenticate_http(
     state: &AppState,
     headers: &HeaderMap,
@@ -157,9 +171,7 @@ pub async fn authenticate_http(
     let (credential, source) = extract_credential(headers);
     match credential {
         Some(token) => authenticate(state, &token, remote_addr).await,
-        None if source == CredentialSource::None && state.config.auth.allow_anonymous_read => {
-            Ok(Authenticated::anonymous(remote_addr))
-        }
+        None if source == CredentialSource::None => Ok(Authenticated::anonymous(remote_addr)),
         None => Err(AuthError::Malformed),
     }
 }
@@ -170,43 +182,39 @@ pub async fn authenticate_http(
 /// isn't `Sync` — borrowing it across an `.await` would make every
 /// handler's future non-`Send` and tonic wouldn't accept it.
 pub struct GrpcCredential {
-    token: String,
+    /// `None` when the request carried no `authorization` metadata at
+    /// all — that's an anonymous caller, not an error.
+    token: Option<String>,
     remote_addr: Option<String>,
 }
 
 #[allow(clippy::result_large_err)]
 pub fn extract_grpc_credential<T>(
-    state: &AppState,
+    _state: &AppState,
     request: &Request<T>,
 ) -> Result<GrpcCredential, Status> {
+    let remote_addr = request.remote_addr().map(|a| a.ip().to_string());
     let raw = request
         .metadata()
         .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            state
-                .metrics
-                .auth_failures
-                .with_label_values(&["missing"])
-                .inc();
-            Status::unauthenticated("missing authorization header")
-        })?;
+        .and_then(|v| v.to_str().ok());
 
-    let token = raw
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| Status::unauthenticated("expected `Bearer <token>`"))?
-        .trim()
-        .to_string();
+    let token = match raw {
+        Some(raw) => Some(
+            raw.strip_prefix("Bearer ")
+                .ok_or_else(|| Status::unauthenticated("expected `Bearer <token>`"))?
+                .trim()
+                .to_string(),
+        ),
+        None => None,
+    };
 
-    Ok(GrpcCredential {
-        token,
-        remote_addr: request.remote_addr().map(|a| a.ip().to_string()),
-    })
+    Ok(GrpcCredential { token, remote_addr })
 }
 
-/// gRPC equivalent of [`authenticate_http`]. There is no anonymous branch:
-/// every gRPC method either publishes, manages, or reads metadata, and
-/// none of those are things an unauthenticated caller should reach.
+/// gRPC equivalent of [`authenticate_http`]. A request with no credential
+/// becomes an anonymous caller rather than an error, same reasoning as
+/// the HTTP side: what it can reach is decided per repo, downstream.
 pub async fn authenticate_grpc<T>(
     state: &Arc<AppState>,
     request: &Request<T>,
@@ -219,9 +227,12 @@ pub async fn authenticate_credential(
     state: &Arc<AppState>,
     credential: GrpcCredential,
 ) -> Result<Authenticated, Status> {
-    authenticate(state, &credential.token, credential.remote_addr)
-        .await
-        .map_err(|e| auth_error_to_status(state, e))
+    match credential.token {
+        Some(token) => authenticate(state, &token, credential.remote_addr)
+            .await
+            .map_err(|e| auth_error_to_status(state, e)),
+        None => Ok(Authenticated::anonymous(credential.remote_addr)),
+    }
 }
 
 /// Maps an authentication failure onto a gRPC status, counting it by
@@ -253,10 +264,37 @@ pub fn auth_error_to_status(state: &AppState, error: AuthError) -> Status {
 }
 
 /// Enforces a permission on a repo, returning a gRPC status on refusal.
+///
+/// A repo's public bit only ever widens `Read` for a caller whose token
+/// wouldn't otherwise reach it — it never affects `Write`/`Admin`, and it
+/// never *replaces* the token check for `Read` either, so a token with
+/// real scope still gets the ordinary answer.
+///
+/// A `Read` refusal reports `NotFound` rather than `PermissionDenied`,
+/// deliberately: a private repo and one that doesn't exist have to look
+/// identical to a caller without access, or the status code itself would
+/// leak which repos exist. `Write`/`Admin` refusals stay
+/// `PermissionDenied`, unchanged.
 #[allow(clippy::result_large_err)] // Status is tonic's error type; boxing it here would just move the cost to callers
-pub fn require_repo(auth: &Authenticated, repo: &str, required: Permission) -> Result<(), Status> {
+pub async fn require_repo(
+    state: &AppState,
+    auth: &Authenticated,
+    repo: &str,
+    required: Permission,
+) -> Result<(), Status> {
     if auth.allows(repo, required) {
         return Ok(());
+    }
+    if required == Permission::Read {
+        let public = state
+            .db
+            .is_repo_public(repo)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if public {
+            return Ok(());
+        }
+        return Err(Status::not_found(format!("no repo `{repo}`")));
     }
     Err(Status::permission_denied(format!(
         "token `{}` lacks {required} access to repo `{repo}`",
@@ -351,13 +389,22 @@ mod tests {
         assert!(extract_credential(&headers_with("Basic !!!not-base64"))
             .0
             .is_none());
-        assert!(extract_credential(&headers_with("Digest whatever"))
-            .0
-            .is_none());
         assert!(extract_credential(&headers_with("Bearer "))
             .0
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn an_unsupported_scheme_is_distinct_from_no_credential_at_all() {
+        // A header that *was* presented but couldn't be understood must
+        // never be mistaken for "no credential" — see
+        // `authenticate_http_rejects_an_unsupported_scheme_instead_of_treating_it_as_anonymous`
+        // for why that distinction matters.
+        let (token, source) = extract_credential(&headers_with("Digest whatever"));
+        assert!(token.is_none());
+        assert_eq!(source, CredentialSource::Unsupported);
+        assert_ne!(source, CredentialSource::None);
     }
 
     #[test]
@@ -370,9 +417,12 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_callers_can_only_ever_read() {
+    fn a_token_less_caller_never_gets_a_yes_from_allows() {
+        // `allows` is scope-and-permission only now; a public repo's
+        // unauthenticated-read allowance is layered on separately by
+        // `require_repo`, exercised below.
         let anon = Authenticated::anonymous(None);
-        assert!(anon.allows("anything", Permission::Read));
+        assert!(!anon.allows("anything", Permission::Read));
         assert!(!anon.allows("anything", Permission::Write));
         assert!(!anon.allows("anything", Permission::Admin));
         assert!(!anon.is_admin());
@@ -388,12 +438,20 @@ mod tests {
         assert!(admin.allows("only-this", Permission::Admin));
     }
 
-    #[test]
-    fn require_helpers_produce_permission_denied() {
+    #[tokio::test]
+    async fn require_helpers_produce_permission_denied() {
+        // Neither branch below reaches the database: a scoped `Read`
+        // succeeds via `allows` alone, and a scoped-out `Write` is
+        // rejected before any repo lookup — see `require_repo`.
+        let state = crate::http::tests::test_state_with(|_| {});
         let reader = authed(Permission::Read, Scope::All);
-        assert!(require_repo(&reader, "r", Permission::Read).is_ok());
+        assert!(require_repo(&state, &reader, "r", Permission::Read)
+            .await
+            .is_ok());
 
-        let err = require_repo(&reader, "r", Permission::Write).unwrap_err();
+        let err = require_repo(&state, &reader, "r", Permission::Write)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("write"));
 
@@ -402,5 +460,67 @@ mod tests {
             tonic::Code::PermissionDenied
         );
         assert!(require_admin(&authed(Permission::Admin, Scope::All)).is_ok());
+    }
+
+    /// The database-backed half of `require_repo`'s behaviour: whether a
+    /// repo is public. Needs a real database because it's the one branch
+    /// that queries one.
+    #[tokio::test]
+    async fn require_repo_falls_back_to_the_public_bit_for_reads_only() {
+        let Ok(url) = std::env::var("SILO_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set SILO_TEST_DATABASE_URL");
+            return;
+        };
+        if url.trim().is_empty() {
+            eprintln!("skipping: set SILO_TEST_DATABASE_URL");
+            return;
+        }
+        let db = silo_db::Db::connect(&silo_db::DbConfig {
+            url,
+            max_connections: 4,
+            connect_timeout: std::time::Duration::from_secs(30),
+            token_pepper: None,
+        })
+        .await
+        .expect("connect to the test database");
+
+        let mut state = crate::http::tests::test_state_with(|_| {});
+        state.db = db.clone();
+        state.publish.db = db.clone();
+
+        let repo = format!("require-repo-{}", uuid::Uuid::new_v4().simple());
+        let outsider = authed(Permission::Read, Scope::Repos(vec!["other".into()]));
+
+        // Private (no row at all yet): an out-of-scope read is refused as
+        // NotFound, not PermissionDenied — it must be indistinguishable
+        // from a repo that doesn't exist.
+        let err = require_repo(&state, &outsider, &repo, Permission::Read)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // An out-of-scope write stays PermissionDenied regardless.
+        let err = require_repo(&state, &outsider, &repo, Permission::Write)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        db.set_repo_public(&repo, true).await.unwrap();
+
+        // Public: the same out-of-scope reader can now read...
+        assert!(require_repo(&state, &outsider, &repo, Permission::Read)
+            .await
+            .is_ok());
+        // ...but still cannot write. Public never grants write.
+        let err = require_repo(&state, &outsider, &repo, Permission::Write)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // A token that already had write scope keeps it, public or not.
+        let writer = authed(Permission::Write, Scope::Repos(vec![repo.clone()]));
+        assert!(require_repo(&state, &writer, &repo, Permission::Write)
+            .await
+            .is_ok());
     }
 }
