@@ -78,6 +78,12 @@ impl Authenticated {
 pub enum CredentialSource {
     Bearer,
     Basic,
+    /// An `Authorization` header was present but its scheme is neither
+    /// `Bearer` nor `Basic` (e.g. `Digest ...`). Distinct from `None` so
+    /// it's never mistaken for "no credential was presented" — a caller
+    /// who tried to authenticate and failed must be rejected, not quietly
+    /// downgraded to anonymous.
+    Unsupported,
     None,
 }
 
@@ -109,7 +115,7 @@ pub fn extract_credential(headers: &HeaderMap) -> (Option<String>, CredentialSou
         }
         return (Some(password.to_string()), CredentialSource::Basic);
     }
-    (None, CredentialSource::None)
+    (None, CredentialSource::Unsupported)
 }
 
 /// Verifies a presented token and builds the [`Actor`] used for auditing.
@@ -383,13 +389,22 @@ mod tests {
         assert!(extract_credential(&headers_with("Basic !!!not-base64"))
             .0
             .is_none());
-        assert!(extract_credential(&headers_with("Digest whatever"))
-            .0
-            .is_none());
         assert!(extract_credential(&headers_with("Bearer "))
             .0
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn an_unsupported_scheme_is_distinct_from_no_credential_at_all() {
+        // A header that *was* presented but couldn't be understood must
+        // never be mistaken for "no credential" — see
+        // `authenticate_http_rejects_an_unsupported_scheme_instead_of_treating_it_as_anonymous`
+        // for why that distinction matters.
+        let (token, source) = extract_credential(&headers_with("Digest whatever"));
+        assert!(token.is_none());
+        assert_eq!(source, CredentialSource::Unsupported);
+        assert_ne!(source, CredentialSource::None);
     }
 
     #[test]

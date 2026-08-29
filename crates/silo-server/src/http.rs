@@ -896,6 +896,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_unsupported_auth_scheme_is_rejected_not_treated_as_anonymous() {
+        // This is rejected in `authenticate_http` itself, before any repo
+        // is looked up — so unlike the rest of this module's repo-content
+        // tests, no database is needed here. A header that was presented
+        // but couldn't be understood must never be silently downgraded to
+        // anonymous, which would hide a client's broken auth setup behind
+        // a misleadingly successful response on a public repo.
+        let state = Arc::new(test_state_with(|_| {}));
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/myrepo/stable/repodata/repomd.xml")
+                    .header(header::AUTHORIZATION, "Digest whatever")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn repodata_is_proxied_with_the_right_content_type() {
         let state = require_public_repo_state!();
         state
