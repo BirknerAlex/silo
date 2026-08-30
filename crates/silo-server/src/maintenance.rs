@@ -72,10 +72,9 @@ pub async fn run(state: Arc<AppState>) {
     loop {
         refresh_inventory(&state).await;
 
-        let now = Utc::now();
         for job in jobs.iter_mut() {
             let Some(next) = job.next else { continue };
-            if now >= next {
+            if Utc::now() >= next {
                 tracing::debug!(job = job.name, "running scheduled job");
                 (job.run)(state.clone()).await;
                 job.next = job.schedule.as_ref().and_then(|s| s.upcoming(Utc).next());

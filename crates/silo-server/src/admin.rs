@@ -534,10 +534,17 @@ impl AdminService for AdminServiceImpl {
 
         silo_core::config::validate_repo_name("repo", &req.repo)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
         if req.keep_last_n.is_none() && req.max_age_days.is_none() {
             return Err(Status::invalid_argument(
                 "at least one of keep_last_n or max_age_days is required",
             ));
+        }
+        if req.keep_last_n.is_some_and(|n| n <= 0) {
+            return Err(Status::invalid_argument("keep_last_n must be positive"));
+        }
+        if req.max_age_days.is_some_and(|n| n <= 0) {
+            return Err(Status::invalid_argument("max_age_days must be positive"));
         }
 
         let rule = self
@@ -575,6 +582,7 @@ impl AdminService for AdminServiceImpl {
 
         silo_core::config::validate_repo_name("repo", &req.repo)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
 
         let cleared = self
             .state
@@ -607,6 +615,7 @@ impl AdminService for AdminServiceImpl {
 
         silo_core::config::validate_repo_name("repo", &req.repo)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
 
         let rule = self
             .state
@@ -630,6 +639,7 @@ impl AdminService for AdminServiceImpl {
 
         silo_core::config::validate_repo_name("repo", &req.repo)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
         let name = req.name.trim();
         if name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
@@ -675,6 +685,7 @@ impl AdminService for AdminServiceImpl {
 
         silo_core::config::validate_repo_name("repo", &req.repo)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
 
         let names = self
             .state
@@ -698,6 +709,24 @@ impl AdminService for AdminServiceImpl {
             return Err(Status::failed_precondition(
                 "pruning is disabled (`prune.enabled` is false in server config)",
             ));
+        }
+
+        if req.repo.is_empty() {
+            // An empty repo filter processes every configured rule across
+            // every repo — only a token scoped to all repos may trigger
+            // that; a repo-scoped admin token must name the repo(s) it
+            // actually has access to.
+            let has_global_scope = caller
+                .token
+                .as_ref()
+                .is_some_and(|t| matches!(t.scope, Scope::All));
+            if !has_global_scope {
+                return Err(Status::permission_denied(
+                    "a repo-scoped admin token must pass a repo; only a token scoped to every repo can run an unscoped prune",
+                ));
+            }
+        } else {
+            auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
         }
 
         let scope = silo_core::prune::PruneScope {
