@@ -26,6 +26,10 @@ pub mod action {
     pub const PACKAGE_DELETE: &str = "package.delete";
     pub const INDEX_REGENERATE: &str = "index.regenerate";
     pub const REPO_SET_MODE: &str = "repo.set_mode";
+    pub const PRUNE_RULE_SET: &str = "prune.rule_set";
+    pub const PRUNE_RULE_CLEAR: &str = "prune.rule_clear";
+    pub const PRUNE_EXEMPTION_SET: &str = "prune.exemption_set";
+    pub const REPO_PRUNE_RUN: &str = "repo.prune_run";
     pub const TOKEN_CREATE: &str = "token.create";
     pub const TOKEN_REVOKE: &str = "token.revoke";
     pub const USER_CREATE: &str = "user.create";

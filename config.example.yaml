@@ -65,6 +65,23 @@ metrics:
   # outside the cluster.
   require_auth: false
 
+# Retention-based package deletion. Off by default, since pruning deletes
+# packages. Per-(repo, channel) rules and exemptions are configured at
+# runtime with `silo repo set-prune-rule` / `silo repo prune-exempt`, not
+# here — this only flips the feature on and off.
+# prune:
+#   enabled: false
+
+# Cron schedules for background jobs (6 fields, seconds first). Every job
+# has a built-in default that preserves silo's historical housekeeping
+# cadence, except `package_prune`, which runs automatically only once you
+# set a schedule for it here — otherwise pruning happens exclusively when
+# `silo prune` is run by hand.
+# jobs:
+#   session_cleanup: "0 */5 * * * *"
+#   audit_prune: "0 0 * * * *"
+#   package_prune: "0 0 3 * * *"
+
 # Optional single sign-on. The CLI runs the device authorization grant
 # directly against the provider, so the server never sees user credentials
 # and a client secret is not required for public clients.

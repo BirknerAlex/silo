@@ -942,8 +942,8 @@ pub(crate) mod tests {
     use axum::http::Request;
     use base64::Engine;
     use silo_core::config::{
-        AuditConfig, AuthConfig, Config, DatabaseConfig, MetricsConfig, SigningConfig,
-        StorageConfig,
+        AuditConfig, AuthConfig, Config, DatabaseConfig, JobsConfig, MetricsConfig, PruneConfig,
+        SigningConfig, StorageConfig,
     };
     use silo_core::Storage;
     use tower::ServiceExt;
@@ -977,6 +977,8 @@ pub(crate) mod tests {
             signing: SigningConfig::default(),
             audit: AuditConfig::default(),
             metrics: MetricsConfig::default(),
+            prune: PruneConfig::default(),
+            jobs: JobsConfig::default(),
         };
         tweak(&mut config);
 

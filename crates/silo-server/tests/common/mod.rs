@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use silo_core::config::{
-    AuditConfig, AuthConfig, Config, DatabaseConfig, MetricsConfig, SigningConfig, StorageConfig,
+    AuditConfig, AuthConfig, Config, DatabaseConfig, JobsConfig, MetricsConfig, PruneConfig,
+    SigningConfig, StorageConfig,
 };
 use silo_core::{PublishContext, Signers, Storage};
 use silo_db::tokens::{IssuedToken, NewToken, Permission, Scope, TokenKind};
@@ -104,6 +105,8 @@ impl Harness {
             signing: SigningConfig::default(),
             audit: AuditConfig::default(),
             metrics: MetricsConfig::default(),
+            prune: PruneConfig::default(),
+            jobs: JobsConfig::default(),
         };
         tweak(&mut config);
 

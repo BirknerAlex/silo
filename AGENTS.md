@@ -40,6 +40,31 @@ Practical consequences:
 - When you change behaviour, rewrite the surrounding prose to describe the
   new behaviour. Do not append a note saying it changed.
 
+## The wiki is part of the documentation
+
+The [GitHub wiki](https://github.com/BirknerAlex/silo/wiki) carries the
+detail the README only links to: architecture, per-format client setup,
+deployment, and contributing. It is a separate git repository
+(`git@github.com:BirknerAlex/silo.wiki.git`), not part of this checkout, so
+it does not show up in `git status` or a normal diff — nothing enforces
+that it stays current, which is exactly why it needs deliberate attention.
+
+A change that touches what the wiki describes updates the wiki in the same
+pass, not as separate, easily-forgotten follow-up:
+
+- A new package format, config option, chart value, or CLI command needs
+  the matching wiki page updated alongside the code.
+- A behaviour change (auth, signing, repo modes, deployment) is edited in
+  place on the page that already covers it, the same present-tense rule as
+  the README (see above) — no "previously" on the wiki either.
+- Removing or renaming something in silo means removing or updating the
+  wiki content that documented it, not leaving a page describing something
+  that no longer exists.
+
+Clone it once (`git clone git@github.com:BirknerAlex/silo.wiki.git`), edit
+the relevant `.md` file, commit, and push — there is no review step, a push
+to `master` publishes immediately.
+
 ## The version lives in one number
 
 `[workspace.package] version` in the root `Cargo.toml` is silo's version.

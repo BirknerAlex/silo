@@ -21,6 +21,8 @@ pgp.workspace = true
 rand.workspace = true
 rsa.workspace = true
 sha2.workspace = true
+cron.workspace = true
+chrono.workspace = true
 sha1 = "0.10"
 url = "2"
 reqwest = { workspace = true }
