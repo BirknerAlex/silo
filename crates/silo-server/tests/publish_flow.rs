@@ -543,7 +543,7 @@ async fn deleting_a_noarch_apk_removes_it_from_every_architecture() {
         .find(|p| p.name == "portable")
         .expect("the noarch row")
         .id;
-    silo_core::repo::delete_package(&harness.state.publish, id, &actor())
+    silo_core::repo::delete_package(&harness.state.publish, id, &actor(), None)
         .await
         .unwrap();
 
@@ -913,7 +913,7 @@ async fn deleting_a_package_removes_it_from_storage_and_the_index() {
     let rows = harness.db.list_packages(&repo, "edge", None).await.unwrap();
     let goner = rows.iter().find(|r| r.name == "goner").unwrap();
 
-    let deleted = silo_core::repo::delete_package(&harness.state.publish, goner.id, &actor())
+    let deleted = silo_core::repo::delete_package(&harness.state.publish, goner.id, &actor(), None)
         .await
         .expect("delete the package");
     assert_eq!(deleted.as_deref(), Some(goner.storage_key.as_str()));

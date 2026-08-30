@@ -1,5 +1,6 @@
 pub mod config;
 pub mod oidc;
+pub mod prune;
 pub mod repo;
 pub mod signing;
 pub mod storage;

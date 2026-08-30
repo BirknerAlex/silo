@@ -59,6 +59,7 @@ jsonwebtoken = "9"
 base64 = "0.22"
 hex = "0.4"
 semver = "1"
+cron = "0.15"
 
 [profile.release]
 lto = true

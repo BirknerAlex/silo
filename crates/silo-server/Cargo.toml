@@ -30,6 +30,7 @@ rand.workspace = true
 prometheus.workspace = true
 sqlx.workspace = true
 base64.workspace = true
+cron.workspace = true
 
 [dev-dependencies]
 tower = "0.5"

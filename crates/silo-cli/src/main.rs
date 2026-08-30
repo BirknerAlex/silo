@@ -24,12 +24,13 @@ use silo_proto::v1::publish_request::Payload;
 use silo_proto::v1::publish_service_client::PublishServiceClient;
 use silo_proto::v1::read_service_client::ReadServiceClient;
 use silo_proto::v1::{
-    CreateTokenRequest, CreateUserRequest, DeletePackageRequest, DeleteUserRequest,
-    GetAuthInfoRequest, GetVersionRequest, ListPackagesRequest, ListReposRequest,
-    ListTokensRequest, ListUsersRequest, LoginOidcRequest, LoginRequest,
-    PackageFormat as ProtoFormat, PublishMetadata, PublishRequest, QueryAuditRequest,
-    RebuildIndexRequest, RepoMode, RevokeTokenRequest, SetRepoModeRequest, SetUserDisabledRequest,
-    SetUserPasswordRequest, TokenScope, WhoAmIRequest,
+    ClearPruneRuleRequest, CreateTokenRequest, CreateUserRequest, DeletePackageRequest,
+    DeleteUserRequest, GetAuthInfoRequest, GetPruneRuleRequest, GetVersionRequest,
+    ListPackagesRequest, ListPruneExemptionsRequest, ListReposRequest, ListTokensRequest,
+    ListUsersRequest, LoginOidcRequest, LoginRequest, PackageFormat as ProtoFormat,
+    PublishMetadata, PublishRequest, QueryAuditRequest, RebuildIndexRequest, RepoMode,
+    RevokeTokenRequest, RunPruneRequest, SetPruneExemptionRequest, SetPruneRuleRequest,
+    SetRepoModeRequest, SetUserDisabledRequest, SetUserPasswordRequest, TokenScope, WhoAmIRequest,
 };
 use tonic::transport::{Channel, ClientTlsConfig};
 
@@ -96,6 +97,21 @@ enum Command {
         /// Package id, as shown by `silo list`.
         #[arg(long)]
         id: i64,
+    },
+    /// Run pruning now, ignoring the schedule. Requires `prune.enabled` in
+    /// server config and a configured rule for the targeted scope(s).
+    Prune {
+        /// Limit to one repo. Omit to run every configured rule.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Requires `--repo`.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Report what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -166,6 +182,47 @@ enum RepoCommand {
         /// "public" or "private".
         #[arg(long)]
         mode: String,
+    },
+    /// Configure or clear automatic pruning for a repo/channel. At least
+    /// one of `--keep-last`/`--max-age-days` is required unless `--clear`
+    /// is given. Admin only.
+    SetPruneRule {
+        repo: String,
+        #[arg(long)]
+        channel: String,
+        /// Keep only the N most recently published versions per package.
+        #[arg(long)]
+        keep_last: Option<i32>,
+        /// Delete versions published more than this many days ago.
+        #[arg(long)]
+        max_age_days: Option<i32>,
+        /// Remove the rule entirely. Mutually exclusive with the flags above.
+        #[arg(long, conflicts_with_all = ["keep_last", "max_age_days"])]
+        clear: bool,
+    },
+    /// Show the prune rule configured for a repo/channel, if any.
+    GetPruneRule {
+        repo: String,
+        #[arg(long)]
+        channel: String,
+    },
+    /// Exempt (or un-exempt) every version of a package name from pruning.
+    /// Admin only.
+    PruneExempt {
+        repo: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        name: String,
+        /// Remove the exemption instead of adding it.
+        #[arg(long)]
+        remove: bool,
+    },
+    /// List package names exempted from pruning for a repo/channel.
+    ListPruneExemptions {
+        repo: String,
+        #[arg(long)]
+        channel: String,
     },
 }
 
@@ -300,6 +357,30 @@ async fn main() -> anyhow::Result<()> {
         Command::Index(cmd) => cmd_index(&config_path, cli.server.as_deref(), cmd).await,
         Command::Version { json } => cmd_version(&config_path, cli.server.as_deref(), json).await,
         Command::Delete { id } => cmd_delete(&config_path, cli.server.as_deref(), id).await,
+        Command::Prune {
+            repo,
+            channel,
+            dry_run,
+            json,
+        } => {
+            if repo.as_deref().is_some_and(|v| v.trim().is_empty())
+                || channel.as_deref().is_some_and(|v| v.trim().is_empty())
+            {
+                anyhow::bail!("--repo and --channel must not be empty");
+            }
+            if channel.is_some() && repo.is_none() {
+                anyhow::bail!("--channel requires --repo");
+            }
+            cmd_prune(
+                &config_path,
+                cli.server.as_deref(),
+                repo,
+                channel,
+                dry_run,
+                json,
+            )
+            .await
+        }
     }
 }
 
@@ -954,8 +1035,118 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
                 .into_inner();
             println!("{}: {}", response.repo, mode_name(response.mode));
         }
+        RepoCommand::SetPruneRule {
+            repo,
+            channel,
+            keep_last,
+            max_age_days,
+            clear,
+        } => {
+            if clear {
+                let response = client
+                    .clear_prune_rule(with_auth(
+                        ClearPruneRuleRequest { repo, channel },
+                        &session.token,
+                    )?)
+                    .await?
+                    .into_inner();
+                if response.cleared {
+                    println!("prune rule cleared");
+                } else {
+                    println!("no prune rule was configured");
+                }
+                return Ok(());
+            }
+            if keep_last.is_none() && max_age_days.is_none() {
+                anyhow::bail!(
+                    "at least one of --keep-last or --max-age-days is required (or pass --clear)"
+                );
+            }
+            let response = client
+                .set_prune_rule(with_auth(
+                    SetPruneRuleRequest {
+                        repo,
+                        channel,
+                        keep_last_n: keep_last,
+                        max_age_days,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            print_prune_rule(response.rule.as_ref());
+        }
+        RepoCommand::GetPruneRule { repo, channel } => {
+            let response = client
+                .get_prune_rule(with_auth(
+                    GetPruneRuleRequest { repo, channel },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            match response.rule {
+                Some(rule) => print_prune_rule(Some(&rule)),
+                None => println!("no prune rule configured"),
+            }
+        }
+        RepoCommand::PruneExempt {
+            repo,
+            channel,
+            name,
+            remove,
+        } => {
+            let response = client
+                .set_prune_exemption(with_auth(
+                    SetPruneExemptionRequest {
+                        repo,
+                        channel,
+                        name,
+                        exempt: !remove,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            if response.exempted {
+                println!("exempted from pruning");
+            } else {
+                println!("exemption removed");
+            }
+        }
+        RepoCommand::ListPruneExemptions { repo, channel } => {
+            let response = client
+                .list_prune_exemptions(with_auth(
+                    ListPruneExemptionsRequest { repo, channel },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            if response.names.is_empty() {
+                println!("no exemptions configured");
+            } else {
+                for name in response.names {
+                    println!("{name}");
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn print_prune_rule(rule: Option<&silo_proto::v1::PruneRule>) {
+    let Some(rule) = rule else {
+        println!("no prune rule configured");
+        return;
+    };
+    println!("{}/{}", rule.repo, rule.channel);
+    println!(
+        "  keep_last_n:  {}",
+        rule.keep_last_n.map_or("-".into(), |n| n.to_string())
+    );
+    println!(
+        "  max_age_days: {}",
+        rule.max_age_days.map_or("-".into(), |n| n.to_string())
+    );
 }
 
 async fn cmd_delete(config_path: &str, server: Option<&str>, id: i64) -> anyhow::Result<()> {
@@ -970,6 +1161,77 @@ async fn cmd_delete(config_path: &str, server: Option<&str>, id: i64) -> anyhow:
         println!("deleted {} and rebuilt the index", response.storage_path);
     } else {
         println!("no package with id {id}");
+    }
+    Ok(())
+}
+
+async fn cmd_prune(
+    config_path: &str,
+    server: Option<&str>,
+    repo: Option<String>,
+    channel: Option<String>,
+    dry_run: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let session = session(config_path, server)?;
+    let mut client = AdminServiceClient::new(connect(&session.addr).await?);
+    let response = client
+        .run_prune(with_auth(
+            RunPruneRequest {
+                repo: repo.unwrap_or_default(),
+                channel: channel.unwrap_or_default(),
+                dry_run,
+            },
+            &session.token,
+        )?)
+        .await?
+        .into_inner();
+
+    if json {
+        let candidates: Vec<_> = response
+            .candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "repo": c.repo,
+                    "channel": c.channel,
+                    "format": format_name(c.format),
+                    "name": c.name,
+                    "version": c.version,
+                    "filename": c.filename,
+                    "matched_rules": c.matched_rules,
+                })
+            })
+            .collect();
+        return print_json(&json!({
+            "dry_run": response.dry_run,
+            "candidates": candidates,
+            "deleted": response.deleted,
+            "failed": response.failed,
+        }));
+    }
+
+    let mut table = Table::new(&[
+        "REPO", "CHANNEL", "FORMAT", "NAME", "VERSION", "MATCHED", "FILENAME",
+    ]);
+    for c in &response.candidates {
+        table.row(vec![
+            c.repo.clone(),
+            c.channel.clone(),
+            format_name(c.format),
+            c.name.clone(),
+            c.version.clone(),
+            c.matched_rules.join(","),
+            c.filename.clone(),
+        ]);
+    }
+    table.print("nothing to prune");
+
+    if response.dry_run {
+        println!("{} would be deleted (dry run)", response.candidates.len());
+    } else {
+        println!("{} deleted, {} failed", response.deleted, response.failed);
     }
     Ok(())
 }

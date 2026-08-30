@@ -13,13 +13,17 @@ use silo_db::Uuid;
 use silo_pkg::PackageFormat;
 use silo_proto::v1::admin_service_server::AdminService;
 use silo_proto::v1::{
-    AuditEntry as ProtoAuditEntry, CreateTokenRequest, CreateTokenResponse, CreateUserRequest,
-    CreateUserResponse, DeletePackageRequest, DeletePackageResponse, DeleteUserRequest,
-    DeleteUserResponse, ListTokensRequest, ListTokensResponse, ListUsersRequest, ListUsersResponse,
+    AuditEntry as ProtoAuditEntry, ClearPruneRuleRequest, ClearPruneRuleResponse,
+    CreateTokenRequest, CreateTokenResponse, CreateUserRequest, CreateUserResponse,
+    DeletePackageRequest, DeletePackageResponse, DeleteUserRequest, DeleteUserResponse,
+    GetPruneRuleRequest, GetPruneRuleResponse, ListPruneExemptionsRequest,
+    ListPruneExemptionsResponse, ListTokensRequest, ListTokensResponse, ListUsersRequest,
+    ListUsersResponse, PruneCandidate as ProtoPruneCandidate, PruneRule as ProtoPruneRule,
     QueryAuditRequest, QueryAuditResponse, RebuildIndexRequest, RebuildIndexResponse, RepoMode,
-    RevokeTokenRequest, RevokeTokenResponse, SetRepoModeRequest, SetRepoModeResponse,
-    SetUserDisabledRequest, SetUserDisabledResponse, SetUserPasswordRequest,
-    SetUserPasswordResponse, TokenInfo, TokenScope as ProtoScope, UserInfo,
+    RevokeTokenRequest, RevokeTokenResponse, RunPruneRequest, RunPruneResponse,
+    SetPruneExemptionRequest, SetPruneExemptionResponse, SetPruneRuleRequest, SetPruneRuleResponse,
+    SetRepoModeRequest, SetRepoModeResponse, SetUserDisabledRequest, SetUserDisabledResponse,
+    SetUserPasswordRequest, SetUserPasswordResponse, TokenInfo, TokenScope as ProtoScope, UserInfo,
 };
 use tonic::{Request, Response, Status};
 
@@ -465,7 +469,7 @@ impl AdminService for AdminServiceImpl {
         let req = request.into_inner();
 
         let storage_path =
-            silo_core::repo::delete_package(&self.state.publish, req.id, &caller.actor)
+            silo_core::repo::delete_package(&self.state.publish, req.id, &caller.actor, None)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -518,6 +522,231 @@ impl AdminService for AdminServiceImpl {
             repo: req.repo,
             mode: mode as i32,
         }))
+    }
+
+    async fn set_prune_rule(
+        &self,
+        request: Request<SetPruneRuleRequest>,
+    ) -> Result<Response<SetPruneRuleResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if req.keep_last_n.is_none() && req.max_age_days.is_none() {
+            return Err(Status::invalid_argument(
+                "at least one of keep_last_n or max_age_days is required",
+            ));
+        }
+
+        let rule = self
+            .state
+            .db
+            .set_prune_rule(&req.repo, &req.channel, req.keep_last_n, req.max_age_days)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        self.state
+            .db
+            .record_audit(
+                AuditEntry::new(audit::action::PRUNE_RULE_SET, &caller.actor)
+                    .repo(&req.repo)
+                    .channel(&req.channel)
+                    .detail(serde_json::json!({
+                        "keep_last_n": req.keep_last_n,
+                        "max_age_days": req.max_age_days,
+                    })),
+            )
+            .await;
+
+        Ok(Response::new(SetPruneRuleResponse {
+            rule: Some(to_proto_rule(&rule)),
+        }))
+    }
+
+    async fn clear_prune_rule(
+        &self,
+        request: Request<ClearPruneRuleRequest>,
+    ) -> Result<Response<ClearPruneRuleResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let cleared = self
+            .state
+            .db
+            .clear_prune_rule(&req.repo, &req.channel)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        if cleared {
+            self.state
+                .db
+                .record_audit(
+                    AuditEntry::new(audit::action::PRUNE_RULE_CLEAR, &caller.actor)
+                        .repo(&req.repo)
+                        .channel(&req.channel),
+                )
+                .await;
+        }
+
+        Ok(Response::new(ClearPruneRuleResponse { cleared }))
+    }
+
+    async fn get_prune_rule(
+        &self,
+        request: Request<GetPruneRuleRequest>,
+    ) -> Result<Response<GetPruneRuleResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let rule = self
+            .state
+            .db
+            .get_prune_rule(&req.repo, &req.channel)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(GetPruneRuleResponse {
+            rule: rule.as_ref().map(to_proto_rule),
+        }))
+    }
+
+    async fn set_prune_exemption(
+        &self,
+        request: Request<SetPruneExemptionRequest>,
+    ) -> Result<Response<SetPruneExemptionResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let name = req.name.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
+        if req.exempt {
+            self.state
+                .db
+                .add_prune_exemption(&req.repo, &req.channel, name)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        } else {
+            self.state
+                .db
+                .remove_prune_exemption(&req.repo, &req.channel, name)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+
+        self.state
+            .db
+            .record_audit(
+                AuditEntry::new(audit::action::PRUNE_EXEMPTION_SET, &caller.actor)
+                    .repo(&req.repo)
+                    .channel(&req.channel)
+                    .target(name)
+                    .detail(serde_json::json!({ "exempt": req.exempt })),
+            )
+            .await;
+
+        Ok(Response::new(SetPruneExemptionResponse {
+            exempted: req.exempt,
+        }))
+    }
+
+    async fn list_prune_exemptions(
+        &self,
+        request: Request<ListPruneExemptionsRequest>,
+    ) -> Result<Response<ListPruneExemptionsResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let names = self
+            .state
+            .db
+            .list_prune_exemptions(&req.repo, &req.channel)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(ListPruneExemptionsResponse { names }))
+    }
+
+    async fn run_prune(
+        &self,
+        request: Request<RunPruneRequest>,
+    ) -> Result<Response<RunPruneResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        if !self.state.config.prune.enabled {
+            return Err(Status::failed_precondition(
+                "pruning is disabled (`prune.enabled` is false in server config)",
+            ));
+        }
+
+        let scope = silo_core::prune::PruneScope {
+            repo: (!req.repo.is_empty()).then_some(req.repo.clone()),
+            channel: (!req.channel.is_empty()).then_some(req.channel.clone()),
+        };
+
+        let report = silo_core::prune::run(&self.state.publish, &scope, req.dry_run, &caller.actor)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(RunPruneResponse {
+            dry_run: report.dry_run,
+            candidates: report.candidates.iter().map(to_proto_candidate).collect(),
+            deleted: report.deleted as i32,
+            failed: report.failed.len() as i32,
+        }))
+    }
+}
+
+fn to_proto_rule(rule: &silo_db::prune::PruneRuleRow) -> ProtoPruneRule {
+    ProtoPruneRule {
+        repo: rule.repo.clone(),
+        channel: rule.channel.clone(),
+        keep_last_n: rule.keep_last_n,
+        max_age_days: rule.max_age_days,
+        updated_at: rule.updated_at.timestamp(),
+    }
+}
+
+fn to_proto_candidate(candidate: &silo_core::prune::PruneCandidate) -> ProtoPruneCandidate {
+    let format = candidate.format.parse().unwrap_or(PackageFormat::Rpm);
+    ProtoPruneCandidate {
+        id: candidate.id,
+        repo: candidate.repo.clone(),
+        channel: candidate.channel.clone(),
+        format: crate::grpc::to_proto_format(format) as i32,
+        index_group: candidate.index_group.clone(),
+        name: candidate.name.clone(),
+        version: candidate.version.clone(),
+        release: candidate.release.clone(),
+        arch: candidate.arch.clone(),
+        filename: candidate.filename.clone(),
+        published_at: candidate.published_at,
+        matched_rules: candidate
+            .matched_rules
+            .iter()
+            .map(|r| r.as_str().to_string())
+            .collect(),
     }
 }
 

@@ -30,6 +30,19 @@ service AdminService {
   // Sets a repo's mode. Public adds unauthenticated read; it never
   // changes who can write, and never revokes or deletes any token.
   rpc SetRepoMode(SetRepoModeRequest) returns (SetRepoModeResponse);
+
+  // Configures, inspects, or clears a repo/channel's retention rule.
+  rpc SetPruneRule(SetPruneRuleRequest) returns (SetPruneRuleResponse);
+  rpc ClearPruneRule(ClearPruneRuleRequest) returns (ClearPruneRuleResponse);
+  rpc GetPruneRule(GetPruneRuleRequest) returns (GetPruneRuleResponse);
+
+  // Exempts (or un-exempts) every version of a package name from pruning.
+  rpc SetPruneExemption(SetPruneExemptionRequest) returns (SetPruneExemptionResponse);
+  rpc ListPruneExemptions(ListPruneExemptionsRequest) returns (ListPruneExemptionsResponse);
+
+  // Runs pruning immediately, ignoring the schedule. Empty repo/channel
+  // runs every configured rule. Requires `prune.enabled` in server config.
+  rpc RunPrune(RunPruneRequest) returns (RunPruneResponse);
 }
 
 // Which repos a token may act on.
@@ -206,4 +219,99 @@ message SetRepoModeRequest {
 message SetRepoModeResponse {
   string repo = 1;
   RepoMode mode = 2;
+}
+
+message PruneRule {
+  string repo = 1;
+  string channel = 2;
+  // Unset means that rule isn't configured. Both may be set at once —
+  // a version is pruned if it violates either one.
+  optional int32 keep_last_n = 3;
+  optional int32 max_age_days = 4;
+  int64 updated_at = 5;
+}
+
+message SetPruneRuleRequest {
+  string repo = 1;
+  string channel = 2;
+  // At least one of these is required.
+  optional int32 keep_last_n = 3;
+  optional int32 max_age_days = 4;
+}
+
+message SetPruneRuleResponse {
+  PruneRule rule = 1;
+}
+
+message ClearPruneRuleRequest {
+  string repo = 1;
+  string channel = 2;
+}
+
+message ClearPruneRuleResponse {
+  bool cleared = 1;
+}
+
+message GetPruneRuleRequest {
+  string repo = 1;
+  string channel = 2;
+}
+
+message GetPruneRuleResponse {
+  // Unset means no rule is configured for this repo/channel.
+  optional PruneRule rule = 1;
+}
+
+message SetPruneExemptionRequest {
+  string repo = 1;
+  string channel = 2;
+  string name = 3;
+  // true adds the exemption, false removes it.
+  bool exempt = 4;
+}
+
+message SetPruneExemptionResponse {
+  // The resulting state after the call.
+  bool exempted = 1;
+}
+
+message ListPruneExemptionsRequest {
+  string repo = 1;
+  string channel = 2;
+}
+
+message ListPruneExemptionsResponse {
+  repeated string names = 1;
+}
+
+message RunPruneRequest {
+  // Empty runs every configured rule.
+  string repo = 1;
+  string channel = 2;
+  // Reports what would be deleted without deleting anything.
+  bool dry_run = 3;
+}
+
+message RunPruneResponse {
+  bool dry_run = 1;
+  repeated PruneCandidate candidates = 2;
+  // 0 on a dry run.
+  int32 deleted = 3;
+  int32 failed = 4;
+}
+
+message PruneCandidate {
+  int64 id = 1;
+  string repo = 2;
+  string channel = 3;
+  PackageFormat format = 4;
+  string index_group = 5;
+  string name = 6;
+  string version = 7;
+  string release = 8;
+  string arch = 9;
+  string filename = 10;
+  int64 published_at = 11;
+  // "keep_last_n", "max_age", or both.
+  repeated string matched_rules = 12;
 }

@@ -46,6 +46,12 @@ pub struct Config {
 
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    #[serde(default)]
+    pub prune: PruneConfig,
+
+    #[serde(default)]
+    pub jobs: JobsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -254,6 +260,52 @@ impl Default for AuditConfig {
     }
 }
 
+/// Global switch for package pruning. Per-(repo, channel) rules — set via
+/// `silo repo set-prune-rule` — only take effect while this is `true`;
+/// flipping it back to `false` stops both the scheduled job and manual
+/// `silo prune` runs without having to unwind any configured rule. Off by
+/// default, since pruning deletes packages.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PruneConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Cron schedules for background jobs, 6 fields with seconds first (e.g.
+/// `"0 */5 * * * *"` for every 5 minutes) — see the `cron` crate's
+/// `Schedule` format. `session_cleanup` and `audit_prune` have defaults
+/// that preserve the housekeeping cadence silo has always run at;
+/// `package_prune` has none, since automatic pruning is opt-in even when
+/// `prune.enabled` is on — leaving it unset means only `silo prune` runs
+/// it, on demand.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JobsConfig {
+    #[serde(default = "default_session_cleanup_schedule")]
+    pub session_cleanup: String,
+    #[serde(default = "default_audit_prune_schedule")]
+    pub audit_prune: String,
+    #[serde(default)]
+    pub package_prune: Option<String>,
+}
+
+fn default_session_cleanup_schedule() -> String {
+    "0 */5 * * * *".to_string()
+}
+
+fn default_audit_prune_schedule() -> String {
+    "0 0 * * * *".to_string()
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self {
+            session_cleanup: default_session_cleanup_schedule(),
+            audit_prune: default_audit_prune_schedule(),
+            package_prune: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MetricsConfig {
     #[serde(default = "default_true")]
@@ -329,6 +381,11 @@ impl Config {
         }
         if self.auth.session_ttl_hours <= 0 {
             anyhow::bail!("`auth.session_ttl_hours` must be positive");
+        }
+        validate_schedule("jobs.session_cleanup", &self.jobs.session_cleanup)?;
+        validate_schedule("jobs.audit_prune", &self.jobs.audit_prune)?;
+        if let Some(schedule) = &self.jobs.package_prune {
+            validate_schedule("jobs.package_prune", schedule)?;
         }
         Ok(())
     }
@@ -433,6 +490,19 @@ fn expand_line(input: &str) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// Parses a cron schedule at config-load time so a typo (or a 5-field
+/// expression missing the leading seconds field the `cron` crate expects)
+/// fails startup with a clear message instead of silently never firing.
+fn validate_schedule(key: &str, schedule: &str) -> anyhow::Result<()> {
+    schedule.parse::<cron::Schedule>().map_err(|e| {
+        anyhow::anyhow!(
+            "`{key}` is not a valid cron schedule: {e} \
+             (6 fields, seconds first, e.g. \"0 */5 * * * *\")"
+        )
+    })?;
+    Ok(())
+}
+
 /// Repo and channel names end up in object-storage keys, URLs, and
 /// advisory-lock scope strings. Restricting them to a conservative
 /// character set keeps all three unambiguous — in particular, no `/`,
@@ -483,6 +553,10 @@ storage:
         assert_eq!(cfg.audit.retention_days, 90);
         assert!(cfg.signing.gpg.is_none());
         assert!(cfg.oidc.is_none());
+        assert!(!cfg.prune.enabled);
+        assert_eq!(cfg.jobs.session_cleanup, "0 */5 * * * *");
+        assert_eq!(cfg.jobs.audit_prune, "0 0 * * * *");
+        assert!(cfg.jobs.package_prune.is_none());
     }
 
     #[test]
@@ -517,6 +591,12 @@ audit:
 metrics:
   enabled: true
   require_auth: true
+prune:
+  enabled: true
+jobs:
+  session_cleanup: "0 */10 * * * *"
+  audit_prune: "0 30 2 * * *"
+  package_prune: "0 0 3 * * *"
 "#
         );
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
@@ -532,6 +612,20 @@ metrics:
         );
         assert!(!cfg.audit.log_downloads);
         assert!(cfg.metrics.require_auth);
+        assert!(cfg.prune.enabled);
+        assert_eq!(cfg.jobs.session_cleanup, "0 */10 * * * *");
+        assert_eq!(cfg.jobs.package_prune.as_deref(), Some("0 0 3 * * *"));
+    }
+
+    #[test]
+    fn rejects_a_malformed_job_schedule() {
+        let yaml = format!("{MINIMAL}\njobs:\n  session_cleanup: \"not a cron\"\n");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(cfg.validate().is_err());
+
+        let yaml = format!("{MINIMAL}\njobs:\n  package_prune: \"* * * * *\"\n"); // 5 fields, missing seconds
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

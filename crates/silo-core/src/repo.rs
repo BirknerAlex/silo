@@ -403,10 +403,17 @@ async fn prune_stale_index_objects(
 }
 
 /// Removes a package and rebuilds the index without it.
+///
+/// `reason` is merged into the audit entry's `detail` (e.g.
+/// `Some(json!({"reason": "prune", "rule": "keep_last_n"}))` for a
+/// prune-triggered delete) so `package.delete` stays the one action name
+/// for "a package row is gone," with `detail` carrying why. `None` for an
+/// ordinary manual delete.
 pub async fn delete_package(
     ctx: &PublishContext,
     id: i64,
     actor: &Actor,
+    reason: Option<serde_json::Value>,
 ) -> anyhow::Result<Option<String>> {
     let Some(row) = ctx.db.delete_package(id).await? else {
         return Ok(None);
@@ -427,13 +434,20 @@ pub async fn delete_package(
     // index too, not just the noarch one.
     regenerate_sharing_groups(ctx, &row.repo, &row.channel, format, &row.index_group).await;
 
+    let mut detail = json!({ "storage_key": row.storage_key });
+    if let Some(reason) = reason {
+        if let (Some(detail), Some(reason)) = (detail.as_object_mut(), reason.as_object()) {
+            detail.extend(reason.clone());
+        }
+    }
+
     ctx.db
         .record_audit(
             AuditEntry::new(audit::action::PACKAGE_DELETE, actor)
                 .repo(&row.repo)
                 .channel(&row.channel)
                 .target(&row.filename)
-                .detail(json!({ "storage_key": row.storage_key })),
+                .detail(detail),
         )
         .await;
 
