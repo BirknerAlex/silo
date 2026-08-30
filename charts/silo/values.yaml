@@ -163,6 +163,21 @@ config:
     enabled: true
     requireAuth: false
 
+  # Package pruning deletes packages, so it's off by default even when
+  # per-(repo, channel) rules are configured via `silo repo set-prune-rule`.
+  prune:
+    enabled: false
+
+  # Cron schedules for background jobs, 6 fields with seconds first (e.g.
+  # "0 */5 * * * *" for every 5 minutes). Leave a field blank to use the
+  # server's built-in default; `packagePrune` has none, so leaving it blank
+  # means automatic pruning never runs even with `prune.enabled: true` —
+  # only `silo prune` does.
+  jobs:
+    sessionCleanup: ""
+    auditPrune: ""
+    packagePrune: ""
+
   # Optional single sign-on. Omit `issuer` to disable.
   oidc:
     issuer: ""
