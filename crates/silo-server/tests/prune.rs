@@ -7,6 +7,7 @@ mod common;
 
 use common::{unique_repo, Harness};
 use silo_db::audit::{Actor, ActorKind, AuditQuery};
+use silo_db::tokens::{Permission, Scope};
 use silo_pkg::testutil::build_test_apk;
 use silo_pkg::PackageFormat;
 use silo_proto::v1::admin_service_server::AdminService;
@@ -610,4 +611,175 @@ async fn running_with_no_configured_rule_is_a_silent_no_op() {
             .len(),
         3
     );
+}
+
+#[tokio::test]
+async fn a_repo_scoped_admin_cannot_touch_another_repos_prune_config() {
+    let url = require_db!();
+    let harness = Harness::with_config(&url, |c| c.prune.enabled = true).await;
+    let mine = unique_repo("scopedmine");
+    let other = unique_repo("scopedother");
+    let scoped_admin = harness
+        .token(
+            "scoped-admin",
+            Permission::Admin,
+            Scope::Repos(vec![mine.clone()]),
+        )
+        .await;
+
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    // Scoped to `mine`: operating on `mine` succeeds.
+    let response = service
+        .set_prune_rule(request(
+            SetPruneRuleRequest {
+                repo: mine.clone(),
+                channel: "edge".into(),
+                keep_last_n: Some(1),
+                max_age_days: None,
+            },
+            Some(&scoped_admin.secret),
+        ))
+        .await
+        .expect("scoped admin can configure its own repo");
+    assert!(response.into_inner().rule.is_some());
+
+    // The same token cannot touch a repo outside its scope.
+    let err = service
+        .set_prune_rule(request(
+            SetPruneRuleRequest {
+                repo: other.clone(),
+                channel: "edge".into(),
+                keep_last_n: Some(1),
+                max_age_days: None,
+            },
+            Some(&scoped_admin.secret),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(harness
+        .db
+        .get_prune_rule(&other, "edge")
+        .await
+        .unwrap()
+        .is_none());
+
+    let err = service
+        .clear_prune_rule(request(
+            ClearPruneRuleRequest {
+                repo: other.clone(),
+                channel: "edge".into(),
+            },
+            Some(&scoped_admin.secret),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    let err = service
+        .get_prune_rule(request(
+            GetPruneRuleRequest {
+                repo: other.clone(),
+                channel: "edge".into(),
+            },
+            Some(&scoped_admin.secret),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    let err = service
+        .set_prune_exemption(request(
+            SetPruneExemptionRequest {
+                repo: other.clone(),
+                channel: "edge".into(),
+                name: "widget".into(),
+                exempt: true,
+            },
+            Some(&scoped_admin.secret),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    let err = service
+        .list_prune_exemptions(request(
+            ListPruneExemptionsRequest {
+                repo: other.clone(),
+                channel: "edge".into(),
+            },
+            Some(&scoped_admin.secret),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn an_unscoped_prune_run_requires_global_scope() {
+    let url = require_db!();
+    let harness = Harness::with_config(&url, |c| c.prune.enabled = true).await;
+    let mine = unique_repo("unscopedmine");
+    let scoped_admin = harness
+        .token(
+            "scoped-admin",
+            Permission::Admin,
+            Scope::Repos(vec![mine.clone()]),
+        )
+        .await;
+    let global_admin = harness.admin_token().await;
+
+    harness
+        .db
+        .set_prune_rule(&mine, "edge", Some(1), None)
+        .await
+        .unwrap();
+
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    // Omitting `repo` means "every configured rule" — a repo-scoped token
+    // must not be able to trigger that.
+    let err = service
+        .run_prune(request(
+            RunPruneRequest {
+                repo: String::new(),
+                channel: String::new(),
+                dry_run: true,
+            },
+            Some(&scoped_admin.secret),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // The same scoped token can still run a prune it explicitly names.
+    service
+        .run_prune(request(
+            RunPruneRequest {
+                repo: mine.clone(),
+                channel: "edge".into(),
+                dry_run: true,
+            },
+            Some(&scoped_admin.secret),
+        ))
+        .await
+        .expect("a repo-scoped token can prune the repo it's scoped to");
+
+    // A globally-scoped admin token can still run an unscoped prune.
+    service
+        .run_prune(request(
+            RunPruneRequest {
+                repo: String::new(),
+                channel: String::new(),
+                dry_run: true,
+            },
+            Some(&global_admin.secret),
+        ))
+        .await
+        .expect("a globally-scoped admin token can run an unscoped prune");
 }
