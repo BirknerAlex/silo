@@ -177,6 +177,26 @@ metrics:
   enabled: {{ .Values.config.metrics.enabled }}
   require_auth: {{ .Values.config.metrics.requireAuth }}
 
+{{- if .Values.config.prune.enabled }}
+
+prune:
+  enabled: true
+{{- end }}
+
+{{- if or .Values.config.jobs.sessionCleanup .Values.config.jobs.auditPrune .Values.config.jobs.packagePrune }}
+
+jobs:
+  {{- with .Values.config.jobs.sessionCleanup }}
+  session_cleanup: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.jobs.auditPrune }}
+  audit_prune: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.jobs.packagePrune }}
+  package_prune: {{ . | quote }}
+  {{- end }}
+{{- end }}
+
 {{- if .Values.config.oidc.issuer }}
 
 oidc:
