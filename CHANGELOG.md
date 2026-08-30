@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/BirknerAlex/silo/compare/v0.6.0...v0.7.0) (2026-08-30)
+
+
+### Features
+
+* **prune:** add retention-based package pruning ([3705ee1](https://github.com/BirknerAlex/silo/commit/3705ee156633393fb144a7ad31e8511d2703f65b))
+
+
+### Bug fixes
+
+* **prune:** enforce repo scope on prune admin RPCs, fix stale scheduler clock ([e59dd2a](https://github.com/BirknerAlex/silo/commit/e59dd2adcce8f478e535e055b822e0ee616e837e))
+
 ## [0.6.0](https://github.com/BirknerAlex/silo/compare/v0.5.3...v0.6.0) (2026-08-30)
 
 
