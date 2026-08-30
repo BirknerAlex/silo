@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0](https://github.com/BirknerAlex/silo/compare/v0.5.3...v0.6.0) (2026-08-30)
+
+
+### Features
+
+* **npm:** support npm publish/yarn publish over HTTP ([fda474f](https://github.com/BirknerAlex/silo/commit/fda474f4d4d81b32500d80a3cc8621e51ef22d58))
+* **pacman:** add Arch Linux pacman repo support ([3e95dfa](https://github.com/BirknerAlex/silo/commit/3e95dfa9e7dc8d8b95b7f4d09c5127ab58654911))
+* **repos:** replace global anonymous-read with per-repo public/private mode ([f4e33b4](https://github.com/BirknerAlex/silo/commit/f4e33b46c32efb4a21b37488ccebe8651b82dead))
+
 ## [0.5.3](https://github.com/BirknerAlex/silo/compare/v0.5.2...v0.5.3) (2026-08-28)
 
 
