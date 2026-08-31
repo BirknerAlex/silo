@@ -22,7 +22,6 @@
 //! HTTP layer resolves any `*.db`/`*.db.tar.{gz,zst,xz}` (and its `.sig`)
 //! request to these fixed objects; see `silo-server`'s pacman route.
 
-use std::io::Read;
 use std::pin::Pin;
 
 use serde_json::json;
@@ -67,11 +66,7 @@ impl Format for PacmanFormat {
                 .to_string_lossy()
                 .into_owned();
             if path == ".PKGINFO" || path == "./.PKGINFO" {
-                let mut text = String::new();
-                entry
-                    .read_to_string(&mut text)
-                    .map_err(|e| ParseError::invalid(format!("unreadable .PKGINFO: {e}")))?;
-                pkginfo = Some(text);
+                pkginfo = Some(crate::read_text_capped(&mut entry, ".PKGINFO")?);
                 break;
             }
         }
@@ -347,25 +342,29 @@ impl Compression {
         }
     }
 
+    /// Inflates the whole archive, bounded by `MAX_INFLATED_BYTES`.
+    ///
+    /// The bound matters most here: of the three formats silo accepts,
+    /// pacman's are the ones compressed with xz and zstd, which reach the
+    /// highest ratios and so make the cheapest decompression bombs.
     fn decompress(&self, bytes: &[u8]) -> Result<Vec<u8>, ParseError> {
-        let mut out = Vec::new();
         match self {
             Compression::Zstd => {
-                return zstd::decode_all(bytes)
-                    .map_err(|e| ParseError::invalid(format!("corrupt zstd package: {e}")));
+                let decoder = zstd::stream::read::Decoder::new(bytes)
+                    .map_err(|e| ParseError::invalid(format!("corrupt zstd package: {e}")))?;
+                crate::inflate_capped(decoder, crate::MAX_INFLATED_BYTES, "zstd package")
             }
-            Compression::Xz => {
-                liblzma::read::XzDecoder::new(bytes)
-                    .read_to_end(&mut out)
-                    .map_err(|e| ParseError::invalid(format!("corrupt xz package: {e}")))?;
-            }
-            Compression::Gzip => {
-                flate2::bufread::GzDecoder::new(bytes)
-                    .read_to_end(&mut out)
-                    .map_err(|e| ParseError::invalid(format!("corrupt gzip package: {e}")))?;
-            }
+            Compression::Xz => crate::inflate_capped(
+                liblzma::read::XzDecoder::new(bytes),
+                crate::MAX_INFLATED_BYTES,
+                "xz package",
+            ),
+            Compression::Gzip => crate::inflate_capped(
+                flate2::bufread::GzDecoder::new(bytes),
+                crate::MAX_INFLATED_BYTES,
+                "gzip package",
+            ),
         }
-        Ok(out)
     }
 }
 
@@ -373,6 +372,7 @@ impl Compression {
 mod tests {
     use super::*;
     use crate::testutil::build_test_pacman;
+    use std::io::Read;
 
     fn record(name: &str, version: &str) -> PackageRecord {
         PackageRecord {

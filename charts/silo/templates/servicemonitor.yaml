@@ -1,4 +1,30 @@
 {{- if .Values.serviceMonitor.enabled }}
+{{- /*
+Caught here rather than at scrape time. `/metrics` requires an admin token
+by default, and a ServiceMonitor without credentials just collects 401s —
+which surfaces as an absence of data, the one failure nobody notices.
+
+`configOverride` and `existingConfigSecret` both replace the rendered
+config, which makes everything under `config:` — including
+`metrics.requireAuth` — say nothing about what the server will actually
+do. Validating against it there would be reading the wrong file. Since the
+chart cannot inspect either, it asks for the token unconditionally: one
+sent to an endpoint that doesn't want it is ignored, whereas a missing one
+is the silent failure this whole guard exists to prevent.
+*/}}
+{{- $configIsOpaque := or .Values.configOverride .Values.existingConfigSecret }}
+{{- if $configIsOpaque }}
+{{- if not .Values.serviceMonitor.bearerTokenSecret }}
+{{- fail "serviceMonitor.enabled is set alongside configOverride/existingConfigSecret, so the chart cannot tell whether /metrics requires a credential. Set serviceMonitor.bearerTokenSecret to a Secret with a `token` key — it is ignored if the endpoint turns out to be open" -}}
+{{- end }}
+{{- else }}
+{{- if and .Values.config.metrics.requireAuth (not .Values.serviceMonitor.bearerTokenSecret) }}
+{{- fail "config.metrics.requireAuth is on, so serviceMonitor.bearerTokenSecret must name a Secret with a `token` key holding an admin token scoped to every repo — or set config.metrics.requireAuth=false if the port is only reachable by your monitoring stack" -}}
+{{- end }}
+{{- if not .Values.config.metrics.enabled }}
+{{- fail "serviceMonitor.enabled is on but config.metrics.enabled is off, so there is nothing to scrape" -}}
+{{- end }}
+{{- end }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -17,4 +43,11 @@ spec:
     - port: http
       path: /metrics
       interval: {{ .Values.serviceMonitor.interval }}
+      {{- with .Values.serviceMonitor.bearerTokenSecret }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ . }}
+          key: token
+      {{- end }}
 {{- end }}

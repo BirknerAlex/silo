@@ -214,6 +214,7 @@ oidc:
   admin_value: {{ . | quote }}
   {{- end }}
   exclusive: {{ .Values.config.oidc.exclusive }}
+  allow_username_linking: {{ .Values.config.oidc.allowUsernameLinking }}
 {{- end }}
 
 {{- if or .Values.config.signing.gpg.key .Values.config.signing.gpg.existingSecret .Values.config.signing.apk.key .Values.config.signing.apk.existingSecret .Values.config.signing.pacman.key .Values.config.signing.pacman.existingSecret }}

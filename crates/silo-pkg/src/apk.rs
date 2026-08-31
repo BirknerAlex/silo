@@ -13,7 +13,7 @@
 //! read back out of object storage.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::pin::Pin;
 
 use base64::Engine;
@@ -234,18 +234,16 @@ fn json_field(metadata: &serde_json::Value, field: &str) -> Option<String> {
 /// Pulls `.PKGINFO` out of one inflated gzip member, or `None` if this
 /// member isn't the control member.
 fn read_pkginfo(compressed: &[u8]) -> Option<String> {
-    let mut decoder = flate2::bufread::GzDecoder::new(compressed);
-    let mut inflated = Vec::new();
-    decoder.read_to_end(&mut inflated).ok()?;
+    let decoder = flate2::bufread::GzDecoder::new(compressed);
+    let inflated =
+        crate::inflate_capped(decoder, crate::MAX_INFLATED_BYTES, "apk control member").ok()?;
 
     let mut archive = tar::Archive::new(inflated.as_slice());
     for entry in archive.entries().ok()? {
         let mut entry = entry.ok()?;
         let path = entry.path().ok()?.to_string_lossy().into_owned();
         if path == ".PKGINFO" || path == "./.PKGINFO" {
-            let mut text = String::new();
-            entry.read_to_string(&mut text).ok()?;
-            return Some(text);
+            return crate::read_text_capped(&mut entry, ".PKGINFO").ok();
         }
     }
     None
@@ -336,6 +334,7 @@ mod tests {
     use super::*;
     use crate::testutil::build_test_apk;
     use crate::PackageRecord;
+    use std::io::Read;
 
     fn record(name: &str, version: &str) -> PackageRecord {
         PackageRecord {

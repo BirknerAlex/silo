@@ -184,6 +184,17 @@ pub struct OidcConfig {
     /// Disable local password login entirely once SSO is in place.
     #[serde(default)]
     pub exclusive: bool,
+    /// Let a first OIDC login bind its subject to a pre-existing local
+    /// account with the same username.
+    ///
+    /// Off by default, and the default is the security-relevant one: the
+    /// username comes from a claim the end user can often set themselves,
+    /// so automatic linking lets anyone who claims `admin` inherit the
+    /// local `admin` account bootstrap creates. Turn it on only while
+    /// migrating established local accounts onto a provider whose
+    /// usernames you control, and turn it back off afterwards.
+    #[serde(default)]
+    pub allow_username_linking: bool,
 }
 
 fn default_username_claim() -> String {
@@ -310,11 +321,15 @@ impl Default for JobsConfig {
 pub struct MetricsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Require a token for `/metrics`. Off by default because the endpoint
-    /// exposes no package contents and Prometheus scrape configs are
-    /// easier without credentials; turn it on if the HTTP port is exposed
-    /// beyond the cluster.
-    #[serde(default)]
+    /// Require an admin token scoped to every repo for `/metrics`.
+    ///
+    /// On by default. The endpoint carries no package contents, but its
+    /// inventory gauges are labelled by repo and channel, so an
+    /// unauthenticated scrape enumerates every private repo in the
+    /// registry — the disclosure the read path's 404-instead-of-403
+    /// handling exists to prevent. Set this to `false` only when the HTTP
+    /// port is reachable solely by your monitoring stack.
+    #[serde(default = "default_true")]
     pub require_auth: bool,
 }
 
@@ -322,7 +337,7 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            require_auth: false,
+            require_auth: true,
         }
     }
 }

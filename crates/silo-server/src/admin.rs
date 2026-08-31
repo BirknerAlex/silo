@@ -1,8 +1,24 @@
 //! The admin gRPC service: tokens, users, audit, and index repair.
 //!
-//! Every method requires an admin token. The service is exposed over gRPC
-//! rather than a separate HTTP admin API so there is exactly one auth
-//! path, one audit path, and one client (`silo`) to keep in sync.
+//! Every method requires an admin token, and the methods split in two by
+//! what they act on:
+//!
+//! - **Repo operations** (prune, rebuild, delete a package, set a repo's
+//!   mode) also take `require_repo`, so a repo-scoped admin token reaches
+//!   exactly the repos it names.
+//! - **Registry-wide operations** (users, and the audit log across every
+//!   repo) take `require_global_admin` instead, because there is no repo
+//!   to scope them against. Admin permission alone is not enough: a
+//!   repo-scoped admin who could create an admin *user* would simply log
+//!   in as them for a session scoped to everything.
+//!
+//! Tokens sit between the two — `create_token`, `list_tokens` and
+//! `revoke_token` are allowed for a repo-scoped admin but only ever reach
+//! tokens their own scope already covers (`covered_by`).
+//!
+//! The service is exposed over gRPC rather than a separate HTTP admin API
+//! so there is exactly one auth path, one audit path, and one client
+//! (`silo`) to keep in sync.
 
 use std::sync::Arc;
 
@@ -75,16 +91,10 @@ impl AdminService for AdminServiceImpl {
         // An admin must not be able to hand out access they don't have
         // themselves — otherwise a repo-scoped admin token is a privilege
         // escalation waiting to happen.
-        if let Some(caller_token) = &caller.token {
-            let covered = match &scope {
-                Scope::All => matches!(caller_token.scope, Scope::All),
-                Scope::Repos(repos) => repos.iter().all(|r| caller_token.scope.covers(r)),
-            };
-            if !covered {
-                return Err(Status::permission_denied(
-                    "cannot create a token with a wider repo scope than your own",
-                ));
-            }
+        if !covered_by(&caller, &scope) {
+            return Err(Status::permission_denied(
+                "cannot create a token with a wider repo scope than your own",
+            ));
         }
 
         let expires_at = timestamp_to_datetime(req.expires_at);
@@ -147,8 +157,17 @@ impl AdminService for AdminServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        // A repo-scoped admin sees only the tokens its own scope covers.
+        // Otherwise this endpoint is a directory of every repo in the
+        // registry — the same enumeration `require_repo` refuses to leak
+        // through status codes.
+        let global = auth::has_global_scope(&caller);
         Ok(Response::new(ListTokensResponse {
-            tokens: tokens.iter().map(token_info).collect(),
+            tokens: tokens
+                .iter()
+                .filter(|t| global || covered_by(&caller, &t.scope))
+                .map(token_info)
+                .collect(),
         }))
     }
 
@@ -184,6 +203,16 @@ impl AdminService for AdminServiceImpl {
             return Ok(Response::new(RevokeTokenResponse { revoked: false }));
         };
 
+        // Revoking is the mirror of creating, so it takes the same scope
+        // test: an admin may not revoke a token that reaches further than
+        // their own does. Without this, a repo-scoped admin could revoke
+        // the registry's only global admin token and lock everyone out.
+        if !auth::has_global_scope(&caller) && !covered_by(&caller, &token.scope) {
+            return Err(Status::permission_denied(
+                "cannot revoke a token with a wider repo scope than your own",
+            ));
+        }
+
         let revoked = self
             .state
             .db
@@ -210,7 +239,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<CreateUserRequest>,
     ) -> Result<Response<CreateUserResponse>, Status> {
         let caller = auth::authenticate_grpc(&self.state, &request).await?;
-        auth::require_admin(&caller)?;
+        auth::require_global_admin(&caller)?;
         let req = request.into_inner();
 
         let password = Some(req.password.as_str()).filter(|p| !p.is_empty());
@@ -243,7 +272,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
         let caller = auth::authenticate_grpc(&self.state, &request).await?;
-        auth::require_admin(&caller)?;
+        auth::require_global_admin(&caller)?;
 
         let users = self
             .state
@@ -262,7 +291,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<SetUserDisabledRequest>,
     ) -> Result<Response<SetUserDisabledResponse>, Status> {
         let caller = auth::authenticate_grpc(&self.state, &request).await?;
-        auth::require_admin(&caller)?;
+        auth::require_global_admin(&caller)?;
         let req = request.into_inner();
 
         self.guard_self_lockout(&caller, &req.username)?;
@@ -296,7 +325,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<SetUserPasswordRequest>,
     ) -> Result<Response<SetUserPasswordResponse>, Status> {
         let caller = auth::authenticate_grpc(&self.state, &request).await?;
-        auth::require_admin(&caller)?;
+        auth::require_global_admin(&caller)?;
         let req = request.into_inner();
 
         let user = self
@@ -330,7 +359,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<DeleteUserRequest>,
     ) -> Result<Response<DeleteUserResponse>, Status> {
         let caller = auth::authenticate_grpc(&self.state, &request).await?;
-        auth::require_admin(&caller)?;
+        auth::require_global_admin(&caller)?;
         let req = request.into_inner();
 
         self.guard_self_lockout(&caller, &req.username)?;
@@ -362,6 +391,20 @@ impl AdminService for AdminServiceImpl {
         let caller = auth::authenticate_grpc(&self.state, &request).await?;
         auth::require_admin(&caller)?;
         let req = request.into_inner();
+
+        // The audit log spans every repo, so an unfiltered query from a
+        // repo-scoped admin would hand back activity — and repo names —
+        // from repos their token cannot reach. Such a caller has to name a
+        // repo, and it has to be one they already have access to.
+        if !auth::has_global_scope(&caller) {
+            if req.repo.is_empty() {
+                return Err(Status::permission_denied(
+                    "a repo-scoped admin token must pass a repo filter; only a token scoped \
+                     to every repo can query the whole audit log",
+                ));
+            }
+            auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
+        }
 
         let rows = self
             .state
@@ -468,6 +511,24 @@ impl AdminService for AdminServiceImpl {
         auth::require_admin(&caller)?;
         let req = request.into_inner();
 
+        // Admin permission is repo-independent, so it alone would let a
+        // repo-scoped admin token delete anything in the registry by
+        // guessing ids. The row is read first purely to learn which repo
+        // to enforce the token's scope against.
+        let package = self
+            .state
+            .db
+            .find_package(req.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let Some(package) = package else {
+            return Ok(Response::new(DeletePackageResponse {
+                deleted: false,
+                storage_path: String::new(),
+            }));
+        };
+        auth::require_repo(&self.state, &caller, &package.repo, Permission::Write).await?;
+
         let storage_path =
             silo_core::repo::delete_package(&self.state.publish, req.id, &caller.actor, None)
                 .await
@@ -489,6 +550,11 @@ impl AdminService for AdminServiceImpl {
 
         silo_core::config::validate_repo_name("repo", &req.repo)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // Publishing a repo is the single most consequential thing an
+        // admin token can do to one, so it needs the token's own scope to
+        // cover that repo — otherwise a repo-scoped admin could make
+        // *someone else's* private repo world-readable.
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
 
         let public = match RepoMode::try_from(req.mode).unwrap_or(RepoMode::Unspecified) {
             RepoMode::Public => true,
@@ -817,6 +883,22 @@ fn non_empty(value: String) -> Option<String> {
     Some(value).filter(|v| !v.is_empty())
 }
 
+/// Whether `scope` reaches no further than the caller's own token does.
+///
+/// `Scope::All` is only covered by `Scope::All`; a named set is covered
+/// when every repo in it is one the caller can already reach. This is the
+/// same test `create_token` applies when minting, reused so listing and
+/// revoking can't be a way around it.
+fn covered_by(caller: &auth::Authenticated, scope: &Scope) -> bool {
+    let Some(caller_token) = &caller.token else {
+        return false;
+    };
+    match scope {
+        Scope::All => matches!(caller_token.scope, Scope::All),
+        Scope::Repos(repos) => repos.iter().all(|r| caller_token.scope.covers(r)),
+    }
+}
+
 /// Proto has no optional timestamp, so 0 is the sentinel for "unset".
 fn timestamp_to_datetime(seconds: i64) -> Option<silo_db::DateTime> {
     if seconds <= 0 {
@@ -860,6 +942,58 @@ fn user_info(user: &User) -> UserInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scoped(scope: Scope) -> auth::Authenticated {
+        auth::Authenticated {
+            token: Some(silo_db::tokens::Token {
+                id: Uuid::nil(),
+                name: "t".into(),
+                prefix: "0".repeat(12),
+                permission: Permission::Admin,
+                kind: TokenKind::Api,
+                scope,
+                user_id: None,
+                created_by: None,
+                created_at: chrono::Utc::now(),
+                expires_at: None,
+                last_used_at: None,
+                revoked_at: None,
+            }),
+            actor: silo_db::audit::Actor::system(),
+        }
+    }
+
+    #[test]
+    fn a_scope_never_covers_one_wider_than_itself() {
+        let global = scoped(Scope::All);
+        let mine = scoped(Scope::Repos(vec!["mine".into(), "also-mine".into()]));
+
+        assert!(covered_by(&global, &Scope::All));
+        assert!(covered_by(&global, &Scope::Repos(vec!["anything".into()])));
+
+        assert!(covered_by(&mine, &Scope::Repos(vec!["mine".into()])));
+        assert!(covered_by(
+            &mine,
+            &Scope::Repos(vec!["mine".into(), "also-mine".into()])
+        ));
+
+        // The two directions that matter: a named scope never covers
+        // `All`, and one unlisted repo is enough to fail the check.
+        assert!(!covered_by(&mine, &Scope::All));
+        assert!(!covered_by(
+            &mine,
+            &Scope::Repos(vec!["mine".into(), "theirs".into()])
+        ));
+        assert!(!covered_by(&mine, &Scope::Repos(vec!["theirs".into()])));
+
+        // An empty set is vacuously covered but reaches nothing anyway.
+        assert!(covered_by(&mine, &Scope::Repos(vec![])));
+
+        // A caller with no token covers nothing at all.
+        let anon = auth::Authenticated::anonymous(None);
+        assert!(!covered_by(&anon, &Scope::All));
+        assert!(!covered_by(&anon, &Scope::Repos(vec!["mine".into()])));
+    }
 
     #[test]
     fn zero_timestamps_mean_unset() {

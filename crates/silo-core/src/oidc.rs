@@ -329,6 +329,7 @@ mod tests {
             admin_claim: Some("groups".into()),
             admin_value: Some("silo-admins".into()),
             exclusive: false,
+            allow_username_linking: false,
         }
     }
 

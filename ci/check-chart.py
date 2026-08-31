@@ -80,6 +80,9 @@ EVERYTHING = [
     "--set", "postgres.enabled=true",
     "--set", "ingress.enabled=true",
     "--set", "serviceMonitor.enabled=true",
+    # /metrics requires an admin token by default, and the chart refuses to
+    # render a ServiceMonitor that would only ever collect 401s.
+    "--set", "serviceMonitor.bearerTokenSecret=prometheus-token",
     "--set", r"serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:test",
     "--set", "commonLabels.team=platform",
     "--set", r"commonAnnotations.example\.com/owner=ci",
@@ -294,8 +297,55 @@ def image_tag_follows_the_chart() -> None:
     assert deployment["spec"]["template"]["spec"]["containers"][0]["image"].endswith(":pinned")
 
 
+def a_scrape_cannot_be_configured_to_collect_401s() -> None:
+    """/metrics needs an admin token by default, so a ServiceMonitor without
+    one scrapes nothing — and a monitoring gap looks identical to a quiet
+    system. The chart refuses the combination rather than rendering it."""
+    refuses(
+        "--set", "postgres.enabled=true",
+        "--set", "serviceMonitor.enabled=true",
+    )  # requireAuth on, no token
+    refuses(
+        "--set", "postgres.enabled=true",
+        "--set", "serviceMonitor.enabled=true",
+        "--set", "serviceMonitor.bearerTokenSecret=tok",
+        "--set", "config.metrics.enabled=false",
+    )  # nothing to scrape at all
+
+    # Both ways out of it render.
+    render(
+        "--set", "postgres.enabled=true",
+        "--set", "serviceMonitor.enabled=true",
+        "--set", "serviceMonitor.bearerTokenSecret=tok",
+    )
+    render(
+        "--set", "postgres.enabled=true",
+        "--set", "serviceMonitor.enabled=true",
+        "--set", "config.metrics.requireAuth=false",
+    )
+
+    # An override replaces the whole config, so `config.metrics` describes
+    # nothing the server will do and cannot be used to decide whether the
+    # scrape needs a credential. The chart asks for one either way.
+    for override in ("configOverride=addr: \"0.0.0.0:8080\"",
+                     "existingConfigSecret=my-config"):
+        refuses(
+            "--set", "postgres.enabled=true",
+            "--set", "serviceMonitor.enabled=true",
+            "--set", "config.metrics.requireAuth=false",
+            "--set-string", override,
+        )
+        render(
+            "--set", "postgres.enabled=true",
+            "--set", "serviceMonitor.enabled=true",
+            "--set", "serviceMonitor.bearerTokenSecret=tok",
+            "--set-string", override,
+        )
+
+
 CHECKS = [
     ("database modes", database_modes),
+    ("a scrape cannot be configured to collect 401s", a_scrape_cannot_be_configured_to_collect_401s),
     ("every optional feature renders", every_optional_feature),
     ("common labels and annotations reach every resource", common_metadata_reaches_everything),
     ("no user label reaches an immutable selector", selectors_stay_immutable),

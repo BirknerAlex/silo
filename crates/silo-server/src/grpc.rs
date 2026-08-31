@@ -146,9 +146,14 @@ fn publish_error_to_status(error: anyhow::Error) -> Status {
     match silo_core::repo::classify_publish_error(&error) {
         PublishErrorKind::InvalidArgument => Status::invalid_argument(message),
         PublishErrorKind::Timeout => Status::deadline_exceeded(message),
+        // Unlike the two branches above, this one isn't the client's own
+        // mistake — it's a storage/database failure, and its `Display` can
+        // carry backend detail (connection strings, paths) a caller has no
+        // business seeing. Full detail still reaches the log. Mirrors the
+        // HTTP publish path's `publish_error_response`.
         PublishErrorKind::Internal => {
             tracing::error!(error = %error, "publish failed");
-            Status::internal(message)
+            Status::internal("internal publish error")
         }
     }
 }
@@ -298,6 +303,20 @@ mod tests {
     fn unexpected_failures_stay_internal() {
         let status = publish_error_to_status(anyhow::anyhow!("connection reset by peer"));
         assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn internal_failures_do_not_leak_backend_detail_to_the_caller() {
+        // The `Display` of a storage or database error routinely carries
+        // an endpoint, a bucket, or a connection string. None of it may
+        // reach a client that merely failed to publish.
+        let status = publish_error_to_status(anyhow::anyhow!(
+            "error connecting to postgres://silo:hunter2@db.internal:5432/silo"
+        ));
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), "internal publish error");
+        assert!(!status.message().contains("hunter2"));
+        assert!(!status.message().contains("db.internal"));
     }
 
     #[test]

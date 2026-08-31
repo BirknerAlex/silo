@@ -18,7 +18,7 @@ use std::sync::Arc;
 use axum::http::{header, HeaderMap};
 use base64::Engine;
 use silo_db::audit::{Actor, ActorKind};
-use silo_db::tokens::{AuthError, Permission, Token};
+use silo_db::tokens::{AuthError, Permission, Scope, Token};
 use tonic::{Request, Status};
 
 use crate::AppState;
@@ -312,10 +312,43 @@ pub fn require_admin(auth: &Authenticated) -> Result<(), Status> {
     ))
 }
 
+/// Whether this caller's token is scoped to every repo.
+///
+/// Separate from [`Authenticated::is_admin`] because the two answer
+/// different questions: `Admin` is a *permission level* and is
+/// repo-independent, while `Scope::All` says the token isn't confined to a
+/// named set of repos. An admin token can be either.
+pub fn has_global_scope(auth: &Authenticated) -> bool {
+    auth.token
+        .as_ref()
+        .is_some_and(|t| matches!(t.scope, Scope::All))
+}
+
+/// Enforces admin permission *and* global scope.
+///
+/// Users, tokens and the audit log are global resources — they belong to
+/// no repo, so [`require_repo`] has nothing to enforce against and
+/// [`require_admin`] alone would let a repo-scoped admin token act on
+/// them. That is a privilege escalation rather than a theoretical one: a
+/// repo-scoped admin who can create an admin *user* can log in as that
+/// user and receive a session token scoped to every repo, which is
+/// exactly what `create_token`'s scope-widening guard exists to prevent.
+#[allow(clippy::result_large_err)]
+pub fn require_global_admin(auth: &Authenticated) -> Result<(), Status> {
+    require_admin(auth)?;
+    if has_global_scope(auth) {
+        return Ok(());
+    }
+    Err(Status::permission_denied(
+        "this operation manages a registry-wide resource and requires an admin token \
+         scoped to every repo",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use silo_db::tokens::{Scope, TokenKind};
+    use silo_db::tokens::TokenKind;
     use uuid::Uuid;
 
     fn headers_with(value: &str) -> HeaderMap {
@@ -427,6 +460,55 @@ mod tests {
         assert!(!anon.allows("anything", Permission::Admin));
         assert!(!anon.is_admin());
         assert_eq!(anon.describe(), "anonymous");
+    }
+
+    #[test]
+    fn global_scope_is_separate_from_admin_permission() {
+        let scoped = authed(Permission::Admin, Scope::Repos(vec!["only-this".into()]));
+        assert!(scoped.is_admin());
+        assert!(!has_global_scope(&scoped));
+
+        let global = authed(Permission::Admin, Scope::All);
+        assert!(has_global_scope(&global));
+
+        // Global scope on its own is not admin.
+        let reader = authed(Permission::Read, Scope::All);
+        assert!(has_global_scope(&reader));
+        assert!(!reader.is_admin());
+
+        // ...and a caller with no token has neither.
+        assert!(!has_global_scope(&Authenticated::anonymous(None)));
+    }
+
+    #[test]
+    fn registry_wide_operations_need_admin_and_global_scope_together() {
+        // Users, tokens and the audit log belong to no repo, so
+        // `require_repo` has nothing to enforce against. Admin alone
+        // would let a repo-scoped token create an admin *user* and then
+        // log in as them for a session scoped to every repo — routing
+        // around `create_token`'s scope-widening guard entirely.
+        assert!(require_global_admin(&authed(Permission::Admin, Scope::All)).is_ok());
+
+        let scoped = authed(Permission::Admin, Scope::Repos(vec!["mine".into()]));
+        assert_eq!(
+            require_global_admin(&scoped).unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+        // ...even though the plain admin check passes for that token.
+        assert!(require_admin(&scoped).is_ok());
+
+        assert_eq!(
+            require_global_admin(&authed(Permission::Write, Scope::All))
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            require_global_admin(&Authenticated::anonymous(None))
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
     }
 
     #[test]
