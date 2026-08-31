@@ -74,7 +74,7 @@ impl AuthService for AuthServiceImpl {
         let oidc = self.state.oidc.as_ref();
         let exclusive = oidc.map(|v| v.config().exclusive).unwrap_or(false);
 
-        Ok(Response::new(GetAuthInfoResponse {
+        let result = Ok(Response::new(GetAuthInfoResponse {
             password_login_enabled: !exclusive,
             oidc_enabled: oidc.is_some(),
             oidc_issuer: oidc.map(|v| v.config().issuer.clone()).unwrap_or_default(),
@@ -93,7 +93,9 @@ impl AuthService for AuthServiceImpl {
             // `ReadService::ListRepos`'s `RepoInfo.mode`.
             #[allow(deprecated)]
             anonymous_read_enabled: false,
-        }))
+        }));
+        self.state.metrics.record_grpc("get_auth_info", &result);
+        result
     }
 
     /// Also unauthenticated. Nothing here is sensitive: the version is
@@ -104,10 +106,41 @@ impl AuthService for AuthServiceImpl {
         &self,
         _request: Request<GetVersionRequest>,
     ) -> Result<Response<GetVersionResponse>, Status> {
-        Ok(Response::new(version_response()))
+        let result = Ok(Response::new(version_response()));
+        self.state.metrics.record_grpc("get_version", &result);
+        result
     }
 
     async fn login(
+        &self,
+        request: Request<LoginRequest>,
+    ) -> Result<Response<LoginResponse>, Status> {
+        let result = self.login_inner(request).await;
+        self.state.metrics.record_grpc("login", &result);
+        result
+    }
+
+    async fn login_oidc(
+        &self,
+        request: Request<LoginOidcRequest>,
+    ) -> Result<Response<LoginOidcResponse>, Status> {
+        let result = self.login_oidc_inner(request).await;
+        self.state.metrics.record_grpc("login_oidc", &result);
+        result
+    }
+
+    async fn who_am_i(
+        &self,
+        request: Request<WhoAmIRequest>,
+    ) -> Result<Response<WhoAmIResponse>, Status> {
+        let result = self.who_am_i_inner(request).await;
+        self.state.metrics.record_grpc("who_am_i", &result);
+        result
+    }
+}
+
+impl AuthServiceImpl {
+    async fn login_inner(
         &self,
         request: Request<LoginRequest>,
     ) -> Result<Response<LoginResponse>, Status> {
@@ -213,7 +246,7 @@ impl AuthService for AuthServiceImpl {
         ))
     }
 
-    async fn login_oidc(
+    async fn login_oidc_inner(
         &self,
         request: Request<LoginOidcRequest>,
     ) -> Result<Response<LoginOidcResponse>, Status> {
@@ -267,7 +300,7 @@ impl AuthService for AuthServiceImpl {
         }))
     }
 
-    async fn who_am_i(
+    async fn who_am_i_inner(
         &self,
         request: Request<WhoAmIRequest>,
     ) -> Result<Response<WhoAmIResponse>, Status> {
@@ -296,9 +329,7 @@ impl AuthService for AuthServiceImpl {
             is_admin: authenticated.is_admin(),
         }))
     }
-}
 
-impl AuthServiceImpl {
     /// Mints the session token a successful login hands back.
     ///
     /// Session tokens are scoped to all repos and carry the user's own
@@ -384,6 +415,46 @@ impl AuthServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn service() -> AuthServiceImpl {
+        AuthServiceImpl {
+            state: Arc::new(crate::http::tests::test_state_with(|_| {})),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_rpc_is_counted_by_method_and_ok() {
+        let svc = service();
+        let resp = svc.get_version(Request::new(GetVersionRequest {})).await;
+        assert!(resp.is_ok());
+        assert_eq!(
+            svc.state
+                .metrics
+                .grpc_requests
+                .with_label_values(&["get_version", "ok"])
+                .get(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_rpc_is_counted_by_method_and_error() {
+        // `who_am_i` needs no database for an anonymous (no-credential)
+        // caller — it's rejected in-process by `authenticate_grpc` before
+        // any lookup, which is what keeps this test DB-free.
+        let svc = service();
+        let resp = svc.who_am_i(Request::new(WhoAmIRequest {})).await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            svc.state
+                .metrics
+                .grpc_requests
+                .with_label_values(&["who_am_i", "error"])
+                .get(),
+            1
+        );
+    }
 
     #[test]
     fn a_database_failure_during_oidc_provisioning_is_not_described_to_the_caller() {

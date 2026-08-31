@@ -216,4 +216,67 @@ mod tests {
         let job = Job::new("bad", Some("not a cron"), |_| Box::pin(async {}));
         assert!(job.next.is_none());
     }
+
+    /// The one test in this module that runs the real tick body rather than
+    /// just its scheduling — `packages`/`package_bytes` only ever move
+    /// through `refresh_inventory`, so a synthetic call to
+    /// `Metrics::refresh_inventory` (see `metrics.rs`'s own tests) would
+    /// never catch a wiring mistake between the database and the job.
+    #[tokio::test]
+    async fn refreshing_inventory_against_a_real_repo_publishes_its_gauges() {
+        let Ok(url) = std::env::var("SILO_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set SILO_TEST_DATABASE_URL");
+            return;
+        };
+        if url.trim().is_empty() {
+            eprintln!("skipping: set SILO_TEST_DATABASE_URL");
+            return;
+        }
+        let db = silo_db::Db::connect(&silo_db::DbConfig {
+            url,
+            max_connections: 4,
+            connect_timeout: std::time::Duration::from_secs(30),
+            token_pepper: None,
+        })
+        .await
+        .expect("connect to the test database");
+
+        let mut state = crate::http::tests::test_state_with(|_| {});
+        state.db = db.clone();
+        state.publish.db = db;
+
+        let repo = format!("refresh-inventory-{}", uuid::Uuid::new_v4().simple());
+        let tarball = silo_pkg::testutil::build_test_rpm("widget", "1.0", "1", "x86_64");
+        let size_bytes = tarball.len() as i64;
+        silo_core::repo::publish(
+            &state.publish,
+            &repo,
+            "stable",
+            silo_pkg::PackageFormat::Rpm,
+            tarball,
+            &silo_db::audit::Actor::system(),
+        )
+        .await
+        .expect("seed a package for the inventory refresh to pick up");
+
+        refresh_inventory(&state).await;
+
+        assert_eq!(state.metrics.database_up.get(), 1);
+        assert_eq!(
+            state
+                .metrics
+                .packages
+                .with_label_values(&[&repo, "stable", "rpm"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            state
+                .metrics
+                .package_bytes
+                .with_label_values(&[&repo, "stable", "rpm"])
+                .get(),
+            size_bytes
+        );
+    }
 }
