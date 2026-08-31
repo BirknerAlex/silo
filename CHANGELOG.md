@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/BirknerAlex/silo/compare/v0.7.1...v0.8.0) (2026-08-31)
+
+
+### Features
+
+* **deb:** add apt/.deb package format support ([#41](https://github.com/BirknerAlex/silo/issues/41)) ([09a587c](https://github.com/BirknerAlex/silo/commit/09a587c694ff44dacaac36d25f41f3b52a02cd40))
+
+
+### Bug fixes
+
+* **metrics:** count package downloads in silo_http_requests_total ([cbc3e6b](https://github.com/BirknerAlex/silo/commit/cbc3e6ba200c6e509e0e576b7781c36dc9893b77))
+
 ## [0.7.1](https://github.com/BirknerAlex/silo/compare/v0.7.0...v0.7.1) (2026-08-31)
 
 
