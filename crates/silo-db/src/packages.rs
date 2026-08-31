@@ -245,6 +245,19 @@ impl Db {
         .await?)
     }
 
+    /// Reads a package row by id without deleting it, so a caller can
+    /// check the repo it belongs to *before* acting on it. `delete_package`
+    /// deletes and returns in one statement, which is too late to refuse
+    /// a caller whose token doesn't cover that repo.
+    pub async fn find_package(&self, id: i64) -> anyhow::Result<Option<PackageRow>> {
+        Ok(
+            sqlx::query_as(&format!("SELECT {COLUMNS} FROM packages WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+
     pub async fn delete_package(&self, id: i64) -> anyhow::Result<Option<PackageRow>> {
         Ok(sqlx::query_as(&format!(
             "DELETE FROM packages WHERE id = $1 RETURNING {COLUMNS}"

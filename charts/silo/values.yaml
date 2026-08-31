@@ -74,19 +74,24 @@ extraEnv: []
   # - name: RUST_LOG
   #   value: info,silo_server=debug
 
-# The image already runs as uid 10001 with no need to write to disk, so
-# these are hardening on top of an already-unprivileged container rather
-# than a prerequisite. Left empty by default because some clusters set
-# them through a policy controller instead.
-podSecurityContext: {}
-  # runAsNonRoot: true
-  # seccompProfile:
-  #   type: RuntimeDefault
-securityContext: {}
-  # allowPrivilegeEscalation: false
-  # readOnlyRootFilesystem: true
-  # capabilities:
-  #   drop: [ALL]
+# The image already runs as uid 10001 and silo-server writes nothing to
+# disk — index generation is in-memory, everything durable is in object
+# storage and Postgres — so none of this costs the workload anything, and
+# it is set rather than merely suggested. Override with `{}` if a policy
+# engine in your cluster owns these fields instead.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop: [ALL]
 
 # ---------------------------------------------------------------- database
 
@@ -161,7 +166,11 @@ config:
 
   metrics:
     enabled: true
-    requireAuth: false
+    # The inventory gauges are labelled by repo and channel, so an open
+    # /metrics lists every private repo. Leave this on unless the port is
+    # reachable only by your monitoring stack; when it is on, the scrape
+    # needs an admin token scoped to every repo (see serviceMonitor below).
+    requireAuth: true
 
   # Package pruning deletes packages, so it's off by default even when
   # per-(repo, channel) rules are configured via `silo repo set-prune-rule`.
@@ -190,6 +199,12 @@ config:
     adminValue: ""
     # Disable local password login once SSO is in place.
     exclusive: false
+    # Let a first OIDC login adopt an existing local account with the same
+    # username. Off, and worth leaving off: usernameClaim is usually
+    # something the end user can set, so this lets anyone claiming `admin`
+    # inherit the bootstrap admin account. Turn it on only while migrating
+    # existing local accounts onto the provider.
+    allowUsernameLinking: false
 
   signing:
     # RPM package + repomd signatures.
@@ -248,6 +263,12 @@ serviceMonitor:
   # put whatever yours looks for here.
   labels: {}
   annotations: {}
+  # Name of a Secret holding a silo admin token scoped to every repo,
+  # under the key `token`. Required when config.metrics.requireAuth is on,
+  # which is the default — create the token with
+  # `silo token create --name prometheus --permission admin --scope all`.
+  # The Secret must live in the same namespace as the ServiceMonitor.
+  bearerTokenSecret: ""
 
 ingress:
   # One Ingress for everything: gRPC (the `silo` CLI) and HTTP (dnf, apk,

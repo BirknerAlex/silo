@@ -163,13 +163,19 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         return (StatusCode::NOT_FOUND, "metrics are disabled").into_response();
     }
     if state.config.metrics.require_auth {
+        // Admin rather than merely "some valid token": the inventory
+        // gauges are labelled by repo and channel, so this endpoint lists
+        // every repo in the registry — including private ones a scoped
+        // read token is deliberately not allowed to discover through
+        // `authorize_read`. A Prometheus scrape gets its own admin token.
+        //
         // `authenticate_http` no longer errors on a missing credential —
         // that's an anonymous caller now, not a failure — so the gate has
-        // to check for an actual token rather than just success.
-        let has_token = auth::authenticate_http(&state, &headers, None)
+        // to check the token itself rather than just success.
+        let authorized = auth::authenticate_http(&state, &headers, None)
             .await
-            .is_ok_and(|a| a.token.is_some());
-        if !has_token {
+            .is_ok_and(|a| a.is_admin() && auth::has_global_scope(&a));
+        if !authorized {
             return unauthorized();
         }
     }
@@ -408,6 +414,9 @@ async fn get_repodata(
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(resp) = validate_repo_path(&repo, &channel) {
+        return resp;
+    }
     if let Err(resp) =
         authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await
     {
@@ -430,6 +439,9 @@ async fn get_rpm_package(
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(resp) = validate_repo_path(&repo, &channel) {
+        return resp;
+    }
     let auth =
         match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
             Ok(auth) => auth,
@@ -454,6 +466,9 @@ async fn get_apk_file(
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(resp) = validate_repo_path(&repo, &channel) {
+        return resp;
+    }
     let auth =
         match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
             Ok(auth) => auth,
@@ -519,6 +534,9 @@ async fn get_pacman_file(
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(resp) = validate_repo_path(&repo, &channel) {
+        return resp;
+    }
     let auth =
         match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
             Ok(auth) => auth,
@@ -608,19 +626,25 @@ async fn get_npm(
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(resp) = validate_repo_path(&repo, &channel) {
+        return resp;
+    }
     let auth =
         match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
             Ok(auth) => auth,
             Err(resp) => return resp,
         };
-    if let Err(resp) = reject_traversal(&path) {
-        return resp;
-    }
-
     // npm URL-encodes the slash in a scoped name (`@acme%2fwidget`) when
     // requesting a packument, but not when requesting a tarball. Decoding
     // it here makes both spellings address the same package.
+    //
+    // The traversal check runs *after* the decode, not before: `..%2f..`
+    // has no `..` segment until the escape is resolved, so checking first
+    // would inspect a string the rest of the handler never uses.
     let path = path.replace("%2f", "/").replace("%2F", "/");
+    if let Err(resp) = reject_traversal(&path) {
+        return resp;
+    }
 
     match parse_npm_path(&path) {
         Some(NpmRequest::Packument { name }) => {
@@ -735,6 +759,9 @@ async fn publish_npm(
     headers: HeaderMap,
     request: Request,
 ) -> Response {
+    if let Err(resp) = validate_repo_path(&repo, &channel) {
+        return resp;
+    }
     let auth =
         match authorize_write(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
             Ok(auth) => auth,
@@ -898,6 +925,28 @@ fn parse_npm_path(path: &str) -> Option<NpmRequest> {
         }),
         _ => None,
     }
+}
+
+/// Validates the `{repo}/{channel}` pair a request addresses.
+///
+/// Both are interpolated straight into a storage key, and axum
+/// percent-decodes path parameters — so `%2e%2e` and `%2f` arrive here
+/// already decoded, and a segment that looked like one on the wire can be
+/// several by the time it reaches a key. `object_store` neutralizes the
+/// result, but the guard belongs here too: these are the same names
+/// `publish` validates before writing, and a read that addresses a repo no
+/// publish could ever create is a malformed request, not a miss.
+#[allow(clippy::result_large_err)]
+fn validate_repo_path(repo: &str, channel: &str) -> Result<(), Response> {
+    for (kind, value) in [("repo", repo), ("channel", channel)] {
+        if silo_core::config::validate_repo_name(kind, value).is_err() {
+            // Deliberately not echoing the name back, and deliberately the
+            // same 400 for both: this runs before authorization, so its
+            // reply must not describe anything about the registry.
+            return Err((StatusCode::BAD_REQUEST, "invalid repo or channel").into_response());
+        }
+    }
+    Ok(())
 }
 
 /// Rejects path segments that would escape their prefix.
@@ -1221,7 +1270,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn metrics_are_served_when_enabled_and_hidden_when_not() {
-        let resp = get(anonymous_state(), "/metrics").await;
+        // `require_auth` is on by default (see the test below), so an
+        // open scrape has to be asked for explicitly here.
+        let open = Arc::new(test_state_with(|cfg| cfg.metrics.require_auth = false));
+        let resp = get(open, "/metrics").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_string(resp).await.contains("silo_"));
 
@@ -1230,11 +1282,70 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    #[test]
+    fn repo_and_channel_are_held_to_the_same_names_publish_allows() {
+        assert!(validate_repo_path("myrepo", "stable").is_ok());
+        assert!(validate_repo_path("my-repo_1.0", "edge").is_ok());
+
+        // axum percent-decodes path parameters, so these are what the
+        // handler actually receives for `%2e%2e` and `%2f` on the wire.
+        assert!(validate_repo_path("..", "stable").is_err());
+        assert!(validate_repo_path("myrepo", "..").is_err());
+        assert!(validate_repo_path("../other", "stable").is_err());
+        assert!(validate_repo_path("myrepo", "stable/../../etc").is_err());
+        assert!(validate_repo_path("", "stable").is_err());
+        assert!(validate_repo_path("myrepo", "").is_err());
+    }
+
     #[tokio::test]
-    async fn metrics_can_be_put_behind_a_credential() {
-        let state = Arc::new(test_state_with(|cfg| {
-            cfg.metrics.require_auth = true;
-        }));
+    async fn a_traversing_repo_or_channel_is_refused_before_authorization() {
+        // 400 rather than 404: this runs ahead of the repo lookup, so it
+        // can't and doesn't say anything about what exists. It also needs
+        // no database, which is the point — the request never gets that
+        // far.
+        let state = Arc::new(test_state_with(|_| {}));
+        for uri in [
+            "/../stable/repodata/repomd.xml",
+            "/myrepo/../repodata/repomd.xml",
+            "/myrepo/stable%2F..%2Fetc/repodata/repomd.xml",
+            "/%2e%2e/stable/Packages/x.rpm",
+        ] {
+            let resp = get(state.clone(), uri).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} should be refused outright"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_paths_are_checked_for_traversal_after_the_escape_is_decoded() {
+        // `..%2f..` has no `..` segment until the escape is resolved, so
+        // the order of these two steps in `get_npm` is what makes the
+        // check mean anything.
+        let raw = "widget/-/..%2f..%2fetc";
+        assert!(
+            reject_traversal(raw).is_ok(),
+            "the encoded form is what slips past a pre-decode check"
+        );
+
+        let decoded = raw.replace("%2f", "/").replace("%2F", "/");
+        assert!(reject_traversal(&decoded).is_err());
+    }
+
+    #[tokio::test]
+    async fn metrics_require_a_credential_by_default() {
+        // The inventory gauges are labelled by repo and channel, so an
+        // open `/metrics` lists every private repo in the registry — the
+        // enumeration `authorize_read` answers 404 to prevent. The
+        // default therefore has to be closed, not open.
+        let state = Arc::new(test_state_with(|_| {}));
+        assert!(
+            state.config.metrics.require_auth,
+            "an unauthenticated /metrics enumerates private repos"
+        );
+
         let resp = get(state, "/metrics").await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }

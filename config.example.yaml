@@ -60,10 +60,11 @@ audit:
 
 metrics:
   enabled: true
-  # Require a token for /metrics. Off by default because the endpoint
-  # exposes no package contents; turn it on if the port is reachable from
-  # outside the cluster.
-  require_auth: false
+  # Require an admin token scoped to every repo for /metrics. On by
+  # default: the inventory gauges are labelled by repo and channel, so an
+  # open /metrics enumerates every private repo. Set to false only when
+  # the port is reachable solely by your monitoring stack.
+  require_auth: true
 
 # Retention-based package deletion. Off by default, since pruning deletes
 # packages. Per-(repo, channel) rules and exemptions are configured at
@@ -95,6 +96,12 @@ metrics:
 #   admin_value: "silo-admins"
 #   # Disable local password login entirely once SSO is in place.
 #   exclusive: false
+#   # Let a first OIDC login adopt an existing local account with the same
+#   # username. Off, and worth leaving off: `username_claim` is usually
+#   # something the end user can set, so this lets anyone claiming `admin`
+#   # inherit the bootstrap admin account. Turn it on only while migrating
+#   # existing local accounts onto the provider.
+#   allow_username_linking: false
 
 # Optional. Both keys are independent; omit either to publish unsigned.
 # signing:

@@ -128,6 +128,19 @@ async fn run_session_cleanup(state: &AppState) {
         Ok(n) => tracing::info!(count = n, "purged expired session tokens"),
         Err(e) => tracing::warn!(error = %e, "failed to purge expired session tokens"),
     }
+
+    // Login throttle rows outlive their window and are never read again.
+    // Left alone, the table grows by one row per username anybody has ever
+    // guessed at, which is unbounded and attacker-controlled.
+    match state
+        .db
+        .purge_stale_login_attempts(crate::grpc_auth::LOGIN_FAILURE_WINDOW_MINUTES)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "purged elapsed login throttle windows"),
+        Err(e) => tracing::warn!(error = %e, "failed to purge login throttle rows"),
+    }
 }
 
 async fn run_audit_prune(state: &AppState) {

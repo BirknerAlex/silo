@@ -309,6 +309,100 @@ impl ParseError {
     }
 }
 
+/// Ceiling on how far a single uploaded package may inflate.
+///
+/// Every parser here has to decompress an archive to reach the one small
+/// metadata file it needs, and a compressor will happily turn a few
+/// megabytes into terabytes of zeroes. Without a bound, any caller allowed
+/// to publish can drive the server out of memory with an upload that
+/// passes the `MAX_PACKAGE_BYTES` size check comfortably — xz and zstd
+/// both reach ratios well past 1000:1.
+///
+/// The value is twice the upload ceiling: real packages compress, so
+/// nothing legitimate inflates past it, and it keeps the worst case
+/// (compressed upload plus inflated copy) to a size a server can survive.
+pub const MAX_INFLATED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Ceiling on a metadata file read out of an archive (`.PKGINFO`,
+/// `package.json`). These are a few kilobytes in practice; the bound is
+/// generous but stops a crafted archive from declaring one entry the size
+/// of the whole inflated stream.
+pub(crate) const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads a decompressing reader to the end, refusing to buffer more than
+/// `limit` bytes.
+///
+/// Every caller passes [`MAX_INFLATED_BYTES`]; the limit is a parameter so
+/// tests can drive the rejection path with a bomb that fits in a test
+/// rather than one that has to allocate gigabytes to prove the point.
+pub(crate) fn inflate_capped<R: std::io::Read>(
+    reader: R,
+    limit: u64,
+    what: &str,
+) -> Result<Vec<u8>, ParseError> {
+    use std::io::Read;
+
+    let mut out = Vec::new();
+    // `limit + 1` so a stream that stops exactly at the ceiling is still
+    // distinguishable from one that ran past it.
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| ParseError::invalid(format!("corrupt {what}: {e}")))?;
+    if out.len() as u64 > limit {
+        return Err(ParseError::invalid(format!(
+            "{what} inflates past the {} MiB decompression limit",
+            limit / (1024 * 1024)
+        )));
+    }
+    Ok(out)
+}
+
+/// Reads one archive entry as UTF-8 text, bounded by
+/// [`MAX_METADATA_BYTES`].
+pub(crate) fn read_text_capped<R: std::io::Read>(
+    reader: R,
+    what: &str,
+) -> Result<String, ParseError> {
+    use std::io::Read;
+
+    let mut text = String::new();
+    reader
+        .take(MAX_METADATA_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| ParseError::invalid(format!("unreadable {what}: {e}")))?;
+    if text.len() as u64 > MAX_METADATA_BYTES {
+        return Err(ParseError::invalid(format!(
+            "{what} is larger than the {} MiB metadata limit",
+            MAX_METADATA_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(text)
+}
+
+/// Discards a reader's output, counting it and stopping at `limit`.
+///
+/// Takes `&mut` rather than ownership because the one caller
+/// ([`split_gzip_members`]) needs the reader back afterwards to recover
+/// how many *compressed* bytes it consumed.
+pub(crate) fn drain_capped<R: std::io::Read>(reader: &mut R, limit: u64) -> std::io::Result<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total += read as u64;
+        if total > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "member inflates past the decompression limit",
+            ));
+        }
+    }
+}
+
 /// Splits a file made of back-to-back gzip members into its members'
 /// *raw compressed* byte ranges.
 ///
@@ -318,10 +412,14 @@ impl ParseError {
 /// the split has to preserve exact byte boundaries rather than just
 /// concatenating the inflated output the way `MultiGzDecoder` would.
 pub(crate) fn split_gzip_members(bytes: &[u8]) -> Result<Vec<(usize, usize)>, ParseError> {
-    use std::io::Read;
-
     let mut ranges = Vec::new();
     let mut offset = 0usize;
+    // Budget shared across every member, not reset per member. A file can
+    // hold arbitrarily many valid gzip members, so a per-member cap bounds
+    // each one and nothing in total — and this runs on an apk before the
+    // control member has even been identified, so it is reachable by
+    // anyone who can publish.
+    let mut budget = MAX_INFLATED_BYTES;
     while offset < bytes.len() {
         // Trailing NULs/padding after the last member: not another member.
         if bytes[offset..].len() < 18 || bytes[offset] != 0x1f || bytes[offset + 1] != 0x8b {
@@ -329,10 +427,12 @@ pub(crate) fn split_gzip_members(bytes: &[u8]) -> Result<Vec<(usize, usize)>, Pa
         }
         let remaining = &bytes[offset..];
         let mut decoder = flate2::bufread::GzDecoder::new(remaining);
-        let mut sink = Vec::new();
-        decoder
-            .read_to_end(&mut sink)
+        // The inflated bytes are thrown away — only the compressed length
+        // matters here — but they still have to be produced to find the
+        // member boundary, so the work is bounded rather than buffered.
+        let inflated = drain_capped(&mut decoder, budget)
             .map_err(|e| ParseError::invalid(format!("corrupt gzip member: {e}")))?;
+        budget -= inflated;
         // `bufread::GzDecoder` consumes exactly one member and leaves the
         // reader positioned at the next one, which is what lets us recover
         // the member's compressed length.
@@ -353,6 +453,110 @@ pub(crate) fn split_gzip_members(bytes: &[u8]) -> Result<Vec<(usize, usize)>, Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gzip member that inflates to `count` zero bytes. Zeroes compress
+    /// to roughly nothing, which is exactly what makes this shape a cheap
+    /// denial of service against an unbounded decompressor.
+    fn zeros_gz(count: usize) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![0u8; count]).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn inflate_capped_accepts_input_up_to_the_limit() {
+        let bytes = zeros_gz(1024);
+        let out = inflate_capped(
+            flate2::bufread::GzDecoder::new(bytes.as_slice()),
+            MAX_INFLATED_BYTES,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1024);
+
+        // Exactly at the ceiling is still allowed through.
+        let out = inflate_capped(
+            flate2::bufread::GzDecoder::new(zeros_gz(1024).as_slice()),
+            1024,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1024);
+    }
+
+    #[test]
+    fn a_decompression_bomb_is_refused_instead_of_buffered() {
+        // 64 MiB of zeroes in about 64 KiB of gzip — the cheap shape of
+        // the attack. What matters is that the reader stops at the limit
+        // rather than allocating whatever the stream decides to produce.
+        let bomb = zeros_gz(64 * 1024 * 1024);
+        assert!(
+            bomb.len() < 256 * 1024,
+            "the input has to be small for this to be the bug it is"
+        );
+
+        let err = inflate_capped(
+            flate2::bufread::GzDecoder::new(bomb.as_slice()),
+            1024 * 1024,
+            "package",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("decompression limit"), "got {err}");
+
+        // The same stream drained rather than buffered stops too.
+        let mut decoder = flate2::bufread::GzDecoder::new(bomb.as_slice());
+        assert!(drain_capped(&mut decoder, 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn read_text_capped_rejects_a_file_past_the_metadata_limit() {
+        let oversized = vec![b'x'; (MAX_METADATA_BYTES + 1) as usize];
+        let err = read_text_capped(oversized.as_slice(), ".PKGINFO").unwrap_err();
+        assert!(err.to_string().contains("metadata limit"), "got {err}");
+
+        // The boundary itself is allowed through.
+        let exact = vec![b'x'; MAX_METADATA_BYTES as usize];
+        assert!(read_text_capped(exact.as_slice(), ".PKGINFO").is_ok());
+    }
+
+    #[test]
+    fn the_inflation_budget_is_shared_across_gzip_members() {
+        // Two members that each fit the limit but together exceed it. A
+        // per-member cap would wave this through, and an apk can carry as
+        // many members as the uploader likes.
+        let member = zeros_gz(4 * 1024 * 1024);
+        let mut both = member.clone();
+        both.extend_from_slice(&member);
+
+        // Sanity: one member alone is well inside a 6 MiB budget.
+        let mut decoder = flate2::bufread::GzDecoder::new(member.as_slice());
+        assert_eq!(
+            drain_capped(&mut decoder, 6 * 1024 * 1024).unwrap(),
+            4 * 1024 * 1024
+        );
+
+        // Draining them in sequence against one shared budget must not.
+        let mut budget = 6u64 * 1024 * 1024;
+        let mut decoder = flate2::bufread::GzDecoder::new(both.as_slice());
+        budget -= drain_capped(&mut decoder, budget).unwrap();
+        let rest = both.len() - decoder.into_inner().len();
+        let mut decoder = flate2::bufread::GzDecoder::new(&both[rest..]);
+        assert!(
+            drain_capped(&mut decoder, budget).is_err(),
+            "the second member must be charged against what the first spent"
+        );
+    }
+
+    #[test]
+    fn drain_capped_counts_what_it_discards() {
+        let bytes = zeros_gz(4096);
+        let mut decoder = flate2::bufread::GzDecoder::new(bytes.as_slice());
+        assert_eq!(
+            drain_capped(&mut decoder, MAX_INFLATED_BYTES).unwrap(),
+            4096
+        );
+    }
 
     #[test]
     fn format_round_trips_through_str() {

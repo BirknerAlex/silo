@@ -14,7 +14,6 @@
 //! stored bytes, the packument is stored with [`BASE_URL_PLACEHOLDER`] and
 //! the HTTP layer substitutes the real base at serve time.
 
-use std::io::Read;
 use std::pin::Pin;
 
 use base64::Engine;
@@ -323,10 +322,11 @@ fn is_name_char(c: char) -> bool {
 /// (`npm pack` of a scoped package historically differed), so the prefix
 /// is taken from the entry itself rather than assumed.
 fn read_package_json(bytes: &[u8]) -> Result<Map<String, Value>, ParseError> {
-    let mut inflated = Vec::new();
-    flate2::bufread::MultiGzDecoder::new(bytes)
-        .read_to_end(&mut inflated)
-        .map_err(|e| ParseError::invalid(format!("not a gzipped tarball: {e}")))?;
+    let inflated = crate::inflate_capped(
+        flate2::bufread::MultiGzDecoder::new(bytes),
+        crate::MAX_INFLATED_BYTES,
+        "npm tarball",
+    )?;
 
     let mut archive = tar::Archive::new(inflated.as_slice());
     for entry in archive
@@ -341,10 +341,7 @@ fn read_package_json(bytes: &[u8]) -> Result<Map<String, Value>, ParseError> {
             .into_owned();
         let components: Vec<&str> = path.trim_start_matches("./").split('/').collect();
         if components.len() == 2 && components[1] == "package.json" {
-            let mut text = String::new();
-            entry
-                .read_to_string(&mut text)
-                .map_err(|e| ParseError::invalid(format!("unreadable package.json: {e}")))?;
+            let text = crate::read_text_capped(&mut entry, "package.json")?;
             return match serde_json::from_str(&text) {
                 Ok(Value::Object(map)) => Ok(map),
                 Ok(_) => Err(ParseError::invalid("package.json is not a JSON object")),

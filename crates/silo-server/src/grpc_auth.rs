@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use silo_db::audit::{self, Actor, ActorKind, AuditEntry};
 use silo_db::tokens::{NewToken, Permission, Scope, TokenKind};
-use silo_db::users::{LoginError, User};
+use silo_db::users::{LoginError, OidcLoginError, User};
 use silo_proto::v1::auth_service_server::AuthService;
 use silo_proto::v1::{
     GetAuthInfoRequest, GetAuthInfoResponse, GetVersionRequest, GetVersionResponse,
@@ -18,6 +18,32 @@ use crate::AppState;
 
 pub struct AuthServiceImpl {
     pub state: Arc<AppState>,
+}
+
+/// How long the login throttle's window is, and how many attempts it
+/// tolerates within one. Set well above what a person fumbling a password
+/// produces and far below what makes a dictionary attack worthwhile. A
+/// successful sign-in clears the count, so only *failures* accumulate in
+/// practice.
+pub(crate) const LOGIN_FAILURE_WINDOW_MINUTES: i64 = 15;
+const MAX_LOGIN_ATTEMPTS: i64 = 25;
+
+/// Maps an OIDC provisioning failure onto a gRPC status.
+///
+/// The split is what the type exists for: a refusal was composed for the
+/// person signing in and naming the blocking account is the only way they
+/// can act on it, whereas a database failure is not their doing and its
+/// `Display` carries whatever sqlx said — endpoints, connection strings.
+/// Only the latter is redacted, and it still reaches the log in full.
+#[allow(clippy::result_large_err)]
+fn oidc_error_to_status(error: OidcLoginError) -> Status {
+    match error {
+        OidcLoginError::Db(e) => {
+            tracing::error!(error = %e, "OIDC provisioning failed against the database");
+            Status::unavailable("sign-in is temporarily unavailable")
+        }
+        refused => Status::permission_denied(refused.to_string()),
+    }
 }
 
 /// This server's version, in wire form. Shared with the HTTP `/version`
@@ -100,6 +126,50 @@ impl AuthService for AuthServiceImpl {
             ));
         }
 
+        // Lowercased and trimmed to match what `find_user_by_username`
+        // looks up. Counting the raw string instead would make `Alice`
+        // and `alice` separate throttle keys for one account, and varying
+        // the case is a one-line bypass.
+        let username = req.username.trim().to_lowercase();
+
+        // Password guessing is the one credential path in silo that a
+        // brute force can actually make progress against — tokens carry
+        // 256 bits of entropy, passwords do not — so the attempt rate has
+        // to be bounded somewhere.
+        //
+        // Keyed on the username, which does mean someone can park a
+        // targeted user at the ceiling and keep them out. That is the
+        // better failure: the window is short and self-healing, an admin
+        // token is unaffected, and the alternative (keying on client
+        // address) is bypassed by the first attacker with more than one.
+        // The attempt is *reserved* before the password is checked, not
+        // counted afterwards. Counting after the fact bounds nothing under
+        // concurrency: a thousand simultaneous attempts would each read
+        // the same under-limit total, each spend argon2, and only then
+        // record a thousand failures.
+        match self
+            .state
+            .db
+            .reserve_login_attempt(&username, LOGIN_FAILURE_WINDOW_MINUTES)
+            .await
+        {
+            Ok(attempts) if attempts > MAX_LOGIN_ATTEMPTS => {
+                self.state
+                    .metrics
+                    .auth_failures
+                    .with_label_values(&["throttled"])
+                    .inc();
+                return Err(Status::resource_exhausted(
+                    "too many failed sign-in attempts for this account; try again shortly",
+                ));
+            }
+            Ok(_) => {}
+            // A throttle that fails closed would turn a database blip into
+            // a total sign-in outage. The attempt itself is still
+            // authenticated normally below.
+            Err(e) => tracing::warn!(error = %e, "could not reserve a login attempt"),
+        }
+
         let user = match self
             .state
             .db
@@ -108,20 +178,35 @@ impl AuthService for AuthServiceImpl {
         {
             Ok(user) => user,
             Err(e) => {
-                self.record_failed_login(&req.username, &e.to_string(), remote_addr)
+                // Recorded under the same normalized name the throttle
+                // counts, so the two agree. The audit entry keeps the
+                // real reason; the client does not get it.
+                self.record_failed_login(&username, &e.to_string(), remote_addr)
                     .await;
                 return Err(match e {
                     LoginError::Db(e) => {
                         tracing::error!(error = %e, "login failed against the database");
                         Status::internal("login is temporarily unavailable")
                     }
-                    // Deliberately not distinguishing "no such user" from
-                    // "wrong password" — that difference is a username
-                    // oracle and nothing legitimate needs it.
-                    other => Status::unauthenticated(other.to_string()),
+                    // One message for every rejection. "No such user",
+                    // "wrong password", "account disabled" and "this
+                    // account is SSO-only" are all username oracles —
+                    // the last two just less obviously so, since they
+                    // confirm an account exists. A client that needs to
+                    // know whether SSO is available asks `GetAuthInfo`,
+                    // which answers without naming anybody.
+                    _ => Status::unauthenticated("invalid username or password"),
                 });
             }
         };
+
+        // Proving you know the password clears the count, so a few typos
+        // before a correct entry don't leave someone carrying reservations
+        // for the rest of the window. Best-effort: failing to forget an
+        // attempt must not fail a sign-in that already succeeded.
+        if let Err(e) = self.state.db.clear_login_attempts(&username).await {
+            tracing::warn!(error = %e, "could not clear the login attempt count");
+        }
 
         Ok(Response::new(
             self.issue_session(user, "password", remote_addr).await?,
@@ -154,9 +239,21 @@ impl AuthService for AuthServiceImpl {
         let user = self
             .state
             .db
-            .upsert_oidc_user(&claims.sub, &username, claims.is_admin(verifier.config()))
+            .upsert_oidc_user(
+                &claims.sub,
+                &username,
+                claims.is_admin(verifier.config()),
+                verifier.config().allow_username_linking,
+            )
             .await
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
+            .map_err(|e| {
+                self.state
+                    .metrics
+                    .auth_failures
+                    .with_label_values(&["oidc_provisioning"])
+                    .inc();
+                oidc_error_to_status(e)
+            })?;
 
         // The same session, reported through this flow's own message. The
         // two are field-identical today; keeping them separate is what
@@ -281,5 +378,46 @@ impl AuthServiceImpl {
                     .failed(reason),
             )
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_database_failure_during_oidc_provisioning_is_not_described_to_the_caller() {
+        // `sqlx::Error`'s Display routinely names the host, the database,
+        // and sometimes the credentials used to reach it. A caller who
+        // merely tried to sign in must not receive any of it.
+        let status = oidc_error_to_status(OidcLoginError::Db(sqlx::Error::PoolTimedOut));
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "sign-in is temporarily unavailable");
+    }
+
+    #[test]
+    fn a_refused_link_still_tells_the_caller_what_to_do_about_it() {
+        // The other half: these messages exist to be read. Redacting them
+        // too would leave someone locked out with nothing to act on.
+        let status = oidc_error_to_status(OidcLoginError::UsernameTaken("admin".into()));
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(status.message().contains("admin"), "{}", status.message());
+        assert!(
+            status.message().contains("allow_username_linking"),
+            "the refusal has to name the setting that changes it"
+        );
+
+        let status = oidc_error_to_status(OidcLoginError::AlreadyLinked("alice".into()));
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(status.message().contains("already linked"));
+
+        // A race is transient, so it says to retry rather than reading as
+        // a permanent refusal.
+        let status = oidc_error_to_status(OidcLoginError::RacedAnotherLogin("bob".into()));
+        assert!(
+            status.message().contains("try again"),
+            "{}",
+            status.message()
+        );
     }
 }
