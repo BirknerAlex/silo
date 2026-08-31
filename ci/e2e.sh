@@ -189,6 +189,30 @@ PACMAN_CANDIDATES=$(ls "$WORK"/packages/*.pkg.tar.zst)
 PACMAN_FILE=$PACMAN_CANDIDATES
 ok "pacman  $(basename "$PACMAN_FILE")"
 
+# deb, via dpkg-deb in Debian. examples/deb is already laid out as the
+# payload tree dpkg-deb expects (a DEBIAN/control alongside the files to
+# install), so there is no separate "source" format to unpack first.
+#
+# Architecture is rewritten to whatever this host's dpkg actually reports
+# rather than trusting the checked-in "amd64": a package built for the
+# wrong architecture is invisible to apt (silo only folds an `all`
+# package into an architecture that has had a real publish of its own —
+# see deb.rs), and this suite has to pass on both amd64 and arm64
+# development machines, not just amd64 CI runners.
+docker run --rm -v "$ROOT/examples/deb:/src:ro" -v "$WORK/packages:/out" debian:12 bash -c '
+    set -e
+    apt-get -qq update >/dev/null 2>&1
+    apt-get -qq -y install dpkg-dev >/dev/null 2>&1
+    cp -r /src /tmp/pkg
+    ARCH=$(dpkg --print-architecture)
+    sed -i "s/^Architecture: .*/Architecture: $ARCH/" /tmp/pkg/DEBIAN/control
+    dpkg-deb --build --root-owner-group /tmp/pkg "/out/silo-hello_1.2.3-4_${ARCH}.deb"
+' >/dev/null 2>&1 || fail "dpkg-deb failed (rerun with bash -x ci/e2e.sh to see why)"
+DEB_FILE=$(ls "$WORK"/packages/*.deb)
+DEB_ARCH=$(basename "$DEB_FILE" .deb)
+DEB_ARCH=${DEB_ARCH##*_}
+ok "deb  $(basename "$DEB_FILE")  (arch: $DEB_ARCH)"
+
 # ------------------------------------------------------------- the server
 
 log "starting silo (postgres + seaweedfs + server)"
@@ -315,15 +339,16 @@ publish "$(basename "$RPM_FILE")" | sed 's/^/    /'
 publish "$(basename "$APK_FILE")" | sed 's/^/    /'
 publish "$(basename "$NPM_FILE")" | sed 's/^/    /'
 publish "$(basename "$PACMAN_FILE")" | sed 's/^/    /'
+publish "$(basename "$DEB_FILE")" | sed 's/^/    /'
 
-# Four packages, four formats, all in one repo/channel.
+# Five packages, five formats, all in one repo/channel.
 LISTED=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
     /usr/local/bin/silo list --repo "$REPO" --channel "$CHANNEL" --json | tr -d '\r')
-for format in rpm apk npm pacman; do
+for format in rpm apk npm pacman deb; do
     echo "$LISTED" | grep -q "\"format\": \"$format\"" \
         || fail "$format is missing from the package list"
 done
-ok "all four formats are indexed"
+ok "all five formats are indexed"
 
 # pacman's downloader does not send Basic-auth credentials embedded in a
 # Server URL the way dnf's and apk's do (verified empirically — it just
@@ -348,6 +373,7 @@ verify() {
         -e "SILO_PUBLISH_TOKEN=$PUBLISH_TOKEN" \
         -e "REPO=$REPO" -e "CHANNEL=$CHANNEL" \
         -e "APK_KEY_NAME=$APK_KEY_NAME" \
+        -e "DEB_ARCH=$DEB_ARCH" \
         -v "$ROOT/ci/e2e:/verify:ro" \
         -v "$WORK/keys:/keys:ro" \
         "$image" sh "/verify/$script" 2>&1 | sed 's/^/    /' \
@@ -359,6 +385,7 @@ verify dnf    fedora:41        verify-dnf.sh
 verify apk    alpine:3.20      verify-apk.sh
 verify npm    node:22-alpine   verify-npm.sh
 verify pacman archlinux:base   verify-pacman.sh
+verify apt    debian:12        verify-apt.sh
 
 # ---------------------------------------------------------------- repair
 
@@ -376,5 +403,10 @@ $COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:80
     /usr/local/bin/silo index rebuild --repo "$REPO" --channel "$CHANNEL" --format pacman \
     | sed 's/^/    /'
 verify "pacman (after an index rebuild)" archlinux:base verify-pacman.sh
+
+$COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+    /usr/local/bin/silo index rebuild --repo "$REPO" --channel "$CHANNEL" --format deb \
+    | sed 's/^/    /'
+verify "apt (after an index rebuild)" debian:12 verify-apt.sh
 
 log "end-to-end suite passed"

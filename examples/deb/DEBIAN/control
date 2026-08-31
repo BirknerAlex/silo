@@ -1,0 +1,13 @@
+Package: silo-hello
+Version: 1.2.3-4
+Architecture: amd64
+Maintainer: silo <silo@example.com>
+Installed-Size: 8
+Depends: bash
+Section: utils
+Priority: optional
+Homepage: https://github.com/BirknerAlex/silo
+Description: A tiny package for silo's end-to-end tests
+ Prints a line. Exists so silo's end-to-end suite can publish a real
+ .deb, serve it through the Packages/Release index silo generates, and
+ have real apt resolve, download, verify and install it.

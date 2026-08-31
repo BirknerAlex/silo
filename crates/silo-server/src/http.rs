@@ -1,13 +1,16 @@
-//! The plain-HTTP surface: what `dnf`, `apk` and `npm` actually talk to.
+//! The plain-HTTP surface: what `dnf`, `apk`, `pacman`, `apt` and `npm`
+//! actually talk to.
 //!
 //! Each client speaks its own protocol and none of them can be taught a
-//! new one, so this module is three thin adapters over the same storage
-//! and the same auth:
+//! new one, so this module is five thin adapters over the same storage and
+//! the same auth:
 //!
 //! | client | reads | credential |
 //! |---|---|---|
 //! | `dnf`/`yum` | `/{repo}/{ch}/repodata/*`, `/{repo}/{ch}/Packages/*` | Basic (`.repo` `username=`/`password=`) |
 //! | `apk` | `/{repo}/{ch}/apk/{arch}/{APKINDEX.tar.gz,*.apk}` | Basic (credentials in the URL) |
+//! | `pacman` | `/{repo}/{ch}/pacman/{arch}/{db.tar.gz,*.pkg.tar.*}` | Basic in principle, but pacman's downloader never sends URL-embedded credentials — see `ci/e2e.sh` |
+//! | `apt` | `/{repo}/{ch}/dists/{suite}/*`, `/{repo}/{ch}/pool/*.deb` | Basic (credentials in the URL) |
 //! | `npm` | `/{repo}/{ch}/npm/{name}`, `.../{name}/-/{file}.tgz` | Bearer (`.npmrc` `_authToken`) |
 //!
 //! Index files (repodata, APKINDEX, packuments) are proxied through the
@@ -60,6 +63,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/:repo/:channel/apk/:arch/*file", get(get_apk_file))
         // pacman
         .route("/:repo/:channel/pacman/:arch/*file", get(get_pacman_file))
+        // apt — `:suite` is accepted but unused: apt appends whatever suite
+        // its `sources.list` entry names, and silo always answers for
+        // `:channel` regardless of what that string is (see `deb.rs`'s
+        // module doc for why component and suite aren't independent axes
+        // here the way they are in a real Debian archive).
+        .route("/:repo/:channel/dists/:suite/*file", get(get_deb_release))
+        .route("/:repo/:channel/pool/*file", get(get_deb_package))
         // npm — one catch-all because scoped names (`@acme/widget`) put a
         // slash inside what npm considers a single path segment. `PUT` is
         // how `npm publish`/`yarn publish` send a new version.
@@ -627,6 +637,60 @@ async fn pacman_key(
     key
 }
 
+// ---------------------------------------------------------------------- apt
+
+/// Serves `Release`, `InRelease`, `Release.gpg` and every architecture's
+/// `Packages*` — everything under `dists/:suite/*`.
+///
+/// Unlike apk/pacman's arch fallback, `:suite` never has to be resolved
+/// against anything: apt's `Architecture: all` packages are folded into
+/// every concrete architecture's `Packages` file at index-build time (see
+/// `deb.rs`), not served from a fallback path at request time, so the key
+/// is a direct join with no lookup.
+async fn get_deb_release(
+    State(state): State<Arc<AppState>>,
+    Path((repo, channel, _suite, file)): Path<(String, String, String, String)>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = validate_repo_path(&repo, &channel) {
+        return resp;
+    }
+    if let Err(resp) =
+        authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await
+    {
+        return resp;
+    }
+    if let Err(resp) = reject_traversal(&file) {
+        return resp;
+    }
+
+    let key = format!("{}/{file}", silo_pkg::deb::dists_prefix(&repo, &channel));
+    serve_index(&state, &key, content_type_for(&file), "deb-index").await
+}
+
+async fn get_deb_package(
+    State(state): State<Arc<AppState>>,
+    Path((repo, channel, file)): Path<(String, String, String)>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = validate_repo_path(&repo, &channel) {
+        return resp;
+    }
+    let auth =
+        match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
+            Ok(auth) => auth,
+            Err(resp) => return resp,
+        };
+    if let Err(resp) = reject_traversal(&file) {
+        return resp;
+    }
+
+    let key = format!("{}/{file}", silo_pkg::deb::pool_prefix(&repo, &channel));
+    serve_package(&state, &key, PackageFormat::Deb, &auth, &repo, &channel).await
+}
+
 // -------------------------------------------------------------------- npm
 
 async fn get_npm(
@@ -977,15 +1041,21 @@ fn reject_traversal(path: &str) -> Result<(), Response> {
 }
 
 fn content_type_for(file: &str) -> &'static str {
+    let basename = file.rsplit('/').next().unwrap_or(file);
     if file.ends_with(".xml") {
         "application/xml"
     } else if file.ends_with(".gz") {
         "application/gzip"
     } else if file.ends_with(".zst") {
         "application/zstd"
+    } else if file.ends_with(".xz") {
+        "application/x-xz"
     } else if file.ends_with(".bz2") {
         "application/x-bzip2"
-    } else if file.ends_with(".asc") {
+    } else if file.ends_with(".asc")
+        || file.ends_with(".gpg")
+        || matches!(basename, "Release" | "InRelease" | "Packages")
+    {
         "text/plain"
     } else {
         "application/octet-stream"
@@ -1868,12 +1938,81 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn deb_release_and_pool_files_are_served_from_the_channel_wide_dists_tree() {
+        let state = require_public_repo_state!();
+        for (key, body) in [
+            ("myrepo/edge/dists/edge/Release", "release-bytes"),
+            (
+                "myrepo/edge/dists/edge/main/binary-amd64/Packages.gz",
+                "packages-gz-bytes",
+            ),
+            ("myrepo/edge/pool/hello_1.0-1_amd64.deb", "debbytes"),
+        ] {
+            state
+                .storage
+                .put(key, body.as_bytes().to_vec())
+                .await
+                .unwrap();
+        }
+
+        // `:suite` is accepted but unused — whatever a client's
+        // sources.list names, silo answers for `:channel`.
+        let resp = get(state.clone(), "/myrepo/edge/dists/edge/Release").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain"
+        );
+        assert_eq!(body_string(resp).await, "release-bytes");
+
+        let resp = get(
+            state.clone(),
+            "/myrepo/edge/dists/edge/main/binary-amd64/Packages.gz",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/gzip"
+        );
+        assert_eq!(body_string(resp).await, "packages-gz-bytes");
+
+        let resp = get(state, "/myrepo/edge/pool/hello_1.0-1_amd64.deb").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, "debbytes");
+    }
+
+    #[tokio::test]
+    async fn deb_release_serving_ignores_the_suite_segment() {
+        // A client's sources.list can name any suite string it likes; silo
+        // never validates it against the channel, only uses it for routing.
+        let state = require_public_repo_state!();
+        state
+            .storage
+            .put("myrepo/edge/dists/edge/Release", b"release-bytes".to_vec())
+            .await
+            .unwrap();
+
+        for suite in ["edge", "whatever-the-client-picked"] {
+            let resp = get(
+                state.clone(),
+                &format!("/myrepo/edge/dists/{suite}/Release"),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_string(resp).await, "release-bytes");
+        }
+    }
+
+    #[tokio::test]
     async fn path_traversal_is_refused() {
         let state = require_public_repo_state!();
         for uri in [
             "/myrepo/stable/repodata/../../../etc/passwd",
             "/myrepo/stable/Packages/..%2f..%2fsecret",
             "/myrepo/edge/apk/x86_64/../../other/APKINDEX.tar.gz",
+            "/myrepo/edge/dists/edge/../../../etc/passwd",
+            "/myrepo/edge/pool/../../secret.deb",
         ] {
             let resp = get(state.clone(), uri).await;
             assert!(

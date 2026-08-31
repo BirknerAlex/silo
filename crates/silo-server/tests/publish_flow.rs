@@ -1,4 +1,4 @@
-//! End-to-end publish tests for all three formats, plus the concurrency
+//! End-to-end publish tests for every format, plus the concurrency
 //! behaviour the distributed lock exists to provide.
 //!
 //! See `tests/common/mod.rs` for how to point these at a database.
@@ -10,7 +10,9 @@ use std::io::Read;
 use common::{unique_repo, Harness};
 use silo_db::audit::{Actor, ActorKind, AuditQuery};
 use silo_db::tokens::{Permission, Scope};
-use silo_pkg::testutil::{build_test_apk, build_test_npm, build_test_pacman, build_test_rpm};
+use silo_pkg::testutil::{
+    build_test_apk, build_test_deb, build_test_npm, build_test_pacman, build_test_rpm,
+};
 use silo_pkg::PackageFormat;
 
 /// Reads one architecture's APKINDEX back out of storage as text.
@@ -718,6 +720,102 @@ async fn rpm_publish_writes_repodata() {
             "{href} is referenced by repomd.xml but missing from storage"
         );
     }
+}
+
+#[tokio::test]
+async fn deb_publish_writes_release_and_packages() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("deb");
+
+    let outcome = silo_core::repo::publish(
+        &harness.state.publish,
+        &repo,
+        "stable",
+        PackageFormat::Deb,
+        build_test_deb("hello", "1.0-1", "amd64"),
+        &actor(),
+    )
+    .await
+    .expect("publish deb");
+
+    assert_eq!(
+        outcome.storage_path,
+        format!("{repo}/stable/pool/hello_1.0-1_amd64.deb")
+    );
+    assert_eq!(
+        outcome.index_group, "",
+        "apt's Release covers every architecture at once"
+    );
+    assert!(
+        !outcome.signed,
+        "no signing key is configured in this harness"
+    );
+
+    let rows = harness
+        .db
+        .list_packages(&repo, "stable", Some(PackageFormat::Deb))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "hello");
+
+    let release = harness
+        .state
+        .storage
+        .get(&format!("{repo}/stable/dists/stable/Release"))
+        .await
+        .unwrap()
+        .expect("Release was written");
+    let release = String::from_utf8_lossy(&release).into_owned();
+    assert!(release.contains("Suite: stable"));
+    assert!(release.contains("Architectures: amd64"));
+    assert!(
+        harness
+            .state
+            .storage
+            .get(&format!("{repo}/stable/dists/stable/InRelease"))
+            .await
+            .unwrap()
+            .is_none(),
+        "InRelease must not exist without a configured signing key"
+    );
+
+    // Every file Release's SHA256 section points at must actually be in
+    // the bucket — the same contract repomd.xml's hrefs give dnf.
+    let paths: Vec<&str> = release
+        .lines()
+        .skip_while(|l| *l != "SHA256:")
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().nth(2))
+        .collect();
+    assert_eq!(paths.len(), 3, "{release}");
+    for path in paths {
+        assert!(
+            harness
+                .state
+                .storage
+                .get(&format!("{repo}/stable/dists/stable/{path}"))
+                .await
+                .unwrap()
+                .is_some(),
+            "{path} is referenced by Release but missing from storage"
+        );
+    }
+
+    let packages = harness
+        .state
+        .storage
+        .get(&format!(
+            "{repo}/stable/dists/stable/main/binary-amd64/Packages"
+        ))
+        .await
+        .unwrap()
+        .expect("Packages was written");
+    let packages = String::from_utf8_lossy(&packages).into_owned();
+    assert!(packages.contains("Package: hello\n"));
+    assert!(packages.contains("Version: 1.0-1\n"));
+    assert!(packages.contains("Filename: pool/hello_1.0-1_amd64.deb\n"));
 }
 
 #[tokio::test]

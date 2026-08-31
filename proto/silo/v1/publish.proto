@@ -13,6 +13,7 @@ enum PackageFormat {
   PACKAGE_FORMAT_APK = 2;
   PACKAGE_FORMAT_NPM = 3;
   PACKAGE_FORMAT_PACMAN = 4;
+  PACKAGE_FORMAT_DEB = 5;
 }
 
 // PublishService lets authorized clients push packages into a repo/channel.
