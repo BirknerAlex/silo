@@ -84,6 +84,14 @@ impl Format for DebFormat {
             get("Version").ok_or_else(|| ParseError::invalid("control is missing Version"))?;
         let arch = get("Architecture")
             .ok_or_else(|| ParseError::invalid("control is missing Architecture"))?;
+        // `filename` below becomes a storage key path segment
+        // (`pool/{filename}`) verbatim, so a `/` in any of these — a
+        // hand-crafted control file, not something `dpkg-deb` would ever
+        // produce — would let a publish escape the pool prefix instead of
+        // merely naming a package oddly.
+        validate_control_field("Package", &name)?;
+        validate_control_field("Version", &raw_version)?;
+        validate_control_field("Architecture", &arch)?;
         let (epoch, version, release) = split_version(&raw_version)?;
 
         let filename = format!(
@@ -272,6 +280,20 @@ fn full_version(record: &PackageRecord) -> String {
             version_without_epoch(&record.version, &record.release)
         )
     }
+}
+
+/// Rejects a control field that could turn `filename` into more than one
+/// storage-key path segment. `field` names which one, for the error.
+fn validate_control_field(field: &str, value: &str) -> Result<(), ParseError> {
+    if value.is_empty() {
+        return Err(ParseError::invalid(format!("control's {field} is empty")));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(ParseError::invalid(format!(
+            "control's {field} contains a path separator: {value:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// Splits a control file's `Version` field (`[epoch:]upstream_version[-debian_revision]`)
@@ -527,6 +549,31 @@ mod tests {
     #[test]
     fn rejects_a_deb_without_control() {
         assert!(DebFormat.parse(b"not an ar archive").is_err());
+    }
+
+    /// A hand-crafted control file — real `dpkg-deb` never produces one of
+    /// these — must not be able to turn `filename` into a storage key that
+    /// escapes `pool/`.
+    #[test]
+    fn rejects_a_slash_in_any_filename_forming_field() {
+        for (name, version, arch) in [
+            ("../../etc/passwd", "1.0-1", "amd64"),
+            ("hello", "../../1.0-1", "amd64"),
+            ("hello", "1.0-1", "../amd64"),
+        ] {
+            let err = DebFormat
+                .parse(&build_test_deb(name, version, arch))
+                .unwrap_err();
+            assert!(err.to_string().contains("path separator"), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_an_empty_package_name() {
+        let err = DebFormat
+            .parse(&build_test_deb("", "1.0-1", "amd64"))
+            .unwrap_err();
+        assert!(err.to_string().contains("is empty"), "{err}");
     }
 
     #[test]
