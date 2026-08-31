@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.1](https://github.com/BirknerAlex/silo/compare/v0.7.0...v0.7.1) (2026-08-31)
+
+
+### Bug fixes
+
+* **deps:** bump jsonwebtoken to 11 to address type confusion advisory ([5829023](https://github.com/BirknerAlex/silo/commit/582902304cc88f0e1947e88a1bad81d76031a2aa))
+* **helm:** expose config.prune / config.jobs via structured values ([aed691c](https://github.com/BirknerAlex/silo/commit/aed691c1ecfa7de35bbafcf738c98fc1e8f1d27c)), closes [#30](https://github.com/BirknerAlex/silo/issues/30)
+* **security:** close privilege-escalation and disclosure paths found in an audit ([051f3e3](https://github.com/BirknerAlex/silo/commit/051f3e31e7001086fe9758007b2c61536a08852c))
+
 ## [0.7.0](https://github.com/BirknerAlex/silo/compare/v0.6.0...v0.7.0) (2026-08-30)
 
 

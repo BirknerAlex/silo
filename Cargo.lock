@@ -3388,7 +3388,7 @@ dependencies = [
 
 [[package]]
 name = "silo-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "silo-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3438,7 +3438,7 @@ dependencies = [
 
 [[package]]
 name = "silo-db"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3459,7 +3459,7 @@ dependencies = [
 
 [[package]]
 name = "silo-pkg"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3480,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "silo-proto"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "prost",
  "tonic",
@@ -3489,7 +3489,7 @@ dependencies = [
 
 [[package]]
 name = "silo-server"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
