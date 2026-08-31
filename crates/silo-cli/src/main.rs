@@ -507,6 +507,7 @@ fn to_proto_format(format: PackageFormat) -> ProtoFormat {
         PackageFormat::Apk => ProtoFormat::Apk,
         PackageFormat::Npm => ProtoFormat::Npm,
         PackageFormat::Pacman => ProtoFormat::Pacman,
+        PackageFormat::Deb => ProtoFormat::Deb,
     }
 }
 
@@ -516,6 +517,7 @@ fn format_name(value: i32) -> String {
         Ok(ProtoFormat::Apk) => "apk".into(),
         Ok(ProtoFormat::Npm) => "npm".into(),
         Ok(ProtoFormat::Pacman) => "pacman".into(),
+        Ok(ProtoFormat::Deb) => "deb".into(),
         _ => "-".into(),
     }
 }
@@ -1720,7 +1722,9 @@ mod tests {
         assert_eq!(parse_format("apk").unwrap(), PackageFormat::Apk);
         assert_eq!(parse_format("alpine").unwrap(), PackageFormat::Apk);
         assert_eq!(parse_format("npm").unwrap(), PackageFormat::Npm);
-        assert!(parse_format("deb").is_err());
+        assert_eq!(parse_format("deb").unwrap(), PackageFormat::Deb);
+        assert_eq!(parse_format("apt").unwrap(), PackageFormat::Deb);
+        assert!(parse_format("snap").is_err());
     }
 
     #[test]
@@ -1745,6 +1749,10 @@ mod tests {
         assert_eq!(
             PackageFormat::from_filename("widget-1.0.0.tgz"),
             Some(PackageFormat::Npm)
+        );
+        assert_eq!(
+            PackageFormat::from_filename("hello_1.0-1_amd64.deb"),
+            Some(PackageFormat::Deb)
         );
         assert_eq!(PackageFormat::from_filename("notes.txt"), None);
     }

@@ -124,6 +124,64 @@ pub fn build_test_pacman(name: &str, version: &str, arch: &str, ext: &str) -> Ve
     }
 }
 
+/// A valid `.deb`: the three-member `ar` archive `dpkg-deb` produces
+/// (`debian-binary`, `control.tar.gz`, `data.tar.gz`), with a minimal but
+/// complete `control` file.
+///
+/// `version` is the full control-file `Version` field
+/// (`[epoch:]upstream_version[-debian_revision]`), matching what real
+/// `.deb`s carry rather than silo's already-split `ParsedPackage` fields —
+/// the same convention `build_test_pacman`'s `version` argument uses.
+pub fn build_test_deb(name: &str, version: &str, arch: &str) -> Vec<u8> {
+    let control = format!(
+        "Package: {name}\n\
+         Version: {version}\n\
+         Architecture: {arch}\n\
+         Maintainer: silo <silo@example.com>\n\
+         Installed-Size: 4\n\
+         Depends: libc6\n\
+         Section: utils\n\
+         Priority: optional\n\
+         Homepage: https://example.com/{name}\n\
+         Description: a test package\n\
+         \x20end-to-end tests exercise this description\n"
+    );
+    let control_tar = tar_bytes(&[("control", control.as_bytes())]).expect("control.tar");
+    let control_tar_gz = gzip(&control_tar).expect("gzip control.tar");
+
+    let data_tar = tar_bytes(&[
+        ("usr/", b"".as_slice()),
+        ("usr/share/", b"".as_slice()),
+        ("usr/share/hello.txt", b"hello from silo\n".as_slice()),
+    ])
+    .expect("data.tar");
+    let data_tar_gz = gzip(&data_tar).expect("gzip data.tar");
+
+    let mut out = Vec::new();
+    {
+        let mut builder = ar::Builder::new(&mut out);
+        builder
+            .append(
+                &ar::Header::new(b"debian-binary".to_vec(), 4),
+                "2.0\n".as_bytes(),
+            )
+            .expect("append debian-binary");
+        builder
+            .append(
+                &ar::Header::new(b"control.tar.gz".to_vec(), control_tar_gz.len() as u64),
+                control_tar_gz.as_slice(),
+            )
+            .expect("append control.tar.gz");
+        builder
+            .append(
+                &ar::Header::new(b"data.tar.gz".to_vec(), data_tar_gz.len() as u64),
+                data_tar_gz.as_slice(),
+            )
+            .expect("append data.tar.gz");
+    }
+    out
+}
+
 /// A valid npm tarball: `package/package.json` plus a README, gzipped.
 pub fn build_test_npm(name: &str, version: &str) -> Vec<u8> {
     let manifest = json!({

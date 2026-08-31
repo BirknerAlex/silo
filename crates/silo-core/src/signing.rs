@@ -13,6 +13,12 @@
 //!   scheme as RPM, but as a detached *binary* (non-armored) signature in
 //!   a sibling `.sig` object — the shape `repo-add -s`/`pacman-key` expect
 //!   — rather than embedded or prepended into the database itself.
+//! - **The apt `Release` file** is signed with the same key as RPM — apt
+//!   trusts an ordinary OpenPGP key the same way dnf does, so there's no
+//!   protocol reason to keep them apart the way pacman's is kept separate.
+//!   Both a detached armored `Release.gpg` and a clearsigned `InRelease`
+//!   (`Release`'s body and its signature folded into one document) are
+//!   produced, since real `apt` deployments still carry both.
 //!
 //! npm has no signing story here: npm clients verify `integrity` hashes
 //! from the packument, which the registry serves over TLS, and there is no
@@ -20,7 +26,9 @@
 
 use std::sync::Arc;
 
-use pgp::composed::{ArmorOptions, Deserializable, DetachedSignature, SignedSecretKey};
+use pgp::composed::{
+    ArmorOptions, CleartextSignedMessage, Deserializable, DetachedSignature, SignedSecretKey,
+};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::ser::Serialize as _;
 use pgp::types::Password;
@@ -79,6 +87,9 @@ impl Signers {
             silo_pkg::PackageFormat::Pacman => {
                 self.pacman.as_deref().map(|s| s as &dyn IndexSigner)
             }
+            // Reuses the RPM key rather than a fourth key slot — see the
+            // module doc for why apt doesn't need one of its own.
+            silo_pkg::PackageFormat::Deb => self.gpg.as_deref().map(|s| s as &dyn IndexSigner),
         }
     }
 }
@@ -148,18 +159,22 @@ impl GpgSigner {
         )?)
     }
 
-    /// Common to both detached-signature forms below: only the final
-    /// serialization (armored vs. raw bytes) differs between them, so the
-    /// key parsing, passphrase handling and hash algorithm live here once
-    /// rather than risking drift between the RPM and pacman paths.
-    fn detached_signature(&self, data: &[u8]) -> anyhow::Result<DetachedSignature> {
+    /// Common to every signature form below: only the final serialization
+    /// (armored bytes, raw bytes, cleartext-framed text) differs between
+    /// them, so the key parsing and passphrase handling live here once
+    /// rather than risking drift between the RPM, pacman and apt paths.
+    fn secret_key_and_password(&self) -> anyhow::Result<(SignedSecretKey, Password)> {
         let (key, _) = SignedSecretKey::from_string(&self.armored_key)
             .map_err(|e| anyhow::anyhow!("failed to parse the gpg secret key: {e}"))?;
-
         let password = match &self.passphrase {
             Some(p) => Password::from(p.clone()),
             None => Password::empty(),
         };
+        Ok((key, password))
+    }
+
+    fn detached_signature(&self, data: &[u8]) -> anyhow::Result<DetachedSignature> {
+        let (key, password) = self.secret_key_and_password()?;
 
         // `&*key` derefs the signed key down to the primary secret key,
         // which is what implements the signing trait.
@@ -174,7 +189,8 @@ impl GpgSigner {
     }
 
     /// Detached, armored signature over arbitrary bytes — used for
-    /// `repomd.xml.asc`, which is what `repo_gpgcheck=1` verifies.
+    /// `repomd.xml.asc`, which is what `repo_gpgcheck=1` verifies, and for
+    /// apt's `Release.gpg`.
     fn detached_armored_signature(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.detached_signature(data)?
             .to_armored_bytes(Default::default())
@@ -188,6 +204,17 @@ impl GpgSigner {
             .to_bytes()
             .map_err(|e| anyhow::anyhow!("failed to serialize the signature: {e}"))
     }
+
+    /// OpenPGP Cleartext Signature Framework over `text` — what apt's
+    /// `InRelease` is: `Release`'s body and its own detached signature
+    /// folded into one clearsigned document.
+    fn clearsign_text(&self, text: &str) -> anyhow::Result<String> {
+        let (key, password) = self.secret_key_and_password()?;
+        CleartextSignedMessage::sign(rand::thread_rng(), text, &*key, &password)
+            .map_err(|e| anyhow::anyhow!("failed to clearsign: {e}"))?
+            .to_armored_string(Default::default())
+            .map_err(|e| anyhow::anyhow!("failed to armor the clearsigned message: {e}"))
+    }
 }
 
 impl IndexSigner for GpgSigner {
@@ -197,6 +224,10 @@ impl IndexSigner for GpgSigner {
 
     fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.detached_armored_signature(data)
+    }
+
+    fn clearsign(&self, text: &str) -> anyhow::Result<Option<String>> {
+        Ok(Some(self.clearsign_text(text)?))
     }
 }
 
@@ -386,6 +417,7 @@ mod tests {
         assert!(signers.for_format(PackageFormat::Rpm).is_none());
         assert!(signers.for_format(PackageFormat::Npm).is_none());
         assert!(signers.for_format(PackageFormat::Pacman).is_none());
+        assert!(signers.for_format(PackageFormat::Deb).is_none());
     }
 
     #[test]
@@ -431,6 +463,43 @@ mod tests {
             signers.for_format(PackageFormat::Pacman).is_none(),
             "configuring signing.gpg must not implicitly sign pacman repos"
         );
+        assert!(
+            signers.for_format(PackageFormat::Deb).is_some(),
+            "apt reuses signing.gpg rather than a key of its own"
+        );
+    }
+
+    #[test]
+    fn gpg_signer_clearsigns_and_the_derived_public_key_verifies_it() {
+        let signer = test_gpg_signer();
+        let inrelease = signer.clearsign("Release bytes\n").unwrap().unwrap();
+        assert!(inrelease.starts_with("-----BEGIN PGP SIGNED MESSAGE-----"));
+        assert!(inrelease.contains("Release bytes"));
+        assert!(inrelease.contains("-----BEGIN PGP SIGNATURE-----"));
+
+        let (public, _) = SignedPublicKey::from_string(signer.armored_public_key()).unwrap();
+        let (msg, _) = CleartextSignedMessage::from_string(&inrelease).unwrap();
+        msg.verify(&public)
+            .expect("the served key must verify what the private half clearsigned");
+    }
+
+    #[test]
+    fn apk_and_pacman_signers_have_no_clearsign_story() {
+        let apk = ApkSigner::from_config(&ApkSigningConfig {
+            key: Some(TEST_RSA_PKCS8.to_string()),
+            key_path: None,
+            key_name: "k.rsa.pub".to_string(),
+        })
+        .unwrap();
+        assert!(apk.clearsign("text").unwrap().is_none());
+
+        let pacman = PacmanSigner::from_config(&GpgConfig {
+            key: Some(TEST_GPG_SECRET_KEY.to_string()),
+            key_path: None,
+            passphrase: None,
+        })
+        .unwrap();
+        assert!(pacman.clearsign("text").unwrap().is_none());
     }
 
     #[test]

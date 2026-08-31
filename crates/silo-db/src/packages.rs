@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn unparseable_format_strings_do_not_panic() {
         let mut row = row();
-        row.format = "deb".into();
+        row.format = "snap".into();
         assert_eq!(row.to_record().format, PackageFormat::Rpm);
     }
 

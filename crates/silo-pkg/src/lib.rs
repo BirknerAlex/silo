@@ -1,10 +1,10 @@
 //! Package format parsing, storage layout, and index rendering.
 //!
-//! Four formats are supported: RPM (`dnf`/`yum`), Alpine APK (`apk`), npm,
-//! and pacman (Arch Linux). Everything format-specific lives behind the
-//! [`Format`] trait so the rest of the codebase — publish flow, HTTP
-//! surface, database index — never matches on a format enum except to
-//! dispatch through [`PackageFormat::handler`].
+//! Five formats are supported: RPM (`dnf`/`yum`), Alpine APK (`apk`), npm,
+//! pacman (Arch Linux), and Debian (`apt`). Everything format-specific
+//! lives behind the [`Format`] trait so the rest of the codebase — publish
+//! flow, HTTP surface, database index — never matches on a format enum
+//! except to dispatch through [`PackageFormat::handler`].
 //!
 //! The formats differ in every dimension that matters, which is why the
 //! trait is shaped the way it is:
@@ -15,8 +15,9 @@
 //! | apk | `{repo}/{ch}/apk/{arch}/{file}` | one architecture |
 //! | pacman | `{repo}/{ch}/pacman/{arch}/{file}` | one architecture |
 //! | npm | `{repo}/{ch}/npm/{name}/-/{file}` | one package name |
+//! | deb | `{repo}/{ch}/pool/{file}` | the whole channel |
 //!
-//! All three indexes are pure functions of the database. Whatever a
+//! All five indexes are pure functions of the database. Whatever a
 //! format's index needs that the common columns don't hold is extracted
 //! once, at publish, into the row's `metadata` — so regenerating an index
 //! never reads a package back out of object storage.
@@ -26,6 +27,7 @@
 //! unit of work that gets a distributed lock taken out on it.
 
 pub mod apk;
+pub mod deb;
 pub mod npm;
 pub mod pacman;
 pub mod repodata;
@@ -47,14 +49,16 @@ pub enum PackageFormat {
     Apk,
     Npm,
     Pacman,
+    Deb,
 }
 
 impl PackageFormat {
-    pub const ALL: [PackageFormat; 4] = [
+    pub const ALL: [PackageFormat; 5] = [
         PackageFormat::Rpm,
         PackageFormat::Apk,
         PackageFormat::Npm,
         PackageFormat::Pacman,
+        PackageFormat::Deb,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -63,6 +67,7 @@ impl PackageFormat {
             PackageFormat::Apk => "apk",
             PackageFormat::Npm => "npm",
             PackageFormat::Pacman => "pacman",
+            PackageFormat::Deb => "deb",
         }
     }
 
@@ -73,6 +78,7 @@ impl PackageFormat {
             PackageFormat::Apk => &apk::ApkFormat,
             PackageFormat::Npm => &npm::NpmFormat,
             PackageFormat::Pacman => &pacman::PacmanFormat,
+            PackageFormat::Deb => &deb::DebFormat,
         }
     }
 
@@ -84,6 +90,8 @@ impl PackageFormat {
             Some(PackageFormat::Rpm)
         } else if lower.ends_with(".apk") {
             Some(PackageFormat::Apk)
+        } else if lower.ends_with(".deb") {
+            Some(PackageFormat::Deb)
         } else if lower.ends_with(".pkg.tar.zst")
             || lower.ends_with(".pkg.tar.xz")
             || lower.ends_with(".pkg.tar.gz")
@@ -112,6 +120,7 @@ impl FromStr for PackageFormat {
             "apk" | "alpine" => Ok(PackageFormat::Apk),
             "npm" | "node" => Ok(PackageFormat::Npm),
             "pacman" | "aur" | "arch" => Ok(PackageFormat::Pacman),
+            "deb" | "apt" | "debian" => Ok(PackageFormat::Deb),
             other => Err(ParseError::UnknownFormat(other.to_string())),
         }
     }
@@ -157,6 +166,16 @@ impl ParsedPackage {
             }
             PackageFormat::Apk => format!("{}-{}.{}", self.name, self.version, self.arch),
             PackageFormat::Npm => format!("{}@{}", self.name, self.version),
+            PackageFormat::Deb => {
+                if self.release.is_empty() {
+                    format!("{}_{}_{}", self.name, self.version, self.arch)
+                } else {
+                    format!(
+                        "{}_{}-{}_{}",
+                        self.name, self.version, self.release, self.arch
+                    )
+                }
+            }
             PackageFormat::Pacman => {
                 if self.epoch == 0 {
                     format!(
@@ -228,6 +247,17 @@ pub trait IndexSigner: Send + Sync {
     /// the `.SIGN.RSA.<name>` member name).
     fn key_name(&self) -> &str;
     fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>>;
+
+    /// OpenPGP cleartext-signs `text`, for apt's `InRelease` — a `Release`
+    /// file and its detached signature folded into one document via the
+    /// Cleartext Signature Framework, rather than `Release` plus a sibling
+    /// `Release.gpg`.
+    ///
+    /// `Ok(None)` — the default — means this signer has no cleartext-sign
+    /// story, true of every signer but the OpenPGP one deb reuses from RPM.
+    fn clearsign(&self, _text: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// The per-format seam. One implementation per supported format; adding a
@@ -587,12 +617,16 @@ mod tests {
             PackageFormat::from_filename("foo-1.0-1-any.pkg.tar.xz"),
             Some(PackageFormat::Pacman)
         );
+        assert_eq!(
+            PackageFormat::from_filename("hello_1.0-1_amd64.deb"),
+            Some(PackageFormat::Deb)
+        );
         assert_eq!(PackageFormat::from_filename("foo.txt"), None);
     }
 
     #[test]
     fn unknown_format_string_is_an_error() {
-        assert!(PackageFormat::from_str("deb").is_err());
+        assert!(PackageFormat::from_str("snap").is_err());
     }
 
     #[test]
