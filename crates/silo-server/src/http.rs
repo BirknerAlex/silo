@@ -305,6 +305,10 @@ async fn serve_index(state: &AppState, key: &str, content_type: &str, surface: &
 
 /// Serves package bytes, preferring a presigned redirect so the download
 /// itself never crosses this process.
+///
+/// The response is built once and `http_requests` counted once right
+/// before it's returned, so every exit — redirect, proxied body, 404, and
+/// storage error — lands in the metric, not just the happy path.
 async fn serve_package(
     state: &AppState,
     key: &str,
@@ -313,7 +317,8 @@ async fn serve_package(
     repo: &str,
     channel: &str,
 ) -> Response {
-    match state.storage.presigned_get_url(key).await {
+    let surface = format!("{}-package", format.as_str());
+    let result = match state.storage.presigned_get_url(key).await {
         Ok(Some(url)) => {
             state
                 .metrics
@@ -321,36 +326,40 @@ async fn serve_package(
                 .with_label_values(&[format.as_str(), "redirect"])
                 .inc();
             audit_download(state, auth, repo, channel, key, format).await;
-            return found_redirect(&url);
+            found_redirect(&url)
         }
-        Ok(None) => {}
+        Ok(None) => match state.storage.get(key).await {
+            Ok(Some(bytes)) => {
+                state
+                    .metrics
+                    .downloads
+                    .with_label_values(&[format.as_str(), "proxy"])
+                    .inc();
+                audit_download(state, auth, repo, channel, key, format).await;
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    bytes,
+                )
+                    .into_response()
+            }
+            Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, key, "failed to read package");
+                (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response()
+            }
+        },
         Err(e) => {
             tracing::error!(error = %e, key, "failed to presign a download URL");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response();
-        }
-    }
-
-    match state.storage.get(key).await {
-        Ok(Some(bytes)) => {
-            state
-                .metrics
-                .downloads
-                .with_label_values(&[format.as_str(), "proxy"])
-                .inc();
-            audit_download(state, auth, repo, channel, key, format).await;
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                bytes,
-            )
-                .into_response()
-        }
-        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, key, "failed to read package");
             (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response()
         }
-    }
+    };
+    state
+        .metrics
+        .http_requests
+        .with_label_values(&[&surface, result.status().as_str()])
+        .inc();
+    result
 }
 
 /// A 302 redirect to a presigned URL.
@@ -1035,9 +1044,14 @@ pub(crate) mod tests {
         let db = silo_db::Db::from_pool(
             sqlx::postgres::PgPoolOptions::new()
                 .max_connections(1)
-                // Never connected to: `connect_lazy` builds the pool
-                // without touching the network, and no test in this module
-                // issues a query.
+                // A short acquire timeout, since `readyz_against_an_
+                // unreachable_database_reports_down` deliberately pings
+                // this pool and needs the connection-refused failure to
+                // surface quickly rather than waiting out sqlx's 30s
+                // default. Every other test in this module still never
+                // connects at all: `connect_lazy` builds the pool without
+                // touching the network.
+                .acquire_timeout(std::time::Duration::from_secs(1))
                 .connect_lazy("postgres://silo:silo@127.0.0.1:1/silo")
                 .expect("build a lazy pool"),
         );
@@ -1193,6 +1207,30 @@ pub(crate) mod tests {
     async fn healthz_needs_no_credential() {
         let resp = get(anonymous_state(), "/healthz").await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_against_an_unreachable_database_reports_down() {
+        // `test_state_with`'s pool points at a port nothing listens on, so
+        // this is a real failed `db.ping()`, not a stubbed one.
+        let state = Arc::new(test_state_with(|_| {}));
+        let metrics = state.metrics.clone();
+        let resp = get(state, "/readyz").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(metrics.database_up.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn readyz_against_a_reachable_database_reports_up() {
+        let db = require_test_db!();
+        let mut state = test_state_with(|_| {});
+        state.db = db.clone();
+        state.publish.db = db;
+        let metrics = state.metrics.clone();
+
+        let resp = get(Arc::new(state), "/readyz").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(metrics.database_up.get(), 1);
     }
 
     #[tokio::test]
@@ -1374,6 +1412,38 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_unrecognized_bearer_token_is_counted_as_an_auth_failure() {
+        // Well-formed but unknown to the database, so this exercises the
+        // real lookup miss in `authenticate_http`/`authenticate`, not just
+        // the pre-database format check `a_bad_basic_password_is_rejected_
+        // before_touching_storage` covers below.
+        let db = require_test_db!();
+        let mut state = test_state_with(|cfg| cfg.audit.log_downloads = false);
+        state.db = db.clone();
+        state.publish.db = db;
+        let metrics = state.metrics.clone();
+
+        let resp = router(Arc::new(state))
+            .oneshot(
+                Request::builder()
+                    .uri("/myrepo/stable/repodata/repomd.xml")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer silo_000000000000_not-a-real-secret",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            metrics.auth_failures.with_label_values(&["unknown"]).get(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn a_bad_basic_password_is_rejected_before_touching_storage() {
         let state = Arc::new(test_state_with(|_| {}));
         let encoded = base64::engine::general_purpose::STANDARD.encode("silo:not-a-token");
@@ -1455,6 +1525,62 @@ pub(crate) mod tests {
         let resp = get(state, "/myrepo/stable/Packages/foo-1.0-1.x86_64.rpm").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_string(resp).await, "rpmbytes");
+    }
+
+    #[tokio::test]
+    async fn a_package_download_is_counted_as_an_http_request() {
+        let state = require_public_repo_state!();
+        state
+            .storage
+            .put(
+                "myrepo/stable/Packages/foo-1.0-1.x86_64.rpm",
+                b"rpmbytes".to_vec(),
+            )
+            .await
+            .unwrap();
+        let metrics = state.metrics.clone();
+
+        let resp = get(state, "/myrepo/stable/Packages/foo-1.0-1.x86_64.rpm").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            metrics
+                .http_requests
+                .with_label_values(&["rpm-package", "200"])
+                .get(),
+            1
+        );
+        // The in-memory storage backend never presigns, so this exercises
+        // `downloads`' "proxy" mode specifically, not "redirect".
+        assert_eq!(
+            metrics.downloads.with_label_values(&["rpm", "proxy"]).get(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_package_download_is_still_counted_as_an_http_request() {
+        // `http_requests` has to cover every exit of `serve_package`, not
+        // just the redirect/proxy happy path, or a dashboard built on it
+        // silently undercounts real failures.
+        let state = require_public_repo_state!();
+        let metrics = state.metrics.clone();
+
+        let resp = get(state, "/myrepo/stable/Packages/missing-1.0-1.x86_64.rpm").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            metrics
+                .http_requests
+                .with_label_values(&["rpm-package", "404"])
+                .get(),
+            1
+        );
+        // `downloads` counts bytes actually served, not attempts — a 404
+        // never reaches either the redirect or proxy branch that increments
+        // it, so it must stay at zero here.
+        assert_eq!(
+            metrics.downloads.with_label_values(&["rpm", "proxy"]).get(),
+            0
+        );
     }
 
     #[tokio::test]

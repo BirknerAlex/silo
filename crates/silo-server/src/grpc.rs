@@ -31,6 +31,17 @@ impl PublishService for PublishServiceImpl {
         &self,
         request: Request<Streaming<PublishRequest>>,
     ) -> Result<Response<PublishResponse>, Status> {
+        let result = self.publish_inner(request).await;
+        self.state.metrics.record_grpc("publish", &result);
+        result
+    }
+}
+
+impl PublishServiceImpl {
+    async fn publish_inner(
+        &self,
+        request: Request<Streaming<PublishRequest>>,
+    ) -> Result<Response<PublishResponse>, Status> {
         // The credential is lifted out before the request is consumed:
         // `Streaming` isn't `Sync`, so borrowing the request across the
         // verification await would make this future non-`Send`.
@@ -168,76 +179,87 @@ impl ReadService for ReadServiceImpl {
         &self,
         request: Request<ListPackagesRequest>,
     ) -> Result<Response<ListPackagesResponse>, Status> {
-        let authenticated = auth::authenticate_grpc(&self.state, &request).await?;
-        let req = request.into_inner();
-        if req.repo.is_empty() || req.channel.is_empty() {
-            return Err(Status::invalid_argument("repo and channel are required"));
+        let result: Result<Response<ListPackagesResponse>, Status> = async {
+            let authenticated = auth::authenticate_grpc(&self.state, &request).await?;
+            let req = request.into_inner();
+            if req.repo.is_empty() || req.channel.is_empty() {
+                return Err(Status::invalid_argument("repo and channel are required"));
+            }
+            auth::require_repo(&self.state, &authenticated, &req.repo, Permission::Read).await?;
+
+            // Listing reads the database, not the bucket: no LIST call, and
+            // metadata that a filename could never carry (size, checksum,
+            // publisher, timestamp) comes back for free.
+            let rows = self
+                .state
+                .db
+                .list_packages(&req.repo, &req.channel, from_proto_format(req.format))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            let packages = rows
+                .into_iter()
+                .map(|row| PackageInfo {
+                    format: to_proto_format(row.format.parse().unwrap_or(PackageFormat::Rpm))
+                        as i32,
+                    name: row.name,
+                    version: row.version,
+                    release: row.release,
+                    arch: row.arch,
+                    storage_path: row.storage_key,
+                    size_bytes: row.size_bytes,
+                    sha256: row.sha256,
+                    published_at: row.published_at.timestamp(),
+                    id: row.id,
+                })
+                .collect();
+
+            Ok(Response::new(ListPackagesResponse { packages }))
         }
-        auth::require_repo(&self.state, &authenticated, &req.repo, Permission::Read).await?;
-
-        // Listing reads the database, not the bucket: no LIST call, and
-        // metadata that a filename could never carry (size, checksum,
-        // publisher, timestamp) comes back for free.
-        let rows = self
-            .state
-            .db
-            .list_packages(&req.repo, &req.channel, from_proto_format(req.format))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let packages = rows
-            .into_iter()
-            .map(|row| PackageInfo {
-                format: to_proto_format(row.format.parse().unwrap_or(PackageFormat::Rpm)) as i32,
-                name: row.name,
-                version: row.version,
-                release: row.release,
-                arch: row.arch,
-                storage_path: row.storage_key,
-                size_bytes: row.size_bytes,
-                sha256: row.sha256,
-                published_at: row.published_at.timestamp(),
-                id: row.id,
-            })
-            .collect();
-
-        Ok(Response::new(ListPackagesResponse { packages }))
+        .await;
+        self.state.metrics.record_grpc("list_packages", &result);
+        result
     }
 
     async fn list_repos(
         &self,
         request: Request<ListReposRequest>,
     ) -> Result<Response<ListReposResponse>, Status> {
-        let authenticated = auth::authenticate_grpc(&self.state, &request).await?;
+        let result: Result<Response<ListReposResponse>, Status> = async {
+            let authenticated = auth::authenticate_grpc(&self.state, &request).await?;
 
-        let summaries = self
-            .state
-            .db
-            .list_repos()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            let summaries = self
+                .state
+                .db
+                .list_repos()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
 
-        // A repo-scoped token shouldn't learn which other repos exist —
-        // unless the repo is public, in which case everyone gets to see
-        // it, credential or not.
-        let repos = summaries
-            .into_iter()
-            .filter(|s| authenticated.allows(&s.repo, Permission::Read) || s.public)
-            .map(|s| RepoInfo {
-                format: to_proto_format(s.format.parse().unwrap_or(PackageFormat::Rpm)) as i32,
-                repo: s.repo,
-                channel: s.channel,
-                package_count: s.packages,
-                total_bytes: s.total_bytes,
-                mode: if s.public {
-                    RepoMode::Public
-                } else {
-                    RepoMode::Private
-                } as i32,
-            })
-            .collect();
+            // A repo-scoped token shouldn't learn which other repos exist —
+            // unless the repo is public, in which case everyone gets to see
+            // it, credential or not.
+            let repos = summaries
+                .into_iter()
+                .filter(|s| authenticated.allows(&s.repo, Permission::Read) || s.public)
+                .map(|s| RepoInfo {
+                    format: to_proto_format(s.format.parse().unwrap_or(PackageFormat::Rpm)) as i32,
+                    repo: s.repo,
+                    channel: s.channel,
+                    package_count: s.packages,
+                    total_bytes: s.total_bytes,
+                    mode: if s.public {
+                        RepoMode::Public
+                    } else {
+                        RepoMode::Private
+                    } as i32,
+                })
+                .collect();
 
-        Ok(Response::new(ListReposResponse { repos }))
+            Ok(Response::new(ListReposResponse { repos }))
+        }
+        .await;
+        self.state.metrics.record_grpc("list_repos", &result);
+        result
     }
 }
 
@@ -265,6 +287,32 @@ pub fn to_proto_format(format: PackageFormat) -> ProtoFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_rejected_read_rpc_is_still_counted() {
+        // Empty repo/channel is refused before any database lookup, which
+        // keeps this test DB-free while still exercising the real
+        // `list_packages` handler end to end.
+        let svc = ReadServiceImpl {
+            state: std::sync::Arc::new(crate::http::tests::test_state_with(|_| {})),
+        };
+        let resp = svc
+            .list_packages(Request::new(ListPackagesRequest {
+                repo: String::new(),
+                channel: String::new(),
+                format: ProtoFormat::Unspecified as i32,
+            }))
+            .await;
+        assert_eq!(resp.unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            svc.state
+                .metrics
+                .grpc_requests
+                .with_label_values(&["list_packages", "error"])
+                .get(),
+            1
+        );
+    }
 
     #[test]
     fn every_format_round_trips_through_the_wire_enum() {

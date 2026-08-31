@@ -57,6 +57,174 @@ impl AdminService for AdminServiceImpl {
         &self,
         request: Request<CreateTokenRequest>,
     ) -> Result<Response<CreateTokenResponse>, Status> {
+        let result = self.create_token_inner(request).await;
+        self.state.metrics.record_grpc("create_token", &result);
+        result
+    }
+
+    async fn list_tokens(
+        &self,
+        request: Request<ListTokensRequest>,
+    ) -> Result<Response<ListTokensResponse>, Status> {
+        let result = self.list_tokens_inner(request).await;
+        self.state.metrics.record_grpc("list_tokens", &result);
+        result
+    }
+
+    async fn revoke_token(
+        &self,
+        request: Request<RevokeTokenRequest>,
+    ) -> Result<Response<RevokeTokenResponse>, Status> {
+        let result = self.revoke_token_inner(request).await;
+        self.state.metrics.record_grpc("revoke_token", &result);
+        result
+    }
+
+    async fn create_user(
+        &self,
+        request: Request<CreateUserRequest>,
+    ) -> Result<Response<CreateUserResponse>, Status> {
+        let result = self.create_user_inner(request).await;
+        self.state.metrics.record_grpc("create_user", &result);
+        result
+    }
+
+    async fn list_users(
+        &self,
+        request: Request<ListUsersRequest>,
+    ) -> Result<Response<ListUsersResponse>, Status> {
+        let result = self.list_users_inner(request).await;
+        self.state.metrics.record_grpc("list_users", &result);
+        result
+    }
+
+    async fn set_user_disabled(
+        &self,
+        request: Request<SetUserDisabledRequest>,
+    ) -> Result<Response<SetUserDisabledResponse>, Status> {
+        let result = self.set_user_disabled_inner(request).await;
+        self.state.metrics.record_grpc("set_user_disabled", &result);
+        result
+    }
+
+    async fn set_user_password(
+        &self,
+        request: Request<SetUserPasswordRequest>,
+    ) -> Result<Response<SetUserPasswordResponse>, Status> {
+        let result = self.set_user_password_inner(request).await;
+        self.state.metrics.record_grpc("set_user_password", &result);
+        result
+    }
+
+    async fn delete_user(
+        &self,
+        request: Request<DeleteUserRequest>,
+    ) -> Result<Response<DeleteUserResponse>, Status> {
+        let result = self.delete_user_inner(request).await;
+        self.state.metrics.record_grpc("delete_user", &result);
+        result
+    }
+
+    async fn query_audit(
+        &self,
+        request: Request<QueryAuditRequest>,
+    ) -> Result<Response<QueryAuditResponse>, Status> {
+        let result = self.query_audit_inner(request).await;
+        self.state.metrics.record_grpc("query_audit", &result);
+        result
+    }
+
+    async fn rebuild_index(
+        &self,
+        request: Request<RebuildIndexRequest>,
+    ) -> Result<Response<RebuildIndexResponse>, Status> {
+        let result = self.rebuild_index_inner(request).await;
+        self.state.metrics.record_grpc("rebuild_index", &result);
+        result
+    }
+
+    async fn delete_package(
+        &self,
+        request: Request<DeletePackageRequest>,
+    ) -> Result<Response<DeletePackageResponse>, Status> {
+        let result = self.delete_package_inner(request).await;
+        self.state.metrics.record_grpc("delete_package", &result);
+        result
+    }
+
+    async fn set_repo_mode(
+        &self,
+        request: Request<SetRepoModeRequest>,
+    ) -> Result<Response<SetRepoModeResponse>, Status> {
+        let result = self.set_repo_mode_inner(request).await;
+        self.state.metrics.record_grpc("set_repo_mode", &result);
+        result
+    }
+
+    async fn set_prune_rule(
+        &self,
+        request: Request<SetPruneRuleRequest>,
+    ) -> Result<Response<SetPruneRuleResponse>, Status> {
+        let result = self.set_prune_rule_inner(request).await;
+        self.state.metrics.record_grpc("set_prune_rule", &result);
+        result
+    }
+
+    async fn clear_prune_rule(
+        &self,
+        request: Request<ClearPruneRuleRequest>,
+    ) -> Result<Response<ClearPruneRuleResponse>, Status> {
+        let result = self.clear_prune_rule_inner(request).await;
+        self.state.metrics.record_grpc("clear_prune_rule", &result);
+        result
+    }
+
+    async fn get_prune_rule(
+        &self,
+        request: Request<GetPruneRuleRequest>,
+    ) -> Result<Response<GetPruneRuleResponse>, Status> {
+        let result = self.get_prune_rule_inner(request).await;
+        self.state.metrics.record_grpc("get_prune_rule", &result);
+        result
+    }
+
+    async fn set_prune_exemption(
+        &self,
+        request: Request<SetPruneExemptionRequest>,
+    ) -> Result<Response<SetPruneExemptionResponse>, Status> {
+        let result = self.set_prune_exemption_inner(request).await;
+        self.state
+            .metrics
+            .record_grpc("set_prune_exemption", &result);
+        result
+    }
+
+    async fn list_prune_exemptions(
+        &self,
+        request: Request<ListPruneExemptionsRequest>,
+    ) -> Result<Response<ListPruneExemptionsResponse>, Status> {
+        let result = self.list_prune_exemptions_inner(request).await;
+        self.state
+            .metrics
+            .record_grpc("list_prune_exemptions", &result);
+        result
+    }
+
+    async fn run_prune(
+        &self,
+        request: Request<RunPruneRequest>,
+    ) -> Result<Response<RunPruneResponse>, Status> {
+        let result = self.run_prune_inner(request).await;
+        self.state.metrics.record_grpc("run_prune", &result);
+        result
+    }
+}
+
+impl AdminServiceImpl {
+    async fn create_token_inner(
+        &self,
+        request: Request<CreateTokenRequest>,
+    ) -> Result<Response<CreateTokenResponse>, Status> {
         let caller = auth::authenticate_grpc(&self.state, &request).await?;
         auth::require_admin(&caller)?;
         let req = request.into_inner();
@@ -142,7 +310,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn list_tokens(
+    async fn list_tokens_inner(
         &self,
         request: Request<ListTokensRequest>,
     ) -> Result<Response<ListTokensResponse>, Status> {
@@ -171,7 +339,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn revoke_token(
+    async fn revoke_token_inner(
         &self,
         request: Request<RevokeTokenRequest>,
     ) -> Result<Response<RevokeTokenResponse>, Status> {
@@ -234,7 +402,7 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(RevokeTokenResponse { revoked }))
     }
 
-    async fn create_user(
+    async fn create_user_inner(
         &self,
         request: Request<CreateUserRequest>,
     ) -> Result<Response<CreateUserResponse>, Status> {
@@ -267,7 +435,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn list_users(
+    async fn list_users_inner(
         &self,
         request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
@@ -286,7 +454,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn set_user_disabled(
+    async fn set_user_disabled_inner(
         &self,
         request: Request<SetUserDisabledRequest>,
     ) -> Result<Response<SetUserDisabledResponse>, Status> {
@@ -320,7 +488,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn set_user_password(
+    async fn set_user_password_inner(
         &self,
         request: Request<SetUserPasswordRequest>,
     ) -> Result<Response<SetUserPasswordResponse>, Status> {
@@ -354,7 +522,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn delete_user(
+    async fn delete_user_inner(
         &self,
         request: Request<DeleteUserRequest>,
     ) -> Result<Response<DeleteUserResponse>, Status> {
@@ -384,7 +552,7 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(DeleteUserResponse { deleted }))
     }
 
-    async fn query_audit(
+    async fn query_audit_inner(
         &self,
         request: Request<QueryAuditRequest>,
     ) -> Result<Response<QueryAuditResponse>, Status> {
@@ -439,7 +607,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn rebuild_index(
+    async fn rebuild_index_inner(
         &self,
         request: Request<RebuildIndexRequest>,
     ) -> Result<Response<RebuildIndexResponse>, Status> {
@@ -487,8 +655,18 @@ impl AdminService for AdminServiceImpl {
                 group,
                 &caller.actor,
             )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .await;
+            let written = match written {
+                Ok(written) => written,
+                Err(e) => {
+                    self.state
+                        .metrics
+                        .index_regenerations
+                        .with_label_values(&[format.as_str(), "error"])
+                        .inc();
+                    return Err(Status::internal(e.to_string()));
+                }
+            };
             self.state
                 .metrics
                 .index_regenerations
@@ -503,7 +681,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn delete_package(
+    async fn delete_package_inner(
         &self,
         request: Request<DeletePackageRequest>,
     ) -> Result<Response<DeletePackageResponse>, Status> {
@@ -540,7 +718,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn set_repo_mode(
+    async fn set_repo_mode_inner(
         &self,
         request: Request<SetRepoModeRequest>,
     ) -> Result<Response<SetRepoModeResponse>, Status> {
@@ -590,7 +768,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn set_prune_rule(
+    async fn set_prune_rule_inner(
         &self,
         request: Request<SetPruneRuleRequest>,
     ) -> Result<Response<SetPruneRuleResponse>, Status> {
@@ -638,7 +816,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn clear_prune_rule(
+    async fn clear_prune_rule_inner(
         &self,
         request: Request<ClearPruneRuleRequest>,
     ) -> Result<Response<ClearPruneRuleResponse>, Status> {
@@ -671,7 +849,7 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(ClearPruneRuleResponse { cleared }))
     }
 
-    async fn get_prune_rule(
+    async fn get_prune_rule_inner(
         &self,
         request: Request<GetPruneRuleRequest>,
     ) -> Result<Response<GetPruneRuleResponse>, Status> {
@@ -695,7 +873,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn set_prune_exemption(
+    async fn set_prune_exemption_inner(
         &self,
         request: Request<SetPruneExemptionRequest>,
     ) -> Result<Response<SetPruneExemptionResponse>, Status> {
@@ -741,7 +919,7 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    async fn list_prune_exemptions(
+    async fn list_prune_exemptions_inner(
         &self,
         request: Request<ListPruneExemptionsRequest>,
     ) -> Result<Response<ListPruneExemptionsResponse>, Status> {
@@ -763,7 +941,7 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(ListPruneExemptionsResponse { names }))
     }
 
-    async fn run_prune(
+    async fn run_prune_inner(
         &self,
         request: Request<RunPruneRequest>,
     ) -> Result<Response<RunPruneResponse>, Status> {

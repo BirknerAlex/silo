@@ -115,6 +115,90 @@ async fn npm_publish_over_http_is_indexed_and_downloadable() {
 }
 
 #[tokio::test]
+async fn npm_publish_over_http_is_counted_in_publish_metrics() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npm-http-metrics-ok");
+    let writer = harness.publisher_token(&repo).await;
+
+    let tarball = build_test_npm("widget", "1.0.0");
+    let body = publish_body("widget-1.0.0.tgz", &tarball);
+    let resp = put_publish(
+        &harness,
+        &repo,
+        "stable",
+        "widget",
+        Some(&writer.secret),
+        body,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(
+        harness
+            .state
+            .metrics
+            .publishes
+            .with_label_values(&["npm", "ok"])
+            .get(),
+        1
+    );
+    assert_eq!(
+        harness
+            .state
+            .metrics
+            .publish_duration
+            .with_label_values(&["npm"])
+            .get_sample_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_npm_publish_is_counted_as_a_publish_failure_not_a_success() {
+    // A rejected publish still has to show up somewhere in `publishes` —
+    // otherwise a dashboard built on it can't distinguish "nobody
+    // published" from "every publish is failing".
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npm-http-metrics-err");
+    let writer = harness.publisher_token(&repo).await;
+
+    let body = publish_body("widget-1.0.0.tgz", b"not a gzipped tarball");
+    let resp = put_publish(
+        &harness,
+        &repo,
+        "stable",
+        "widget",
+        Some(&writer.secret),
+        body,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(
+        harness
+            .state
+            .metrics
+            .publishes
+            .with_label_values(&["npm", "error"])
+            .get(),
+        1
+    );
+    // A failed publish's duration isn't meaningful, so it must not be
+    // observed at all — mirrors `record_publish`'s own unit test.
+    assert_eq!(
+        harness
+            .state
+            .metrics
+            .publish_duration
+            .with_label_values(&["npm"])
+            .get_sample_count(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn npm_publish_over_http_and_via_grpc_converge_on_one_packument() {
     let url = require_db!();
     let harness = Harness::new(&url).await;

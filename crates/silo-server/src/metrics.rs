@@ -76,7 +76,7 @@ impl Metrics {
         let downloads = IntCounterVec::new(
             Opts::new(
                 "downloads_total",
-                "Package and index fetches served, by format and how they were served",
+                "Package fetches served, by format and how they were served",
             ),
             &["format", "mode"],
         )?;
@@ -159,6 +159,19 @@ impl Metrics {
                 .with_label_values(&[format])
                 .observe(seconds);
         }
+    }
+
+    /// Records one gRPC call, by method and coarse ok/error outcome.
+    ///
+    /// There is no gRPC-wide middleware — a `tonic::Status`'s outcome is
+    /// only known after a handler runs, and this codebase never captures
+    /// metrics via response-rewriting middleware (see `serve_index`'s and
+    /// `serve_package`'s own "build once, count once" comments), so every
+    /// RPC method calls this itself before returning.
+    pub fn record_grpc<T>(&self, method: &str, result: &Result<tonic::Response<T>, tonic::Status>) {
+        self.grpc_requests
+            .with_label_values(&[method, if result.is_ok() { "ok" } else { "error" }])
+            .inc();
     }
 }
 
