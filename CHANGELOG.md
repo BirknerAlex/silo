@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/BirknerAlex/silo/compare/v0.9.0...v0.10.0) (2026-09-01)
+
+
+### Features
+
+* **release:** publish deb/rpm/apk/pacman packages of the CLI via nfpm ([84ded33](https://github.com/BirknerAlex/silo/commit/84ded33cb305522c558ed558452f6dd7a85a3119))
+
 ## [0.9.0](https://github.com/BirknerAlex/silo/compare/v0.8.0...v0.9.0) (2026-09-01)
 
 
