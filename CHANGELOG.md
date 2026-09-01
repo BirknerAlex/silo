@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/BirknerAlex/silo/compare/v0.8.0...v0.9.0) (2026-09-01)
+
+
+### Features
+
+* **repo:** add `repo create`/`repo delete` commands ([3900ef3](https://github.com/BirknerAlex/silo/commit/3900ef3f6c7a5ca5bee38b1736baca8a843853b1))
+
 ## [0.8.0](https://github.com/BirknerAlex/silo/compare/v0.7.1...v0.8.0) (2026-08-31)
 
 
