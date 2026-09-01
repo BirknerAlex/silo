@@ -30,8 +30,9 @@ use silo_pkg::PackageFormat;
 use silo_proto::v1::admin_service_server::AdminService;
 use silo_proto::v1::{
     AuditEntry as ProtoAuditEntry, ClearPruneRuleRequest, ClearPruneRuleResponse,
-    CreateTokenRequest, CreateTokenResponse, CreateUserRequest, CreateUserResponse,
-    DeletePackageRequest, DeletePackageResponse, DeleteUserRequest, DeleteUserResponse,
+    CreateRepoRequest, CreateRepoResponse, CreateTokenRequest, CreateTokenResponse,
+    CreateUserRequest, CreateUserResponse, DeletePackageRequest, DeletePackageResponse,
+    DeleteRepoRequest, DeleteRepoResponse, DeleteUserRequest, DeleteUserResponse,
     GetPruneRuleRequest, GetPruneRuleResponse, ListPruneExemptionsRequest,
     ListPruneExemptionsResponse, ListTokensRequest, ListTokensResponse, ListUsersRequest,
     ListUsersResponse, PruneCandidate as ProtoPruneCandidate, PruneRule as ProtoPruneRule,
@@ -158,6 +159,24 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<SetRepoModeResponse>, Status> {
         let result = self.set_repo_mode_inner(request).await;
         self.state.metrics.record_grpc("set_repo_mode", &result);
+        result
+    }
+
+    async fn create_repo(
+        &self,
+        request: Request<CreateRepoRequest>,
+    ) -> Result<Response<CreateRepoResponse>, Status> {
+        let result = self.create_repo_inner(request).await;
+        self.state.metrics.record_grpc("create_repo", &result);
+        result
+    }
+
+    async fn delete_repo(
+        &self,
+        request: Request<DeleteRepoRequest>,
+    ) -> Result<Response<DeleteRepoResponse>, Status> {
+        let result = self.delete_repo_inner(request).await;
+        self.state.metrics.record_grpc("delete_repo", &result);
         result
     }
 
@@ -765,6 +784,172 @@ impl AdminServiceImpl {
         Ok(Response::new(SetRepoModeResponse {
             repo: req.repo,
             mode: mode as i32,
+        }))
+    }
+
+    async fn create_repo_inner(
+        &self,
+        request: Request<CreateRepoRequest>,
+    ) -> Result<Response<CreateRepoResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // Same reasoning as `set_repo_mode_inner`: creating a repo also
+        // sets its mode, so it needs the token's own scope to cover it.
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
+
+        if self
+            .state
+            .db
+            .repo_exists(&req.repo)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            return Err(Status::already_exists(format!(
+                "repo `{}` already exists",
+                req.repo
+            )));
+        }
+
+        // Unspecified means "use the default", unlike `set_repo_mode_inner`
+        // which requires the caller to say public or private explicitly.
+        let public = matches!(
+            RepoMode::try_from(req.mode).unwrap_or(RepoMode::Unspecified),
+            RepoMode::Public
+        );
+
+        let created = self
+            .state
+            .db
+            .create_repo(&req.repo, public)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !created {
+            return Err(Status::already_exists(format!(
+                "repo `{}` already exists",
+                req.repo
+            )));
+        }
+
+        self.state
+            .db
+            .record_audit(
+                AuditEntry::new(audit::action::REPO_CREATE, &caller.actor)
+                    .repo(&req.repo)
+                    .detail(serde_json::json!({ "public": public })),
+            )
+            .await;
+
+        let mode = if public {
+            RepoMode::Public
+        } else {
+            RepoMode::Private
+        };
+        Ok(Response::new(CreateRepoResponse {
+            repo: req.repo,
+            mode: mode as i32,
+        }))
+    }
+
+    async fn delete_repo_inner(
+        &self,
+        request: Request<DeleteRepoRequest>,
+    ) -> Result<Response<DeleteRepoResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
+
+        let packages = self
+            .state
+            .db
+            .list_all_in_repo(&req.repo)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        if !packages.is_empty() && !req.force {
+            return Err(Status::failed_precondition(format!(
+                "repo `{}` has {} package(s); pass --force to delete them too",
+                req.repo,
+                packages.len()
+            )));
+        }
+
+        let mut deleted = 0i32;
+        let mut first_package_error: Option<String> = None;
+        if req.force {
+            for package in &packages {
+                match silo_core::repo::delete_package(
+                    &self.state.publish,
+                    package.id,
+                    &caller.actor,
+                    Some(serde_json::json!({ "reason": "repo_delete" })),
+                )
+                .await
+                {
+                    Ok(Some(_)) => deleted += 1,
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e, repo = %req.repo, package_id = package.id,
+                            "failed to delete a package while force-deleting its repo"
+                        );
+                        first_package_error.get_or_insert_with(|| e.to_string());
+                    }
+                }
+            }
+        }
+
+        let repo_deleted = self
+            .state
+            .db
+            .delete_repo(&req.repo)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !repo_deleted {
+            // Distinguishes why nothing was deleted: a package failed to
+            // delete (so the repo is genuinely non-empty and the caller
+            // needs the real cause, not just "still has packages"), the
+            // repo never existed at all, or — the ordinary non-force
+            // case — it simply still has packages.
+            if let Some(error) = first_package_error {
+                return Err(Status::internal(format!(
+                    "repo `{}`: deleted {deleted} package(s), but one failed: {error}",
+                    req.repo
+                )));
+            }
+            let exists = self
+                .state
+                .db
+                .repo_exists(&req.repo)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            if !exists {
+                return Err(Status::not_found(format!("no repo `{}`", req.repo)));
+            }
+            return Err(Status::failed_precondition(format!(
+                "repo `{}` still has packages, retry",
+                req.repo
+            )));
+        }
+
+        self.state
+            .db
+            .record_audit(
+                AuditEntry::new(audit::action::REPO_DELETE, &caller.actor)
+                    .repo(&req.repo)
+                    .detail(serde_json::json!({ "force": req.force, "packages_deleted": deleted })),
+            )
+            .await;
+
+        Ok(Response::new(DeleteRepoResponse {
+            packages_deleted: deleted,
         }))
     }
 
