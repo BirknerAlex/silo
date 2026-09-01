@@ -1,0 +1,21 @@
+name: silo
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: "Alexander Birkner <alex.birkner@gmail.com>"
+description: Self-hosted package registry for RPM, APK, npm, pacman, and Debian.
+vendor: "Alexander Birkner"
+homepage: https://github.com/BirknerAlex/silo
+license: MIT
+
+contents:
+  - src: ${BIN_PATH}
+    dst: /usr/bin/silo
+    expand: true
+    file_info:
+      mode: 0755
+
+archlinux:
+  pkgbase: silo

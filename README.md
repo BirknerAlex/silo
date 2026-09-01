@@ -46,6 +46,7 @@ explicit.
 The [wiki](https://github.com/BirknerAlex/silo/wiki) has the full docs:
 
 - [Introduction](https://github.com/BirknerAlex/silo/wiki/Introduction) — architecture, the format seam, distributed locking
+- [Installation](https://github.com/BirknerAlex/silo/wiki/Installation) — installing the `silo` CLI itself: deb/rpm/apk/pacman, Homebrew, or the GitHub release
 - [Setup](https://github.com/BirknerAlex/silo/wiki/Setup) — Docker Compose and Helm deployment, the `config.yaml` schema
 - [Usage](https://github.com/BirknerAlex/silo/wiki/Usage) — tokens, repo public/private mode, administration
   - [RPM](https://github.com/BirknerAlex/silo/wiki/Usage-RPM), [APK](https://github.com/BirknerAlex/silo/wiki/Usage-APK), [npm](https://github.com/BirknerAlex/silo/wiki/Usage-npm), [pacman](https://github.com/BirknerAlex/silo/wiki/Usage-Pacman), [Deb](https://github.com/BirknerAlex/silo/wiki/Usage-Deb) — per-client config, with and without auth, signing
