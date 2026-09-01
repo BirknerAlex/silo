@@ -267,22 +267,41 @@ impl Db {
         .await?)
     }
 
+    /// Every package in a repo, across all channels and formats. Used only
+    /// by `repo delete --force` to enumerate everything that needs purging
+    /// before the repo row itself can go.
+    pub async fn list_all_in_repo(&self, repo: &str) -> anyhow::Result<Vec<PackageRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM packages WHERE repo = $1 ORDER BY id"
+        ))
+        .bind(repo)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     /// Distinct repo/channel pairs, for `silo repos` and the metrics
     /// gauges.
     pub async fn list_repos(&self) -> anyhow::Result<Vec<RepoSummary>> {
         // `sum()` over a bigint returns NUMERIC in Postgres, which will
-        // not decode into i64 — hence the explicit cast. `count(*)` is
-        // already bigint and needs none. The join is left rather than
-        // inner so a repo that predates the `repos` table backfill (or
-        // was published to before `ensure_repo` ran, in theory) still
-        // lists — just as private, via `coalesce`.
+        // not decode into i64 — hence the explicit cast. The join is full
+        // rather than left so a repo created ahead of its first publish
+        // (via `repo create`/`repo set`) still lists, with no packages —
+        // hence `count(p.id)` rather than `count(*)`, so the synthetic
+        // all-NULL row a full join produces for such a repo counts as 0
+        // packages rather than 1. `coalesce(r.public, false)` covers a repo
+        // that predates the `repos` table backfill (or was published to
+        // before `ensure_repo` ran, in theory) — still lists, just private.
         Ok(sqlx::query_as(
-            "SELECT p.repo, p.channel, p.format, count(*) AS packages, \
+            "SELECT coalesce(p.repo, r.repo) AS repo, \
+                    coalesce(p.channel, '') AS channel, \
+                    coalesce(p.format, '') AS format, \
+                    count(p.id) AS packages, \
                     coalesce(sum(p.size_bytes), 0)::bigint AS total_bytes, \
                     coalesce(r.public, false) AS public \
-             FROM packages p LEFT JOIN repos r ON r.repo = p.repo \
-             GROUP BY p.repo, p.channel, p.format, r.public \
-             ORDER BY p.repo, p.channel, p.format",
+             FROM packages p FULL JOIN repos r ON r.repo = p.repo \
+             GROUP BY coalesce(p.repo, r.repo), coalesce(p.channel, ''), \
+                      coalesce(p.format, ''), r.public \
+             ORDER BY 1, 2, 3",
         )
         .fetch_all(self.pool())
         .await?)

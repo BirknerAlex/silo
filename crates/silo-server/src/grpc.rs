@@ -242,7 +242,14 @@ impl ReadService for ReadServiceImpl {
                 .into_iter()
                 .filter(|s| authenticated.allows(&s.repo, Permission::Read) || s.public)
                 .map(|s| RepoInfo {
-                    format: to_proto_format(s.format.parse().unwrap_or(PackageFormat::Rpm)) as i32,
+                    // Empty for a repo with no packages yet (created ahead
+                    // of its first publish) — `Rpm` would be a made-up
+                    // default, so this reports "no format" honestly instead.
+                    format: s
+                        .format
+                        .parse()
+                        .map(to_proto_format)
+                        .unwrap_or(ProtoFormat::Unspecified) as i32,
                     repo: s.repo,
                     channel: s.channel,
                     package_count: s.packages,

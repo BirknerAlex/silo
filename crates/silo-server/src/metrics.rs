@@ -136,6 +136,13 @@ impl Metrics {
         self.packages.reset();
         self.package_bytes.reset();
         for summary in summaries {
+            // `list_repos` also returns a row for a repo that was created
+            // but never published to, with no packages and no channel/
+            // format to label a series with — skip it rather than emit a
+            // bogus `{channel="",format=""}` zero series.
+            if summary.packages == 0 {
+                continue;
+            }
             let labels = [
                 summary.repo.as_str(),
                 summary.channel.as_str(),

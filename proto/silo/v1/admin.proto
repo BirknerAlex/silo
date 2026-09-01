@@ -31,6 +31,13 @@ service AdminService {
   // changes who can write, and never revokes or deletes any token.
   rpc SetRepoMode(SetRepoModeRequest) returns (SetRepoModeResponse);
 
+  // Creates a repo ahead of its first publish, so tokens can be scoped to
+  // it before any package exists. Fails if the repo already exists.
+  rpc CreateRepo(CreateRepoRequest) returns (CreateRepoResponse);
+  // Deletes a repo. Fails if it has packages unless `force` is set, in
+  // which case every package (all channels/formats) is deleted first.
+  rpc DeleteRepo(DeleteRepoRequest) returns (DeleteRepoResponse);
+
   // Configures, inspects, or clears a repo/channel's retention rule.
   rpc SetPruneRule(SetPruneRuleRequest) returns (SetPruneRuleResponse);
   rpc ClearPruneRule(ClearPruneRuleRequest) returns (ClearPruneRuleResponse);
@@ -219,6 +226,26 @@ message SetRepoModeRequest {
 message SetRepoModeResponse {
   string repo = 1;
   RepoMode mode = 2;
+}
+
+message CreateRepoRequest {
+  string repo = 1;
+  // Defaults to private if unspecified.
+  RepoMode mode = 2;
+}
+
+message CreateRepoResponse {
+  string repo = 1;
+  RepoMode mode = 2;
+}
+
+message DeleteRepoRequest {
+  string repo = 1;
+  bool force = 2;
+}
+
+message DeleteRepoResponse {
+  int32 packages_deleted = 1;
 }
 
 message PruneRule {

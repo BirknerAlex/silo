@@ -24,13 +24,14 @@ use silo_proto::v1::publish_request::Payload;
 use silo_proto::v1::publish_service_client::PublishServiceClient;
 use silo_proto::v1::read_service_client::ReadServiceClient;
 use silo_proto::v1::{
-    ClearPruneRuleRequest, CreateTokenRequest, CreateUserRequest, DeletePackageRequest,
-    DeleteUserRequest, GetAuthInfoRequest, GetPruneRuleRequest, GetVersionRequest,
-    ListPackagesRequest, ListPruneExemptionsRequest, ListReposRequest, ListTokensRequest,
-    ListUsersRequest, LoginOidcRequest, LoginRequest, PackageFormat as ProtoFormat,
-    PublishMetadata, PublishRequest, QueryAuditRequest, RebuildIndexRequest, RepoMode,
-    RevokeTokenRequest, RunPruneRequest, SetPruneExemptionRequest, SetPruneRuleRequest,
-    SetRepoModeRequest, SetUserDisabledRequest, SetUserPasswordRequest, TokenScope, WhoAmIRequest,
+    ClearPruneRuleRequest, CreateRepoRequest, CreateTokenRequest, CreateUserRequest,
+    DeletePackageRequest, DeleteRepoRequest, DeleteUserRequest, GetAuthInfoRequest,
+    GetPruneRuleRequest, GetVersionRequest, ListPackagesRequest, ListPruneExemptionsRequest,
+    ListReposRequest, ListTokensRequest, ListUsersRequest, LoginOidcRequest, LoginRequest,
+    PackageFormat as ProtoFormat, PublishMetadata, PublishRequest, QueryAuditRequest,
+    RebuildIndexRequest, RepoMode, RevokeTokenRequest, RunPruneRequest, SetPruneExemptionRequest,
+    SetPruneRuleRequest, SetRepoModeRequest, SetUserDisabledRequest, SetUserPasswordRequest,
+    TokenScope, WhoAmIRequest,
 };
 use tonic::transport::{Channel, ClientTlsConfig};
 
@@ -182,6 +183,23 @@ enum RepoCommand {
         /// "public" or "private".
         #[arg(long)]
         mode: String,
+    },
+    /// Create a repo ahead of its first publish, so tokens can be scoped
+    /// to it before any package exists. Fails if the repo already exists.
+    /// Admin only.
+    Create {
+        repo: String,
+        /// "public" or "private". Defaults to private.
+        #[arg(long, default_value = "private")]
+        mode: String,
+    },
+    /// Delete a repo. Fails if it has packages unless `--force` is given,
+    /// in which case every package (all channels/formats) is deleted
+    /// first. Admin only.
+    Delete {
+        repo: String,
+        #[arg(long)]
+        force: bool,
     },
     /// Configure or clear automatic pruning for a repo/channel. At least
     /// one of `--keep-last`/`--max-age-days` is required unless `--clear`
@@ -995,7 +1013,7 @@ async fn cmd_repos(config_path: &str, server: Option<&str>, json: bool) -> anyho
     for repo in &response.repos {
         table.row(vec![
             repo.repo.clone(),
-            repo.channel.clone(),
+            dash_if_empty(&repo.channel),
             format_name(repo.format),
             mode_name(repo.mode),
             repo.package_count.to_string(),
@@ -1036,6 +1054,40 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
                 .await?
                 .into_inner();
             println!("{}: {}", response.repo, mode_name(response.mode));
+        }
+        RepoCommand::Create { repo, mode } => {
+            let mode = match mode.to_ascii_lowercase().as_str() {
+                "public" => RepoMode::Public,
+                "private" => RepoMode::Private,
+                other => anyhow::bail!("mode must be `public` or `private`, got `{other}`"),
+            };
+            let response = client
+                .create_repo(with_auth(
+                    CreateRepoRequest {
+                        repo,
+                        mode: mode as i32,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            println!("{}: created ({})", response.repo, mode_name(response.mode));
+        }
+        RepoCommand::Delete { repo, force } => {
+            let response = client
+                .delete_repo(with_auth(
+                    DeleteRepoRequest {
+                        repo: repo.clone(),
+                        force,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            println!(
+                "{repo}: deleted ({} package(s) removed)",
+                response.packages_deleted
+            );
         }
         RepoCommand::SetPruneRule {
             repo,
