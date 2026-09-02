@@ -17,7 +17,7 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 
 /// A 256-bit AES-GCM key, loaded once at startup so a malformed key is a
 /// startup failure rather than a failure on the first `add-upstream`.
@@ -62,7 +62,7 @@ impl SecretBox {
     /// Encrypts `plaintext` under a freshly generated random nonce.
     pub fn seal(&self, plaintext: &str) -> anyhow::Result<Sealed> {
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = self
             .cipher
@@ -100,7 +100,7 @@ impl SecretBox {
     /// runs once to populate `upstream_secret.key` in config.
     pub fn generate_key() -> String {
         let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         base64::engine::general_purpose::STANDARD.encode(key)
     }
 }

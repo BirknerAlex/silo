@@ -30,7 +30,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
@@ -427,7 +427,7 @@ impl Db {
 }
 
 fn random_token_material() -> ([u8; PREFIX_BYTES], [u8; SECRET_BYTES], [u8; SALT_BYTES]) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut prefix = [0u8; PREFIX_BYTES];
     let mut secret = [0u8; SECRET_BYTES];
     let mut salt = [0u8; SALT_BYTES];
