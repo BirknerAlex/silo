@@ -74,6 +74,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // slash inside what npm considers a single path segment. `PUT` is
         // how `npm publish`/`yarn publish` send a new version.
         .route("/:repo/:channel/npm/*path", get(get_npm).put(publish_npm))
+        // `*path` never matches a zero-length remainder — `/npm` and
+        // `/npm/` need their own routes, both mapped to the same root
+        // handler. See `get_npm_root`'s doc for why this exists at all.
+        .route("/:repo/:channel/npm", get(get_npm_root))
+        .route("/:repo/:channel/npm/", get(get_npm_root))
         .with_state(state)
 }
 
@@ -328,7 +333,42 @@ async fn serve_package(
     channel: &str,
 ) -> Response {
     let surface = format!("{}-package", format.as_str());
-    let result = match state.storage.presigned_get_url(key).await {
+
+    // A presigned URL is generated whether or not the object actually
+    // exists — S3 never checks — so an existence check has to come first
+    // here, both to give the right 404 and to have a real chance of
+    // reaching the pull-through path on a miss instead of redirecting a
+    // client to a URL that will itself 404.
+    let result = match state.storage.head(key).await {
+        Ok(true) => serve_existing_package(state, key, format, auth, repo, channel).await,
+        Ok(false) => match pull_through_miss(state, key, format, repo, channel).await {
+            Some(response) => response,
+            None => (StatusCode::NOT_FOUND, "not found").into_response(),
+        },
+        Err(e) => {
+            tracing::error!(error = %e, key, "failed to check package existence");
+            (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response()
+        }
+    };
+    state
+        .metrics
+        .http_requests
+        .with_label_values(&[&surface, result.status().as_str()])
+        .inc();
+    result
+}
+
+/// The original happy path: the object is already in storage, so serve it
+/// the normal way (redirect if the backend can presign, otherwise proxy).
+async fn serve_existing_package(
+    state: &AppState,
+    key: &str,
+    format: PackageFormat,
+    auth: &Authenticated,
+    repo: &str,
+    channel: &str,
+) -> Response {
+    match state.storage.presigned_get_url(key).await {
         Ok(Some(url)) => {
             state
                 .metrics
@@ -353,6 +393,8 @@ async fn serve_package(
                 )
                     .into_response()
             }
+            // Raced with a delete between the `head` check and here —
+            // treat it the same as never having existed.
             Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
             Err(e) => {
                 tracing::error!(error = %e, key, "failed to read package");
@@ -363,13 +405,310 @@ async fn serve_package(
             tracing::error!(error = %e, key, "failed to presign a download URL");
             (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response()
         }
+    }
+}
+
+/// Handles a storage miss for a package artifact via pull-through, if a
+/// configured upstream applies. `None` means there's nothing to do —
+/// no upstream configured for this `(repo, channel, format)`, or the
+/// upstream's synced index has no matching filename — so the caller
+/// falls back to an ordinary 404.
+///
+/// Never persists on the `no_cache` paths, and never lets an upstream
+/// credential reach the response in any form (redirect Location, body, or
+/// error message) — the hard credential-isolation invariant pull-through
+/// is built around.
+async fn pull_through_miss(
+    state: &AppState,
+    key: &str,
+    format: PackageFormat,
+    repo: &str,
+    channel: &str,
+) -> Option<Response> {
+    let filename = key.rsplit('/').next().unwrap_or(key);
+
+    let upstream = match silo_core::pull_through::select_upstream(&state.db, repo, channel, format)
+        .await
+    {
+        Ok(Some(upstream)) => upstream,
+        // No upstream configured for this (repo, channel, format) — an
+        // ordinary 404, not an error.
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::error!(error = %e, repo, channel, "could not look up a pull-through upstream");
+            return Some((StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response());
+        }
+    };
+    // When the in-memory cache is enabled for this upstream, read through
+    // it — the same one the index merge uses, so the two lookup paths
+    // never disagree about what's fresh. Otherwise this is a single
+    // filename, so go straight to the indexed by-filename query rather
+    // than fetching (and scanning) the whole synced index for it.
+    let found = if upstream.cache_index_in_memory {
+        silo_core::repo::upstream_packages_for(&state.publish, &upstream)
+            .await
+            .map(|synced| synced.iter().find(|r| r.filename == filename).cloned())
+    } else {
+        state
+            .db
+            .find_upstream_package_by_filename(upstream.id, filename)
+            .await
+    };
+    let upstream_pkg = match found {
+        Ok(Some(pkg)) => pkg,
+        // Not in this upstream's synced index — an ordinary 404.
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::error!(error = %e, upstream = %upstream.name, "could not look up an upstream package");
+            return Some((StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response());
+        }
+    };
+    let cache_mode = silo_core::pull_through::CacheMode::parse(&upstream.cache_mode).ok()?;
+    let requires_auth = silo_core::pull_through::requires_auth(&upstream);
+    let availability = silo_core::pull_through::UpstreamAvailability::Known(Some((
+        upstream_pkg.epoch.max(0) as u32,
+        upstream_pkg.version.as_str(),
+        upstream_pkg.release.as_str(),
+    )));
+    let action = silo_core::pull_through::decide(
+        format,
+        None,
+        Some((cache_mode, requires_auth, availability)),
+    );
+
+    let http = match silo_core::upstream_sync::http_for(
+        state.upstream_http.clone(),
+        state.upstream_secrets.as_ref(),
+        &upstream,
+    ) {
+        Ok(http) => http,
+        Err(e) => {
+            tracing::error!(error = %e, upstream = %upstream.name, "could not build an upstream client");
+            return Some((StatusCode::BAD_GATEWAY, "upstream credential error").into_response());
+        }
+    };
+
+    match action {
+        silo_core::pull_through::Action::RedirectToUpstream => {
+            state
+                .metrics
+                .pull_through
+                .with_label_values(&[format.as_str(), "redirect"])
+                .inc();
+            Some(found_redirect(&upstream_pkg.download_url))
+        }
+        silo_core::pull_through::Action::ProxyUpstream => {
+            let started = Instant::now();
+            match http.get(&upstream_pkg.download_url).await {
+                Ok(bytes) => {
+                    state
+                        .metrics
+                        .pull_through_fetch_duration
+                        .with_label_values(&[format.as_str()])
+                        .observe(started.elapsed().as_secs_f64());
+                    state
+                        .metrics
+                        .pull_through
+                        .with_label_values(&[format.as_str(), "proxy"])
+                        .inc();
+                    Some(
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/octet-stream")],
+                            bytes,
+                        )
+                            .into_response(),
+                    )
+                }
+                Err(e) => {
+                    record_upstream_fetch_error(state, format, &e);
+                    Some((StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response())
+                }
+            }
+        }
+        silo_core::pull_through::Action::FetchAndCache => {
+            let started = Instant::now();
+            let bytes = match http.get(&upstream_pkg.download_url).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    record_upstream_fetch_error(state, format, &e);
+                    return Some(
+                        (StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response(),
+                    );
+                }
+            };
+            state
+                .metrics
+                .pull_through_fetch_duration
+                .with_label_values(&[format.as_str()])
+                .observe(started.elapsed().as_secs_f64());
+            if bytes.len() > silo_core::repo::MAX_PACKAGE_BYTES {
+                return Some(
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "upstream package exceeds the size limit",
+                    )
+                        .into_response(),
+                );
+            }
+            match silo_core::repo::publish_with_origin(
+                &state.publish,
+                repo,
+                channel,
+                format,
+                bytes,
+                &audit::Actor::system(),
+                Some(upstream.id),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    state
+                        .metrics
+                        .pull_through
+                        .with_label_values(&[format.as_str(), "fetch_cache"])
+                        .inc();
+                    // Not `bytes`: rpm signing rewrites the payload on
+                    // capture (see `repo::index_metadata`'s doc), so what
+                    // was actually stored can differ from what was
+                    // fetched. Re-reading it back is what makes the very
+                    // first response to a cold cache byte-for-byte the
+                    // same as every response after it.
+                    match state.storage.get(&outcome.storage_path).await {
+                        Ok(Some(stored)) => Some(
+                            (
+                                StatusCode::OK,
+                                [(header::CONTENT_TYPE, "application/octet-stream")],
+                                stored,
+                            )
+                                .into_response(),
+                        ),
+                        Ok(None) => {
+                            tracing::error!(
+                                key = outcome.storage_path,
+                                "just-published package is missing from storage"
+                            );
+                            Some(
+                                (StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+                                    .into_response(),
+                            )
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, key = outcome.storage_path, "failed to read back a cached package");
+                            Some(
+                                (StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+                                    .into_response(),
+                            )
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, upstream = %upstream.name, "failed to cache a pulled-through package");
+                    Some(
+                        (StatusCode::BAD_GATEWAY, "failed to cache upstream package")
+                            .into_response(),
+                    )
+                }
+            }
+        }
+        silo_core::pull_through::Action::ServeLocal | silo_core::pull_through::Action::NotFound => {
+            None
+        }
+    }
+}
+
+/// npm's lazy pull-through path: unlike the other four formats (whose
+/// whole-channel/whole-arch index is rebuilt eagerly once when their
+/// upstream is added or synced — see `repo::rebuild_index_for_upstream`),
+/// npm has no endpoint that lists every package a registry holds, so
+/// there is nothing to rebuild ahead of time. Instead, a packument miss
+/// fetches just that one name's versions from the upstream, upserts them,
+/// and renders the packument on demand — the same
+/// `merge_upstream_records` machinery every other format's index already
+/// goes through, just triggered per-request instead of per-sync.
+///
+/// Returns `None` when there's nothing to do (no npm upstream configured,
+/// or the upstream doesn't have this name either), so the caller falls
+/// back to its ordinary 404.
+async fn pull_through_npm_packument(
+    state: &AppState,
+    repo: &str,
+    channel: &str,
+    name: &str,
+) -> Option<Vec<u8>> {
+    let upstream =
+        silo_core::pull_through::select_upstream(&state.db, repo, channel, PackageFormat::Npm)
+            .await
+            .ok()
+            .flatten()?;
+
+    let fetched = match silo_core::upstream_sync::sync_npm_package(
+        &state.db,
+        state.upstream_http.clone(),
+        state.upstream_secrets.as_ref(),
+        &upstream,
+        name,
+    )
+    .await
+    {
+        Ok(fetched) => fetched,
+        Err(e) => {
+            // Still surfaced as a 404 to the caller — npm's lazy path has
+            // no separate error channel back to the client — but logged
+            // and counted the same way the other four formats' upstream
+            // fetch failures are, so this doesn't look invisible in
+            // metrics/logs the way a plain miss would.
+            match e.downcast::<silo_pkg::UpstreamError>() {
+                Ok(upstream_err) => {
+                    record_upstream_fetch_error(state, PackageFormat::Npm, &upstream_err)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, upstream = %upstream.name, "npm pull-through sync failed")
+                }
+            }
+            return None;
+        }
+    };
+    if fetched.is_empty() {
+        return None;
+    }
+
+    silo_core::repo::regenerate_index(
+        &state.publish,
+        repo,
+        channel,
+        PackageFormat::Npm,
+        name,
+        &audit::Actor::system(),
+    )
+    .await
+    .ok()?;
+
+    let key = format!(
+        "{}/{}",
+        silo_pkg::npm::package_prefix(repo, channel, name),
+        silo_pkg::npm::PACKUMENT_OBJECT
+    );
+    state.storage.get(&key).await.ok().flatten()
+}
+
+fn record_upstream_fetch_error(
+    state: &AppState,
+    format: PackageFormat,
+    error: &silo_pkg::UpstreamError,
+) {
+    let reason = match error {
+        silo_pkg::UpstreamError::Fetch { .. } => "network",
+        silo_pkg::UpstreamError::Status { .. } => "http_status",
+        silo_pkg::UpstreamError::Parse(_) => "parse_error",
+        silo_pkg::UpstreamError::TooLarge { .. } => "too_large",
     };
     state
         .metrics
-        .http_requests
-        .with_label_values(&[&surface, result.status().as_str()])
+        .upstream_fetch_errors
+        .with_label_values(&[format.as_str(), reason])
         .inc();
-    result
+    tracing::error!(error = %error, format = %format, "pull-through fetch failed");
 }
 
 /// A 302 redirect to a presigned URL.
@@ -693,6 +1032,45 @@ async fn get_deb_package(
 
 // -------------------------------------------------------------------- npm
 
+/// The bare registry root, with no package name at all — `/:repo/:channel/npm`
+/// and its trailing-slash twin need their own routes because axum's
+/// `*path` wildcard on `get_npm`'s route never matches a zero-length
+/// remainder, so neither ever reaches that handler.
+///
+/// Real npm clients essentially never fetch this directly, but a health
+/// check or `npm ping` might, and it's also what `add-upstream`'s
+/// reachability probe hits when the upstream is *another silo* rather
+/// than a public registry — without this, that probe 404s and silo can
+/// never pull through another silo's npm namespace. A minimal
+/// CouchDB-style root document is enough to satisfy both: "this looks
+/// like an npm registry."
+async fn get_npm_root(
+    State(state): State<Arc<AppState>>,
+    Path((repo, channel)): Path<(String, String)>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = validate_repo_path(&repo, &channel) {
+        return resp;
+    }
+    if let Err(resp) =
+        authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await
+    {
+        return resp;
+    }
+    state
+        .metrics
+        .http_requests
+        .with_label_values(&["npm-index", "200"])
+        .inc();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "db_name": format!("silo:{repo}/{channel}") }).to_string(),
+    )
+        .into_response()
+}
+
 async fn get_npm(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, path)): Path<(String, String, String)>,
@@ -745,7 +1123,26 @@ async fn get_npm(
                     )
                         .into_response()
                 }
-                Ok(None) => npm_not_found(&state),
+                Ok(None) => {
+                    match pull_through_npm_packument(&state, &repo, &channel, &name).await {
+                        Some(bytes) => {
+                            let base = state.base_url_for(&headers);
+                            let bytes = silo_pkg::npm::substitute_base_url(&bytes, &base);
+                            state
+                                .metrics
+                                .http_requests
+                                .with_label_values(&["npm-index", "200"])
+                                .inc();
+                            (
+                                StatusCode::OK,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                bytes,
+                            )
+                                .into_response()
+                        }
+                        None => npm_not_found(&state),
+                    }
+                }
                 Err(e) => {
                     tracing::error!(error = %e, key, "failed to read packument");
                     (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response()
@@ -1107,6 +1504,7 @@ pub(crate) mod tests {
             metrics: MetricsConfig::default(),
             prune: PruneConfig::default(),
             jobs: JobsConfig::default(),
+            upstream_secret: None,
         };
         tweak(&mut config);
 
@@ -1132,12 +1530,15 @@ pub(crate) mod tests {
                 db: db.clone(),
                 signers: Default::default(),
                 public_base_url: config.public_base_url.clone(),
+                upstream_index_cache: Default::default(),
             },
             config,
             storage,
             db,
             oidc: None,
             metrics: Metrics::new().expect("build metrics"),
+            upstream_secrets: None,
+            upstream_http: reqwest::Client::new(),
         }
     }
 

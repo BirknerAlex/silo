@@ -17,9 +17,15 @@ use std::io::Write;
 use std::pin::Pin;
 
 use base64::Engine;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
 
+use std::collections::HashMap;
+use std::future::Future;
+
+use crate::upstream::{
+    UpstreamError, UpstreamFetchOptions, UpstreamHttp, UpstreamIndex, UpstreamPackage,
+};
 use crate::{
     split_gzip_members, Format, IndexContext, IndexObject, PackageFormat, ParseError, ParsedPackage,
 };
@@ -329,6 +335,281 @@ pub(crate) fn strip_tar_eof(bytes: &[u8]) -> &[u8] {
     &bytes[..end]
 }
 
+/// Fetches and parses an upstream Alpine repository's `APKINDEX.tar.gz`,
+/// one per configured architecture — apk has no arch-agnostic root index,
+/// the same reason [`Format::index_group`] partitions by arch above.
+pub struct ApkUpstream;
+
+impl UpstreamIndex for ApkUpstream {
+    fn format(&self) -> PackageFormat {
+        PackageFormat::Apk
+    }
+
+    fn fetch_index<'a>(
+        &'a self,
+        http: &'a UpstreamHttp,
+        opts: &'a UpstreamFetchOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UpstreamPackage>, UpstreamError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if opts.arches.is_empty() {
+                return Err(UpstreamError::parse(
+                    "an apk upstream needs at least one --arch",
+                ));
+            }
+            // One `APKINDEX.tar.gz` per architecture, fetched concurrently
+            // rather than one at a time — a mirror configured with several
+            // arches otherwise pays their round-trip latencies serially.
+            let fetched =
+                futures::future::try_join_all(opts.arches.iter().map(|arch| async move {
+                    let bytes = http.get(&format!("{arch}/APKINDEX.tar.gz")).await?;
+                    Ok::<_, UpstreamError>((arch, bytes))
+                }))
+                .await?;
+            let mut out = Vec::new();
+            for (arch, bytes) in fetched {
+                let base = format!("{}/{arch}", http.base_url().trim_end_matches('/'));
+                out.extend(parse_apkindex_tar_gz(&bytes, arch, &base)?);
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// Extracts and parses the `APKINDEX` text member out of a fetched
+/// `APKINDEX.tar.gz`. Handles the same multi-gzip-member shape
+/// [`split_gzip_members`] exists for on the write side: a signed index
+/// prepends a signature member ahead of the one actually holding the
+/// `APKINDEX` file.
+pub fn parse_apkindex_tar_gz(
+    bytes: &[u8],
+    arch: &str,
+    base_url: &str,
+) -> Result<Vec<UpstreamPackage>, UpstreamError> {
+    let members = split_gzip_members(bytes).map_err(|e| UpstreamError::parse(e.to_string()))?;
+    for (start, end) in &members {
+        let raw = &bytes[*start..*end];
+        let decoder = flate2::bufread::GzDecoder::new(raw);
+        let Ok(inflated) =
+            crate::inflate_capped(decoder, crate::MAX_INFLATED_BYTES, "apk index member")
+        else {
+            continue;
+        };
+        let mut archive = tar::Archive::new(inflated.as_slice());
+        let Ok(entries) = archive.entries() else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(mut entry) = entry else { continue };
+            let Ok(path) = entry.path() else { continue };
+            if path.to_string_lossy() != "APKINDEX" {
+                continue;
+            }
+            let text = crate::read_text_capped(&mut entry, "APKINDEX")
+                .map_err(|e| UpstreamError::parse(e.to_string()))?;
+            return Ok(parse_apkindex_text(&text, arch, base_url));
+        }
+    }
+    Err(UpstreamError::parse(
+        "APKINDEX.tar.gz has no APKINDEX member",
+    ))
+}
+
+/// Parses the plain-text `APKINDEX` body — the exact shape
+/// [`render_apkindex`] produces, one `KEY:value` line per field,
+/// blank-line-separated records — into normalized upstream packages.
+/// Unlike `.PKGINFO`, fields are single letters (`P:name`, not
+/// `pkgname = name`), so this doesn't reuse [`parse_pkginfo`].
+pub fn parse_apkindex_text(text: &str, arch: &str, base_url: &str) -> Vec<UpstreamPackage> {
+    let mut out = Vec::new();
+    for block in text.split("\n\n") {
+        if block.trim().is_empty() {
+            continue;
+        }
+        let fields = parse_apkindex_block(block);
+        let (Some(name), Some(version)) = (fields.get(&'P'), fields.get(&'V')) else {
+            continue;
+        };
+        let filename = format!("{name}-{version}.apk");
+        // Everything beyond the four columns above rides in `metadata`,
+        // under the same keys `ApkFormat::parse` uses — `INDEX_FIELDS`
+        // maps the single-letter wire field to that key, so a package
+        // synced from a real upstream carries its description/url/
+        // license/depends/etc. into a synthetic index entry exactly the
+        // way a locally-published one would, not just a bare name and
+        // version.
+        let mut metadata = Map::new();
+        for (key, meta_key) in INDEX_FIELDS {
+            let ch = key.chars().next().unwrap();
+            if matches!(ch, 'P' | 'V' | 'A' | 'S') {
+                continue; // already columns on UpstreamPackage itself
+            }
+            if let Some(value) = fields.get(&ch) {
+                metadata.insert((*meta_key).to_string(), Value::String(value.clone()));
+            }
+        }
+        out.push(UpstreamPackage {
+            name: name.clone(),
+            epoch: 0,
+            version: version.clone(),
+            release: String::new(),
+            arch: fields
+                .get(&'A')
+                .cloned()
+                .unwrap_or_else(|| arch.to_string()),
+            download_url: format!("{}/{filename}", base_url.trim_end_matches('/')),
+            filename,
+            size_bytes: fields.get(&'S').and_then(|s| s.parse::<i64>().ok()),
+            sha256: None,
+            metadata: Value::Object(metadata),
+        });
+    }
+    out
+}
+
+fn parse_apkindex_block(block: &str) -> HashMap<char, String> {
+    let mut fields = HashMap::new();
+    for line in block.lines() {
+        let line = line.trim();
+        let mut chars = line.chars();
+        let Some(key) = chars.next() else { continue };
+        if chars.next() != Some(':') {
+            continue;
+        }
+        fields.insert(key, line[key.len_utf8() + 1..].to_string());
+    }
+    fields
+}
+
+/// Compares two apk version strings per apk-tools' own ordering: numeric
+/// and alphabetic segments compare in the obvious way, and a fixed set of
+/// pre/post-release suffixes (`_alpha` < `_beta` < `_pre` < `_rc` <
+/// (no suffix) < `_cvs`/`_svn`/`_git`/`_hg`/`_p`) order around the plain
+/// release the same way RPM's tilde/no-tilde does. apk's package
+/// revision is actually separated with `-r` (`1.0-r0`), which
+/// `compare_segments`/`tokenize_version` already order correctly as an
+/// ordinary trailing numeric segment; [`split_apk_revision`] instead
+/// breaks ties on a *different*, rarer `_rN` marker apk-tools also
+/// recognizes mid-version (as in `1.0_alpha1_r2`'s `_r2`).
+///
+/// This is a pragmatic subset of the real algorithm (`apk_pkg_version.c`)
+/// covering the shapes real Alpine packages actually use; it does not
+/// claim byte-for-byte parity with every edge case apk-tools handles.
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a_main, a_rev) = split_apk_revision(a);
+    let (b_main, b_rev) = split_apk_revision(b);
+    compare_segments(a_main, b_main).then_with(|| a_rev.cmp(&b_rev))
+}
+
+fn split_apk_revision(v: &str) -> (&str, u64) {
+    match v.rsplit_once("_r") {
+        Some((main, rev)) if rev.chars().all(|c| c.is_ascii_digit()) && !rev.is_empty() => {
+            (main, rev.parse().unwrap_or(0))
+        }
+        _ => (v, 0),
+    }
+}
+
+/// Ordering rank for apk's recognized suffix words — lower sorts earlier.
+/// A plain segment with no recognized suffix ranks as "release" (between
+/// `_rc` and the post-release markers), matching apk-tools' treatment of
+/// an unmarked version as the "final" release relative to its
+/// pre-releases and equal-or-later to its post-release snapshots.
+fn suffix_rank(word: &str) -> i32 {
+    match word {
+        "alpha" => -4,
+        "beta" => -3,
+        "pre" => -2,
+        "rc" => -1,
+        "cvs" | "svn" | "git" | "hg" | "p" => 1,
+        _ => 0,
+    }
+}
+
+fn compare_segments(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut a_tokens = tokenize_version(a).into_iter().peekable();
+    let mut b_tokens = tokenize_version(b).into_iter().peekable();
+
+    loop {
+        match (a_tokens.next(), b_tokens.next()) {
+            (None, None) => return Ordering::Equal,
+            // A leftover token when the other side has ended decides
+            // based on *what* it is, not just that it exists: a leftover
+            // numeric component means "more specific, so newer" (`1.0.1`
+            // > `1.0`), but a leftover pre-release word (`_alpha`,
+            // `_beta`, `_pre`, `_rc`) means "not released yet, so older"
+            // (`1.0_rc1` < `1.0`) while a post-release word (`_git`,
+            // `_cvs`, ...) still means newer.
+            (Some(Token::Num(_)), None) => return Ordering::Greater,
+            (None, Some(Token::Num(_))) => return Ordering::Less,
+            (Some(Token::Suffix(s)), None) => {
+                return if suffix_rank(&s) < 0 {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            }
+            (None, Some(Token::Suffix(s))) => {
+                return if suffix_rank(&s) < 0 {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+            (Some(Token::Num(x)), Some(Token::Num(y))) => match x.cmp(&y) {
+                Ordering::Equal => continue,
+                other => return other,
+            },
+            (Some(Token::Suffix(x)), Some(Token::Suffix(y))) => {
+                match suffix_rank(&x).cmp(&suffix_rank(&y)) {
+                    Ordering::Equal => match x.cmp(&y) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    },
+                    other => return other,
+                }
+            }
+            // A numeric segment always outranks a suffix word at the same
+            // position — `1.0` is newer than `1.0_alpha`.
+            (Some(Token::Num(_)), Some(Token::Suffix(_))) => return Ordering::Greater,
+            (Some(Token::Suffix(_)), Some(Token::Num(_))) => return Ordering::Less,
+        }
+    }
+}
+
+enum Token {
+    Num(u64),
+    Suffix(String),
+}
+
+/// Splits a version's main part into alternating numeric and
+/// alpha/underscore-word tokens, e.g. `1.2.3_alpha1` ->
+/// `[Num(1), Num(2), Num(3), Suffix("alpha"), Num(1)]`.
+fn tokenize_version(v: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut chars = v.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut num = String::new();
+            while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                num.push(chars.next().unwrap());
+            }
+            tokens.push(Token::Num(num.parse().unwrap_or(0)));
+        } else if c == '.' || c == '_' || c == '-' {
+            chars.next();
+        } else {
+            let mut word = String::new();
+            while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                word.push(chars.next().unwrap());
+            }
+            tokens.push(Token::Suffix(word));
+        }
+    }
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +821,84 @@ mod tests {
         assert_eq!(stripped.len() % 512, 0);
         // The header block and its data block must survive.
         assert_eq!(stripped.len(), 1024);
+    }
+
+    #[test]
+    fn parses_an_upstream_apkindex_round_tripped_through_our_own_renderer() {
+        // The upstream parser's real-world input is another apk-tools
+        // repository, but the fastest way to exercise it end to end
+        // without vendoring a real Alpine mirror snippet is our own
+        // renderer, since it emits the exact same wire shape.
+        let text = render_apkindex(&[record("curl", "8.0.1-r0"), record("wget", "1.21-r2")]);
+        let packages = parse_apkindex_text(&text, "x86_64", "https://example.com/x86_64");
+        assert_eq!(packages.len(), 2);
+        let curl = packages.iter().find(|p| p.name == "curl").unwrap();
+        assert_eq!(curl.version, "8.0.1-r0");
+        assert_eq!(curl.arch, "x86_64");
+        assert_eq!(curl.filename, "curl-8.0.1-r0.apk");
+        assert_eq!(
+            curl.download_url,
+            "https://example.com/x86_64/curl-8.0.1-r0.apk"
+        );
+        assert_eq!(curl.size_bytes, Some(1234));
+        assert_eq!(curl.metadata["checksum"], "Q1abc");
+        // Description/license/depends must survive too — a synthetic
+        // index entry should look the same as a locally published one,
+        // not just carry a bare name and version.
+        assert_eq!(curl.metadata["description"], "a test package");
+        assert_eq!(curl.metadata["license"], "MIT");
+        assert_eq!(curl.metadata["depends"], "musl so:libc.musl-x86_64.so.1");
+    }
+
+    #[test]
+    fn parses_an_upstream_apkindex_tar_gz_including_a_signature_member() {
+        let text = render_apkindex(&[record("curl", "8.0.1-r0")]);
+        let index_tar_gz = tar_gz(&[("APKINDEX", text.as_bytes())]).unwrap();
+
+        // Prepend a bogus signature member, the same shape a real signed
+        // upstream index has — the parser must skip past it to find the
+        // member that actually contains APKINDEX.
+        let sig_tar = tar_bytes(&[(".SIGN.RSA.fake", &[0xAB; 32])]).unwrap();
+        let mut signed = gzip(strip_tar_eof(&sig_tar)).unwrap();
+        signed.extend_from_slice(&index_tar_gz);
+
+        let packages =
+            parse_apkindex_tar_gz(&signed, "x86_64", "https://example.com/x86_64").unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "curl");
+    }
+
+    #[test]
+    fn version_cmp_orders_numeric_segments_and_release_revisions() {
+        use std::cmp::Ordering;
+        assert_eq!(version_cmp("1.2.3", "1.2.4"), Ordering::Less);
+        assert_eq!(version_cmp("1.10.0", "1.9.0"), Ordering::Greater);
+        assert_eq!(version_cmp("1.0-r0", "1.0-r1"), Ordering::Less);
+        assert_eq!(version_cmp("1.0", "1.0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn version_cmp_orders_pre_release_suffixes_below_the_plain_release() {
+        use std::cmp::Ordering;
+        assert_eq!(version_cmp("1.0_alpha1", "1.0"), Ordering::Less);
+        assert_eq!(version_cmp("1.0_alpha1", "1.0_beta1"), Ordering::Less);
+        assert_eq!(version_cmp("1.0_beta1", "1.0_rc1"), Ordering::Less);
+        assert_eq!(version_cmp("1.0_rc1", "1.0"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_orders_post_release_suffixes_above_the_plain_release() {
+        use std::cmp::Ordering;
+        assert_eq!(version_cmp("1.0", "1.0_git1"), Ordering::Less);
+    }
+
+    #[test]
+    fn parse_apkindex_block_does_not_panic_on_a_multi_byte_field_key() {
+        // A key is documented as always being a single ASCII character,
+        // but an upstream (malicious or buggy) can still serve one that
+        // isn't — this must not panic by slicing mid-character.
+        let fields = parse_apkindex_block("€:x\nP:hello\nV:1.0\n");
+        assert_eq!(fields.get(&'P').map(String::as_str), Some("hello"));
+        assert_eq!(fields.get(&'V').map(String::as_str), Some("1.0"));
     }
 }

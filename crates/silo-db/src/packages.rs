@@ -43,6 +43,9 @@ pub struct PackageRow {
     pub published_at: DateTime,
     pub published_by_token: Option<Uuid>,
     pub published_by_user: Option<Uuid>,
+    /// `NULL` for a locally published package; otherwise the upstream it
+    /// was pulled through from. See `0005_upstreams.sql`.
+    pub origin_upstream_id: Option<Uuid>,
 }
 
 impl PackageRow {
@@ -87,11 +90,15 @@ pub struct NewPackage {
     pub metadata: Value,
     pub published_by_token: Option<Uuid>,
     pub published_by_user: Option<Uuid>,
+    /// `None` for a normal publish; `Some` tags the package as pulled
+    /// through from that upstream (set only by `silo-core`'s
+    /// `repo::publish_with_origin`).
+    pub origin_upstream_id: Option<Uuid>,
 }
 
 const COLUMNS: &str = "id, repo, channel, format, index_group, name, epoch, version, release, \
                        arch, filename, storage_key, size_bytes, sha256, metadata, published_at, \
-                       published_by_token, published_by_user";
+                       published_by_token, published_by_user, origin_upstream_id";
 
 /// Inserts or replaces a package.
 ///
@@ -106,8 +113,9 @@ pub async fn upsert<'e, E: PgExecutor<'e>>(
     let row: PackageRow = sqlx::query_as(&format!(
         "INSERT INTO packages (repo, channel, format, index_group, name, epoch, version, \
                                release, arch, filename, storage_key, size_bytes, sha256, \
-                               metadata, published_by_token, published_by_user) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
+                               metadata, published_by_token, published_by_user, \
+                               origin_upstream_id) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
          ON CONFLICT (repo, channel, format, storage_key) DO UPDATE SET \
              index_group = EXCLUDED.index_group, \
              name = EXCLUDED.name, \
@@ -121,7 +129,8 @@ pub async fn upsert<'e, E: PgExecutor<'e>>(
              metadata = EXCLUDED.metadata, \
              published_at = now(), \
              published_by_token = EXCLUDED.published_by_token, \
-             published_by_user = EXCLUDED.published_by_user \
+             published_by_user = EXCLUDED.published_by_user, \
+             origin_upstream_id = EXCLUDED.origin_upstream_id \
          RETURNING {COLUMNS}"
     ))
     .bind(&pkg.repo)
@@ -140,6 +149,7 @@ pub async fn upsert<'e, E: PgExecutor<'e>>(
     .bind(&pkg.metadata)
     .bind(pkg.published_by_token)
     .bind(pkg.published_by_user)
+    .bind(pkg.origin_upstream_id)
     .fetch_one(executor)
     .await?;
     Ok(row)
@@ -343,6 +353,7 @@ mod tests {
             published_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             published_by_token: None,
             published_by_user: None,
+            origin_upstream_id: None,
         }
     }
 

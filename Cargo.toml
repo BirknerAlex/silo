@@ -60,6 +60,8 @@ base64 = "0.22"
 hex = "0.4"
 semver = "1"
 cron = "0.15"
+aes-gcm = "0.10"
+quick-xml = "0.36"
 
 [profile.release]
 lto = true

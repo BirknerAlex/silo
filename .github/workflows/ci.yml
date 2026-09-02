@@ -159,10 +159,13 @@ jobs:
   # installed by real dnf/apk/npm. See ci/e2e.sh.
   e2e:
     runs-on: ubuntu-latest
-    # 25 rather than the 360-minute default: the suite takes about five,
-    # and the failure mode worth guarding against is a package manager
-    # blocking on a prompt, which would otherwise burn six hours.
-    timeout-minutes: 25
+    # 40 rather than the 360-minute default: the suite builds and boots two
+    # silo instances, runs a full install/verify pass against each, and
+    # also validates pull-through against real public mirrors (Fedora
+    # rawhide, Alpine edge, Debian sid, npmjs.org). The failure mode worth
+    # guarding against is a package manager blocking on a prompt, which
+    # would otherwise burn six hours.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 

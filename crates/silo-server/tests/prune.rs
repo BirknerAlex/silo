@@ -131,6 +131,7 @@ async fn set_get_clear_prune_rule_round_trips() {
                 channel: "stable".into(),
                 keep_last_n: Some(5),
                 max_age_days: None,
+                origin_scope: 0,
             },
             Some(&admin.secret),
         ))
@@ -149,6 +150,7 @@ async fn set_get_clear_prune_rule_round_trips() {
                 channel: "stable".into(),
                 keep_last_n: Some(3),
                 max_age_days: Some(90),
+                origin_scope: 0,
             },
             Some(&admin.secret),
         ))
@@ -201,7 +203,7 @@ async fn keep_last_n_deletes_the_oldest_beyond_n() {
     publish_versions(&harness, &repo, "edge", "widget", 5).await;
     harness
         .db
-        .set_prune_rule(&repo, "edge", Some(2), None)
+        .set_prune_rule(&repo, "edge", Some(2), None, "all")
         .await
         .unwrap();
 
@@ -239,7 +241,7 @@ async fn max_age_deletes_versions_older_than_the_threshold() {
     publish_versions(&harness, &repo, "edge", "widget", 5).await;
     harness
         .db
-        .set_prune_rule(&repo, "edge", None, Some(2))
+        .set_prune_rule(&repo, "edge", None, Some(2), "all")
         .await
         .unwrap();
 
@@ -280,7 +282,7 @@ async fn combined_rules_are_a_union_not_an_intersection() {
     // Union: ages 3 and 4 pruned (age 4 hit by both, age 3 hit by max_age only).
     harness
         .db
-        .set_prune_rule(&repo, "edge", Some(4), Some(3))
+        .set_prune_rule(&repo, "edge", Some(4), Some(3), "all")
         .await
         .unwrap();
 
@@ -322,7 +324,7 @@ async fn an_exempt_name_survives_both_rules() {
     publish_versions(&harness, &repo, "edge", "widget", 5).await;
     harness
         .db
-        .set_prune_rule(&repo, "edge", Some(1), Some(1))
+        .set_prune_rule(&repo, "edge", Some(1), Some(1), "all")
         .await
         .unwrap();
 
@@ -390,7 +392,7 @@ async fn dry_run_reports_without_deleting_or_auditing() {
     publish_versions(&harness, &repo, "edge", "widget", 5).await;
     harness
         .db
-        .set_prune_rule(&repo, "edge", Some(2), None)
+        .set_prune_rule(&repo, "edge", Some(2), None, "all")
         .await
         .unwrap();
 
@@ -449,7 +451,7 @@ async fn live_run_writes_package_delete_and_summary_audit_entries() {
     publish_versions(&harness, &repo, "edge", "widget", 3).await;
     harness
         .db
-        .set_prune_rule(&repo, "edge", Some(1), None)
+        .set_prune_rule(&repo, "edge", Some(1), None, "all")
         .await
         .unwrap();
 
@@ -503,7 +505,7 @@ async fn prune_disabled_globally_rejects_run_prune() {
 
     harness
         .db
-        .set_prune_rule(&repo, "edge", Some(1), None)
+        .set_prune_rule(&repo, "edge", Some(1), None, "all")
         .await
         .unwrap();
 
@@ -536,12 +538,12 @@ async fn scoping_by_repo_and_channel_leaves_others_untouched() {
     publish_versions(&harness, &repo_b, "edge", "widget", 5).await;
     harness
         .db
-        .set_prune_rule(&repo_a, "edge", Some(1), None)
+        .set_prune_rule(&repo_a, "edge", Some(1), None, "all")
         .await
         .unwrap();
     harness
         .db
-        .set_prune_rule(&repo_b, "edge", Some(1), None)
+        .set_prune_rule(&repo_b, "edge", Some(1), None, "all")
         .await
         .unwrap();
 
@@ -639,6 +641,7 @@ async fn a_repo_scoped_admin_cannot_touch_another_repos_prune_config() {
                 channel: "edge".into(),
                 keep_last_n: Some(1),
                 max_age_days: None,
+                origin_scope: 0,
             },
             Some(&scoped_admin.secret),
         ))
@@ -654,6 +657,7 @@ async fn a_repo_scoped_admin_cannot_touch_another_repos_prune_config() {
                 channel: "edge".into(),
                 keep_last_n: Some(1),
                 max_age_days: None,
+                origin_scope: 0,
             },
             Some(&scoped_admin.secret),
         ))
@@ -734,7 +738,7 @@ async fn an_unscoped_prune_run_requires_global_scope() {
 
     harness
         .db
-        .set_prune_rule(&mine, "edge", Some(1), None)
+        .set_prune_rule(&mine, "edge", Some(1), None, "all")
         .await
         .unwrap();
 

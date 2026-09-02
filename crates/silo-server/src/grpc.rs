@@ -197,6 +197,23 @@ impl ReadService for ReadServiceImpl {
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
 
+            // Only resolved (an extra query) when at least one row is
+            // actually tagged — the ordinary all-local-packages case
+            // never pays for a lookup it doesn't need.
+            let upstream_names: std::collections::HashMap<silo_db::Uuid, String> =
+                if rows.iter().any(|r| r.origin_upstream_id.is_some()) {
+                    self.state
+                        .db
+                        .list_upstreams(&req.repo, &req.channel)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .into_iter()
+                        .map(|u| (u.id, u.name))
+                        .collect()
+                } else {
+                    Default::default()
+                };
+
             let packages = rows
                 .into_iter()
                 .map(|row| PackageInfo {
@@ -211,6 +228,10 @@ impl ReadService for ReadServiceImpl {
                     sha256: row.sha256,
                     published_at: row.published_at.timestamp(),
                     id: row.id,
+                    origin_upstream: row
+                        .origin_upstream_id
+                        .and_then(|id| upstream_names.get(&id).cloned())
+                        .unwrap_or_default(),
                 })
                 .collect();
 

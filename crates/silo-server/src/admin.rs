@@ -29,18 +29,21 @@ use silo_db::Uuid;
 use silo_pkg::PackageFormat;
 use silo_proto::v1::admin_service_server::AdminService;
 use silo_proto::v1::{
-    AuditEntry as ProtoAuditEntry, ClearPruneRuleRequest, ClearPruneRuleResponse,
-    CreateRepoRequest, CreateRepoResponse, CreateTokenRequest, CreateTokenResponse,
-    CreateUserRequest, CreateUserResponse, DeletePackageRequest, DeletePackageResponse,
-    DeleteRepoRequest, DeleteRepoResponse, DeleteUserRequest, DeleteUserResponse,
-    GetPruneRuleRequest, GetPruneRuleResponse, ListPruneExemptionsRequest,
-    ListPruneExemptionsResponse, ListTokensRequest, ListTokensResponse, ListUsersRequest,
-    ListUsersResponse, PruneCandidate as ProtoPruneCandidate, PruneRule as ProtoPruneRule,
-    QueryAuditRequest, QueryAuditResponse, RebuildIndexRequest, RebuildIndexResponse, RepoMode,
-    RevokeTokenRequest, RevokeTokenResponse, RunPruneRequest, RunPruneResponse,
-    SetPruneExemptionRequest, SetPruneExemptionResponse, SetPruneRuleRequest, SetPruneRuleResponse,
-    SetRepoModeRequest, SetRepoModeResponse, SetUserDisabledRequest, SetUserDisabledResponse,
-    SetUserPasswordRequest, SetUserPasswordResponse, TokenInfo, TokenScope as ProtoScope, UserInfo,
+    AddUpstreamRequest, AddUpstreamResponse, AuditEntry as ProtoAuditEntry, ClearPruneRuleRequest,
+    ClearPruneRuleResponse, CreateRepoRequest, CreateRepoResponse, CreateTokenRequest,
+    CreateTokenResponse, CreateUserRequest, CreateUserResponse, DeletePackageRequest,
+    DeletePackageResponse, DeleteRepoRequest, DeleteRepoResponse, DeleteUserRequest,
+    DeleteUserResponse, GetPruneRuleRequest, GetPruneRuleResponse, ListPruneExemptionsRequest,
+    ListPruneExemptionsResponse, ListTokensRequest, ListTokensResponse, ListUpstreamsRequest,
+    ListUpstreamsResponse, ListUsersRequest, ListUsersResponse, OriginScope as ProtoOriginScope,
+    PruneCandidate as ProtoPruneCandidate, PruneRule as ProtoPruneRule, QueryAuditRequest,
+    QueryAuditResponse, RebuildIndexRequest, RebuildIndexResponse, RemoveUpstreamRequest,
+    RemoveUpstreamResponse, RepoMode, RevokeTokenRequest, RevokeTokenResponse, RunPruneRequest,
+    RunPruneResponse, SetPruneExemptionRequest, SetPruneExemptionResponse, SetPruneRuleRequest,
+    SetPruneRuleResponse, SetRepoModeRequest, SetRepoModeResponse, SetUserDisabledRequest,
+    SetUserDisabledResponse, SetUserPasswordRequest, SetUserPasswordResponse, SyncUpstreamRequest,
+    SyncUpstreamResponse, TokenInfo, TokenScope as ProtoScope, UpdateUpstreamRequest,
+    UpdateUpstreamResponse, UpstreamCacheMode as ProtoCacheMode, UpstreamInfo, UserInfo,
 };
 use tonic::{Request, Response, Status};
 
@@ -235,6 +238,51 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<RunPruneResponse>, Status> {
         let result = self.run_prune_inner(request).await;
         self.state.metrics.record_grpc("run_prune", &result);
+        result
+    }
+
+    async fn add_upstream(
+        &self,
+        request: Request<AddUpstreamRequest>,
+    ) -> Result<Response<AddUpstreamResponse>, Status> {
+        let result = self.add_upstream_inner(request).await;
+        self.state.metrics.record_grpc("add_upstream", &result);
+        result
+    }
+
+    async fn update_upstream(
+        &self,
+        request: Request<UpdateUpstreamRequest>,
+    ) -> Result<Response<UpdateUpstreamResponse>, Status> {
+        let result = self.update_upstream_inner(request).await;
+        self.state.metrics.record_grpc("update_upstream", &result);
+        result
+    }
+
+    async fn remove_upstream(
+        &self,
+        request: Request<RemoveUpstreamRequest>,
+    ) -> Result<Response<RemoveUpstreamResponse>, Status> {
+        let result = self.remove_upstream_inner(request).await;
+        self.state.metrics.record_grpc("remove_upstream", &result);
+        result
+    }
+
+    async fn list_upstreams(
+        &self,
+        request: Request<ListUpstreamsRequest>,
+    ) -> Result<Response<ListUpstreamsResponse>, Status> {
+        let result = self.list_upstreams_inner(request).await;
+        self.state.metrics.record_grpc("list_upstreams", &result);
+        result
+    }
+
+    async fn sync_upstream(
+        &self,
+        request: Request<SyncUpstreamRequest>,
+    ) -> Result<Response<SyncUpstreamResponse>, Status> {
+        let result = self.sync_upstream_inner(request).await;
+        self.state.metrics.record_grpc("sync_upstream", &result);
         result
     }
 }
@@ -976,10 +1024,17 @@ impl AdminServiceImpl {
             return Err(Status::invalid_argument("max_age_days must be positive"));
         }
 
+        let origin_scope = from_proto_origin_scope(req.origin_scope);
         let rule = self
             .state
             .db
-            .set_prune_rule(&req.repo, &req.channel, req.keep_last_n, req.max_age_days)
+            .set_prune_rule(
+                &req.repo,
+                &req.channel,
+                req.keep_last_n,
+                req.max_age_days,
+                origin_scope,
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -992,6 +1047,7 @@ impl AdminServiceImpl {
                     .detail(serde_json::json!({
                         "keep_last_n": req.keep_last_n,
                         "max_age_days": req.max_age_days,
+                        "origin_scope": origin_scope,
                     })),
             )
             .await;
@@ -1174,6 +1230,582 @@ impl AdminServiceImpl {
             failed: report.failed.len() as i32,
         }))
     }
+
+    async fn add_upstream_inner(
+        &self,
+        request: Request<AddUpstreamRequest>,
+    ) -> Result<Response<AddUpstreamResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        silo_core::config::validate_repo_name("channel", &req.channel)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        silo_core::config::validate_repo_name("name", &req.name)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
+
+        let format = from_proto_format(req.format)
+            .ok_or_else(|| Status::invalid_argument("a valid format is required"))?;
+        validate_base_url(&req.base_url)?;
+        let cache_mode = proto_cache_mode_to_str(req.cache_mode)?;
+
+        let auth_triplet = req.auth.as_ref().filter(|a| !a.kind.is_empty()).map(|a| {
+            (
+                a.kind.as_str(),
+                non_empty_str(&a.username),
+                a.secret.as_str(),
+            )
+        });
+        if auth_triplet.is_some() && self.state.upstream_secrets.is_none() {
+            return Err(Status::failed_precondition(
+                "this server has no `upstream_secret` key configured, so upstreams can't carry a credential",
+            ));
+        }
+
+        let opts = silo_pkg::UpstreamFetchOptions {
+            arches: req.arches.clone(),
+            suite: non_empty_str(&req.suite).map(str::to_string),
+            components: req.components.clone(),
+        };
+
+        // Validate + first fetch BEFORE anything is persisted — a failure
+        // here rejects the call outright and creates no row.
+        let http = silo_core::upstream_sync::http_from_plaintext(
+            self.state.upstream_http.clone(),
+            &req.base_url,
+            auth_triplet,
+        )
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let fetched = silo_core::upstream_sync::fetch(&http, format, &opts)
+            .await
+            .map_err(|e| Status::invalid_argument(format!("could not validate upstream: {e}")))?;
+
+        let sealed = auth_triplet
+            .map(|(kind, username, secret)| {
+                silo_core::upstream_sync::seal_auth(
+                    self.state.upstream_secrets.as_ref().expect("checked above"),
+                    kind,
+                    username,
+                    secret,
+                )
+            })
+            .transpose()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let row = self
+            .state
+            .db
+            .create_upstream(&silo_db::upstreams::NewUpstream {
+                repo: req.repo.clone(),
+                channel: req.channel.clone(),
+                name: req.name.clone(),
+                format: format.as_str().to_string(),
+                base_url: req.base_url.clone(),
+                cache_mode: cache_mode.to_string(),
+                cache_index_in_memory: req.cache_index_in_memory,
+                arches: req.arches.clone(),
+                suite: opts.suite.clone(),
+                components: req.components.clone(),
+                auth: sealed,
+            })
+            .await
+            .map_err(|e| match e.downcast_ref::<sqlx::Error>() {
+                Some(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                    Status::already_exists(e.to_string())
+                }
+                _ => Status::internal(e.to_string()),
+            })?;
+
+        if format != PackageFormat::Npm {
+            let synced: Vec<silo_db::upstreams::SyncedPackage> =
+                fetched.into_iter().map(to_synced_package).collect();
+            self.state
+                .db
+                .replace_upstream_packages(row.id, &synced)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        self.state
+            .db
+            .record_upstream_sync_success(row.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        silo_core::repo::rebuild_index_for_upstream(
+            &self.state.publish,
+            &req.repo,
+            &req.channel,
+            format,
+            &req.arches,
+            &caller.actor,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let row = self
+            .state
+            .db
+            .find_upstream(row.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::internal("upstream vanished immediately after creation"))?;
+
+        self.state
+            .db
+            .record_audit(
+                AuditEntry::new(audit::action::UPSTREAM_ADD, &caller.actor)
+                    .repo(&req.repo)
+                    .channel(&req.channel)
+                    .target(&req.name)
+                    .detail(
+                        serde_json::json!({ "format": format.as_str(), "base_url": req.base_url }),
+                    ),
+            )
+            .await;
+
+        Ok(Response::new(AddUpstreamResponse {
+            upstream: Some(to_proto_upstream(&row)),
+        }))
+    }
+
+    async fn update_upstream_inner(
+        &self,
+        request: Request<UpdateUpstreamRequest>,
+    ) -> Result<Response<UpdateUpstreamResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        silo_core::config::validate_repo_name("channel", &req.channel)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        silo_core::config::validate_repo_name("name", &req.name)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
+        let existing = self
+            .state
+            .db
+            .get_upstream(&req.repo, &req.channel, &req.name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("no upstream `{}`", req.name)))?;
+
+        if let Some(url) = &req.base_url {
+            validate_base_url(url)?;
+        }
+        let base_url = req
+            .base_url
+            .clone()
+            .unwrap_or_else(|| existing.base_url.clone());
+        let cache_mode = match req.cache_mode {
+            Some(mode) => proto_cache_mode_to_str(mode)?.to_string(),
+            None => existing.cache_mode.clone(),
+        };
+        let cache_index_in_memory = req
+            .cache_index_in_memory
+            .unwrap_or(existing.cache_index_in_memory);
+        let arches = if req.clear_arches {
+            Vec::new()
+        } else if req.arches.is_empty() {
+            existing.arches.clone()
+        } else {
+            req.arches.clone()
+        };
+        let suite = req.suite.clone().or_else(|| existing.suite.clone());
+        let components = if req.clear_components {
+            Vec::new()
+        } else if req.components.is_empty() {
+            existing.components.clone()
+        } else {
+            req.components.clone()
+        };
+
+        let sealed = match &req.auth {
+            None => None,
+            Some(a) if a.kind.is_empty() => {
+                // Explicit clear: caller sent `auth` with an empty kind.
+                Some(None)
+            }
+            Some(a) => {
+                let secrets = self.state.upstream_secrets.as_ref().ok_or_else(|| {
+                    Status::failed_precondition(
+                        "this server has no `upstream_secret` key configured",
+                    )
+                })?;
+                let username = non_empty_str(&a.username);
+                Some(Some(
+                    silo_core::upstream_sync::seal_auth(secrets, &a.kind, username, &a.secret)
+                        .map_err(|e| Status::internal(e.to_string()))?,
+                ))
+            }
+        };
+
+        let updated = match sealed {
+            None => {
+                self.state
+                    .db
+                    .update_upstream(
+                        existing.id,
+                        &base_url,
+                        &cache_mode,
+                        cache_index_in_memory,
+                        &arches,
+                        suite.as_deref(),
+                        &components,
+                        None,
+                    )
+                    .await
+            }
+            Some(None) => {
+                // Clearing: reuse the same update call but with auth
+                // fields nulled via a direct query, since `update_upstream`
+                // only ever *sets* a credential, never clears one — a
+                // clear is only reachable through this explicit path.
+                self.state
+                    .db
+                    .clear_upstream_auth(existing.id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                self.state
+                    .db
+                    .update_upstream(
+                        existing.id,
+                        &base_url,
+                        &cache_mode,
+                        cache_index_in_memory,
+                        &arches,
+                        suite.as_deref(),
+                        &components,
+                        None,
+                    )
+                    .await
+            }
+            Some(Some(sealed)) => {
+                self.state
+                    .db
+                    .update_upstream(
+                        existing.id,
+                        &base_url,
+                        &cache_mode,
+                        cache_index_in_memory,
+                        &arches,
+                        suite.as_deref(),
+                        &components,
+                        Some(&sealed),
+                    )
+                    .await
+            }
+        }
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(format!("no upstream `{}`", req.name)))?;
+
+        // Any of `base_url`/`cache_mode`/auth/index-cache-toggle changing
+        // makes a cached copy of this upstream's index untrustworthy —
+        // drop it so the next read repopulates against the new settings.
+        self.state
+            .publish
+            .upstream_index_cache
+            .invalidate(existing.id);
+
+        // A `base_url` change is worse than a stale cache: every synced
+        // row's `download_url` was resolved against the *old* base URL,
+        // so merging the index or serving a pull-through request would
+        // keep pointing at the old host until the next sync happens to
+        // run. Clearing the synced rows here (rather than merely
+        // invalidating the read cache) means the package is simply
+        // unadvertised until the next sync repopulates it correctly,
+        // instead of silently serving a wrong-host URL.
+        if base_url != existing.base_url {
+            if let Err(e) = self
+                .state
+                .db
+                .replace_upstream_packages(existing.id, &[])
+                .await
+            {
+                tracing::error!(
+                    error = %e,
+                    upstream = %req.name,
+                    "could not clear synced packages after a base_url change"
+                );
+            }
+        }
+
+        self.state
+            .db
+            .record_audit(
+                AuditEntry::new(audit::action::UPSTREAM_UPDATE, &caller.actor)
+                    .repo(&req.repo)
+                    .channel(&req.channel)
+                    .target(&req.name),
+            )
+            .await;
+
+        Ok(Response::new(UpdateUpstreamResponse {
+            upstream: Some(to_proto_upstream(&updated)),
+        }))
+    }
+
+    async fn remove_upstream_inner(
+        &self,
+        request: Request<RemoveUpstreamRequest>,
+    ) -> Result<Response<RemoveUpstreamResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        silo_core::config::validate_repo_name("channel", &req.channel)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        silo_core::config::validate_repo_name("name", &req.name)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
+        let existing = self
+            .state
+            .db
+            .get_upstream(&req.repo, &req.channel, &req.name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("no upstream `{}`", req.name)))?;
+
+        let mut pruned = 0i32;
+        if req.prune {
+            let packages = self
+                .state
+                .db
+                .list_all_in_repo(&req.repo)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            for package in packages
+                .iter()
+                .filter(|p| p.origin_upstream_id == Some(existing.id))
+            {
+                match silo_core::repo::delete_package(
+                    &self.state.publish,
+                    package.id,
+                    &caller.actor,
+                    Some(serde_json::json!({ "reason": "upstream_remove" })),
+                )
+                .await
+                {
+                    Ok(Some(_)) => pruned += 1,
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(Status::internal(format!(
+                        "removed {pruned} upstream package(s) before failing on package {}: {e}",
+                        package.id
+                    )))
+                    }
+                }
+            }
+        }
+
+        let removed = self
+            .state
+            .db
+            .delete_upstream(existing.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .is_some();
+        self.state
+            .publish
+            .upstream_index_cache
+            .invalidate(existing.id);
+
+        self.state
+            .db
+            .record_audit(
+                AuditEntry::new(audit::action::UPSTREAM_REMOVE, &caller.actor)
+                    .repo(&req.repo)
+                    .channel(&req.channel)
+                    .target(&req.name)
+                    .detail(serde_json::json!({ "prune": req.prune, "packages_pruned": pruned })),
+            )
+            .await;
+
+        Ok(Response::new(RemoveUpstreamResponse {
+            removed,
+            packages_pruned: pruned,
+        }))
+    }
+
+    async fn list_upstreams_inner(
+        &self,
+        request: Request<ListUpstreamsRequest>,
+    ) -> Result<Response<ListUpstreamsResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Read).await?;
+        let rows = self
+            .state
+            .db
+            .list_upstreams(&req.repo, &req.channel)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(ListUpstreamsResponse {
+            upstreams: rows.iter().map(to_proto_upstream).collect(),
+        }))
+    }
+
+    async fn sync_upstream_inner(
+        &self,
+        request: Request<SyncUpstreamRequest>,
+    ) -> Result<Response<SyncUpstreamResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_admin(&caller)?;
+        let req = request.into_inner();
+
+        silo_core::config::validate_repo_name("repo", &req.repo)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        silo_core::config::validate_repo_name("channel", &req.channel)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        silo_core::config::validate_repo_name("name", &req.name)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
+        let existing = self
+            .state
+            .db
+            .get_upstream(&req.repo, &req.channel, &req.name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("no upstream `{}`", req.name)))?;
+
+        let count = silo_core::upstream_sync::sync_one(
+            &self.state.db,
+            self.state.upstream_http.clone(),
+            self.state.upstream_secrets.as_ref(),
+            &existing,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        self.state
+            .publish
+            .upstream_index_cache
+            .invalidate(existing.id);
+        if let Ok(format) = existing.format.parse::<PackageFormat>() {
+            silo_core::repo::rebuild_index_for_upstream(
+                &self.state.publish,
+                &req.repo,
+                &req.channel,
+                format,
+                &existing.arches,
+                &caller.actor,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        }
+
+        self.state
+            .db
+            .record_audit(
+                AuditEntry::new(audit::action::UPSTREAM_SYNC, &caller.actor)
+                    .repo(&req.repo)
+                    .channel(&req.channel)
+                    .target(&req.name)
+                    .detail(serde_json::json!({ "packages_synced": count })),
+            )
+            .await;
+
+        let row = self
+            .state
+            .db
+            .find_upstream(existing.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("no upstream `{}`", req.name)))?;
+
+        Ok(Response::new(SyncUpstreamResponse {
+            upstream: Some(to_proto_upstream(&row)),
+            packages_synced: count as i32,
+        }))
+    }
+}
+
+fn non_empty_str(s: &str) -> Option<&str> {
+    (!s.is_empty()).then_some(s)
+}
+
+/// Rejects anything but an absolute http(s) URL with no embedded
+/// userinfo (`https://user:pass@host/...`). A credential belongs in the
+/// upstream's own `auth` field, sealed at rest — one baked into the URL
+/// would round-trip in plain text through `download_url` and, on a
+/// `no_cache` upstream, straight into a client-visible redirect
+/// `Location` header.
+fn validate_base_url(url: &str) -> Result<(), Status> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(Status::invalid_argument(
+            "base_url must be an absolute http(s) URL",
+        ));
+    }
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| Status::invalid_argument(format!("base_url is not a valid URL: {e}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Status::invalid_argument(
+            "base_url must not embed credentials — configure `auth` instead",
+        ));
+    }
+    Ok(())
+}
+
+fn proto_cache_mode_to_str(value: i32) -> Result<&'static str, Status> {
+    match ProtoCacheMode::try_from(value).unwrap_or(ProtoCacheMode::Unspecified) {
+        ProtoCacheMode::Cache => Ok("cache"),
+        ProtoCacheMode::NoCache => Ok("no_cache"),
+        ProtoCacheMode::Unspecified => Err(Status::invalid_argument("cache_mode is required")),
+    }
+}
+
+fn to_synced_package(pkg: silo_pkg::UpstreamPackage) -> silo_db::upstreams::SyncedPackage {
+    silo_db::upstreams::SyncedPackage {
+        name: pkg.name,
+        epoch: pkg.epoch as i32,
+        version: pkg.version,
+        release: pkg.release,
+        arch: pkg.arch,
+        filename: pkg.filename,
+        download_url: pkg.download_url,
+        size_bytes: pkg.size_bytes,
+        sha256: pkg.sha256,
+        metadata: pkg.metadata,
+    }
+}
+
+fn to_proto_upstream(row: &silo_db::upstreams::UpstreamRow) -> UpstreamInfo {
+    let cache_mode = match row.cache_mode.as_str() {
+        "cache" => ProtoCacheMode::Cache,
+        "no_cache" => ProtoCacheMode::NoCache,
+        _ => ProtoCacheMode::Unspecified,
+    };
+    UpstreamInfo {
+        id: row.id.to_string(),
+        repo: row.repo.clone(),
+        channel: row.channel.clone(),
+        name: row.name.clone(),
+        format: row
+            .format
+            .parse::<PackageFormat>()
+            .map(crate::grpc::to_proto_format)
+            .unwrap_or_default() as i32,
+        base_url: row.base_url.clone(),
+        cache_mode: cache_mode as i32,
+        cache_index_in_memory: row.cache_index_in_memory,
+        arches: row.arches.clone(),
+        suite: row.suite.clone().unwrap_or_default(),
+        components: row.components.clone(),
+        auth_configured: row.auth_kind.is_some(),
+        status: row.status.clone(),
+        last_sync_at: row.last_sync_at.map(|t| t.timestamp()).unwrap_or_default(),
+        last_sync_error: row.last_sync_error.clone().unwrap_or_default(),
+        last_success_at: row
+            .last_success_at
+            .map(|t| t.timestamp())
+            .unwrap_or_default(),
+    }
 }
 
 fn to_proto_rule(rule: &silo_db::prune::PruneRuleRow) -> ProtoPruneRule {
@@ -1183,6 +1815,27 @@ fn to_proto_rule(rule: &silo_db::prune::PruneRuleRow) -> ProtoPruneRule {
         keep_last_n: rule.keep_last_n,
         max_age_days: rule.max_age_days,
         updated_at: rule.updated_at.timestamp(),
+        origin_scope: to_proto_origin_scope(&rule.origin_scope) as i32,
+    }
+}
+
+fn to_proto_origin_scope(scope: &str) -> ProtoOriginScope {
+    match scope {
+        "local" => ProtoOriginScope::Local,
+        "upstream" => ProtoOriginScope::Upstream,
+        _ => ProtoOriginScope::All,
+    }
+}
+
+/// Unspecified (the zero value, what an older client that doesn't know
+/// about this field sends) is treated as "all" — the behavior every rule
+/// had before origin scoping existed, so a client that never sets this
+/// field sees no change.
+fn from_proto_origin_scope(value: i32) -> &'static str {
+    match ProtoOriginScope::try_from(value).unwrap_or(ProtoOriginScope::Unspecified) {
+        ProtoOriginScope::Local => "local",
+        ProtoOriginScope::Upstream => "upstream",
+        ProtoOriginScope::All | ProtoOriginScope::Unspecified => "all",
     }
 }
 

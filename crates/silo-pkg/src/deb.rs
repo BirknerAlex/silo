@@ -28,6 +28,7 @@
 //! repodata tree and npm's one-tarball-per-name already keep to.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
 
@@ -35,6 +36,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::apk::gzip;
+use crate::upstream::{
+    UpstreamError, UpstreamFetchOptions, UpstreamHttp, UpstreamIndex, UpstreamPackage,
+};
 use crate::{
     Format, IndexContext, IndexObject, PackageFormat, PackageRecord, ParseError, ParsedPackage,
 };
@@ -509,6 +513,273 @@ fn xz(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
+/// Fetches and parses an upstream apt repository's `Packages` files —
+/// one per (component, architecture) pair, the two axes an upstream deb
+/// config carries beyond `suite` (see the module doc for why apt's shape
+/// needs all three where every other format needs at most one).
+pub struct DebUpstream;
+
+impl UpstreamIndex for DebUpstream {
+    fn format(&self) -> PackageFormat {
+        PackageFormat::Deb
+    }
+
+    fn fetch_index<'a>(
+        &'a self,
+        http: &'a UpstreamHttp,
+        opts: &'a UpstreamFetchOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UpstreamPackage>, UpstreamError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let suite = opts
+                .suite
+                .as_deref()
+                .ok_or_else(|| UpstreamError::parse("a deb upstream needs --suite"))?;
+            if opts.components.is_empty() {
+                return Err(UpstreamError::parse(
+                    "a deb upstream needs at least one --component",
+                ));
+            }
+            if opts.arches.is_empty() {
+                return Err(UpstreamError::parse(
+                    "a deb upstream needs at least one --arch",
+                ));
+            }
+
+            // Validates the suite actually exists before trying any
+            // component/arch combination — the same "fail add-upstream
+            // loudly rather than silently sync nothing" reasoning as the
+            // other eager formats' fetches.
+            http.get(&format!("dists/{suite}/Release")).await?;
+
+            // One `Packages.gz` per component×arch pair, fetched
+            // concurrently rather than one at a time — a mirror with
+            // several components and arches otherwise pays their
+            // round-trip latencies serially.
+            let pairs: Vec<(&String, &String)> = opts
+                .components
+                .iter()
+                .flat_map(|component| opts.arches.iter().map(move |arch| (component, arch)))
+                .collect();
+            let fetched = futures::future::try_join_all(pairs.into_iter().map(
+                |(component, arch)| async move {
+                    let path = format!("dists/{suite}/{component}/binary-{arch}/Packages.gz");
+                    let bytes = http.get(&path).await?;
+                    Ok::<_, UpstreamError>(bytes)
+                },
+            ))
+            .await?;
+            let mut out = Vec::new();
+            for bytes in fetched {
+                let inflated = crate::inflate_capped(
+                    flate2::bufread::GzDecoder::new(bytes.as_slice()),
+                    crate::MAX_INFLATED_BYTES,
+                    "upstream Packages.gz",
+                )
+                .map_err(|e| UpstreamError::parse(e.to_string()))?;
+                let text = String::from_utf8(inflated)
+                    .map_err(|e| UpstreamError::parse(format!("Packages is not utf-8: {e}")))?;
+                out.extend(parse_packages_stanzas(&text, http.base_url()));
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// Parses a fetched `Packages` document — deb822 stanzas separated by
+/// blank lines, the exact shape [`render_packages`] writes — into
+/// normalized upstream packages.
+pub fn parse_packages_stanzas(text: &str, base_url: &str) -> Vec<UpstreamPackage> {
+    let mut out = Vec::new();
+    for stanza in split_stanzas(text) {
+        let fields = parse_control(&stanza);
+        let get = |k: &str| fields.get(k).cloned();
+
+        let (Some(name), Some(raw_version), Some(arch), Some(filename)) = (
+            get("Package"),
+            get("Version"),
+            get("Architecture"),
+            get("Filename"),
+        ) else {
+            continue;
+        };
+        let Ok((epoch, version, release)) = split_version(&raw_version) else {
+            continue;
+        };
+
+        // The rest of `STANZA_FIELDS` rides in `metadata` under the same
+        // `control_key`-lowercased names `json_field`/`render_packages`
+        // already use, so a synced package's Depends/Description/etc.
+        // survive into a synthetic index entry, not just its identity.
+        let mut metadata = serde_json::Map::new();
+        for field in STANZA_FIELDS {
+            if let Some(value) = fields.get(*field) {
+                metadata.insert(control_key(field), serde_json::Value::String(value.clone()));
+            }
+        }
+
+        // `Filename` is relative to the *repo root*, not to `pool/`, and
+        // real archives nest it by source package
+        // (`pool/main/h/hello/hello_2.10-3_amd64.deb`) rather than the
+        // flat `pool/<file>` our own renderer always produces. The full
+        // path is exactly what `download_url` needs to fetch the real
+        // object; `UpstreamPackage.filename` is not that — every other
+        // format's parser (and `render_packages`'s own `pool/{filename}`
+        // template) treats it as a bare basename, so storing the full
+        // path there would double up the `pool/` prefix the moment a
+        // synthetic entry gets rendered locally.
+        let basename = filename
+            .rsplit('/')
+            .next()
+            .unwrap_or(filename.as_str())
+            .to_string();
+
+        out.push(UpstreamPackage {
+            name,
+            epoch,
+            version,
+            release,
+            arch,
+            download_url: format!("{}/{filename}", base_url.trim_end_matches('/')),
+            filename: basename,
+            size_bytes: get("Size").and_then(|s| s.parse().ok()),
+            sha256: get("SHA256"),
+            metadata: serde_json::Value::Object(metadata),
+        });
+    }
+    out
+}
+
+/// Splits a `Packages` document on blank lines into individual stanzas —
+/// [`parse_control`] already handles one stanza's continuation lines, but
+/// a `Packages` file is many stanzas concatenated, which `parse_control`
+/// alone would merge into one (it just resets on a blank line rather than
+/// starting a new record).
+fn split_stanzas(text: &str) -> Vec<String> {
+    text.split("\n\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Compares two deb `[epoch:]upstream_version[-debian_revision]` strings
+/// per dpkg's own ordering: epoch numerically first, then upstream
+/// version and revision each compared by dpkg's alternating
+/// digit/non-digit rule where `~` sorts before everything (including the
+/// empty string) so `1.0~beta1` orders before the `1.0` it precedes.
+///
+/// A pragmatic subset of `dpkg`'s real comparison, covering the shapes
+/// real `.deb`s use; not a byte-for-byte reimplementation of every
+/// corner of `dpkg --compare-versions`.
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a_epoch, a_rest) = split_epoch(a);
+    let (b_epoch, b_rest) = split_epoch(b);
+    let (a_upstream, a_revision) = split_revision(a_rest);
+    let (b_upstream, b_revision) = split_revision(b_rest);
+    a_epoch
+        .cmp(&b_epoch)
+        .then_with(|| dpkg_version_cmp(a_upstream, b_upstream))
+        .then_with(|| dpkg_version_cmp(a_revision, b_revision))
+}
+
+fn split_epoch(v: &str) -> (u32, &str) {
+    match v.split_once(':') {
+        Some((e, rest)) => (e.parse().unwrap_or(0), rest),
+        None => (0, v),
+    }
+}
+
+/// dpkg compares `upstream_version` and `debian_revision` as two
+/// independent fields, split on the *last* hyphen — an upstream version
+/// legitimately contains hyphens of its own, so the separator has to be
+/// the rightmost one. No hyphen means a native (non-Debian-revisioned)
+/// package, whose revision is empty.
+fn split_revision(v: &str) -> (&str, &str) {
+    match v.rsplit_once('-') {
+        Some((upstream, revision)) => (upstream, revision),
+        None => (v, ""),
+    }
+}
+
+/// dpkg's version-comparison algorithm applied to a version string with
+/// its epoch already stripped: alternating non-digit and digit runs
+/// compare in turn, where a non-digit run compares character by
+/// character with `~` ranking below everything else (even the end of the
+/// string), and a digit run compares numerically.
+fn dpkg_version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut a = a;
+    let mut b = b;
+    loop {
+        let (a_alpha, a_rest) = take_non_digits(a);
+        let (b_alpha, b_rest) = take_non_digits(b);
+        match compare_dpkg_alpha(a_alpha, b_alpha) {
+            Ordering::Equal => {}
+            other => return other,
+        }
+        a = a_rest;
+        b = b_rest;
+
+        let (a_num, a_rest) = take_digits(a);
+        let (b_num, b_rest) = take_digits(b);
+        let a_val: u64 = a_num.parse().unwrap_or(0);
+        let b_val: u64 = b_num.parse().unwrap_or(0);
+        match a_val.cmp(&b_val) {
+            Ordering::Equal => {}
+            other => return other,
+        }
+        a = a_rest;
+        b = b_rest;
+
+        if a.is_empty() && b.is_empty() {
+            return Ordering::Equal;
+        }
+    }
+}
+
+/// `~` sorts before everything, including the empty string — that's what
+/// lets `1.0~beta1` (a pre-release of `1.0`) order before `1.0` itself.
+/// Every other character compares by its ASCII value, letters ranking
+/// below digits and punctuation (dpkg's own rule) — not needed here since
+/// digits are stripped out before this runs, but preserved for fidelity
+/// with non-alphanumeric separators like `.` and `+`.
+fn compare_dpkg_alpha(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut a_chars = a.chars();
+    let mut b_chars = b.chars();
+    loop {
+        let a_c = a_chars.next();
+        let b_c = b_chars.next();
+        let rank = |c: Option<char>| match c {
+            None => 0,
+            Some('~') => -1,
+            Some(c) if c.is_ascii_alphabetic() => c as i32,
+            Some(c) => c as i32 + 256,
+        };
+        match (a_c, b_c) {
+            (None, None) => return Ordering::Equal,
+            _ => match rank(a_c).cmp(&rank(b_c)) {
+                Ordering::Equal if a_c.is_none() && b_c.is_none() => return Ordering::Equal,
+                Ordering::Equal => continue,
+                other => return other,
+            },
+        }
+    }
+}
+
+fn take_digits(s: &str) -> (&str, &str) {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s.split_at(end)
+}
+
+fn take_non_digits(s: &str) -> (&str, &str) {
+    let end = s.find(|c: char| c.is_ascii_digit()).unwrap_or(s.len());
+    s.split_at(end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,5 +1052,87 @@ mod tests {
         let text = String::from_utf8(inrelease.bytes.clone()).unwrap();
         assert!(text.starts_with("-----BEGIN PGP SIGNED MESSAGE-----"));
         assert!(text.contains("Suite: stable"));
+    }
+
+    #[test]
+    fn parses_an_upstream_packages_file_round_tripped_through_our_own_renderer() {
+        let foo = record("foo", "1.0-1", "amd64");
+        let bar = record("bar", "2:2.5-3", "amd64");
+        let text = render_packages(&[&foo, &bar]);
+
+        let packages = parse_packages_stanzas(&text, "https://example.com/debian");
+        assert_eq!(packages.len(), 2);
+        let foo_up = packages.iter().find(|p| p.name == "foo").unwrap();
+        assert_eq!(foo_up.version, "1.0");
+        assert_eq!(foo_up.release, "1");
+        assert_eq!(foo_up.epoch, 0);
+        assert_eq!(foo_up.arch, "amd64");
+        assert_eq!(
+            foo_up.download_url,
+            "https://example.com/debian/pool/foo_1.0-1_amd64.deb"
+        );
+        assert_eq!(foo_up.sha256.as_deref(), Some("deadbeef"));
+        assert_eq!(foo_up.metadata["depends"], "libc6");
+
+        let bar_up = packages.iter().find(|p| p.name == "bar").unwrap();
+        assert_eq!(bar_up.epoch, 2);
+        assert_eq!(bar_up.version, "2.5");
+        assert_eq!(bar_up.release, "3");
+    }
+
+    /// Real archives (unlike our own flat `pool/<file>` renderer) nest
+    /// `Filename` by source package, e.g. Debian's actual layout for
+    /// `hello`. `download_url` must use the full nested path; `filename`
+    /// must be just the basename, or a synthetic record's storage key
+    /// doubles up the `pool/` prefix the moment it's rendered locally.
+    #[test]
+    fn a_real_archives_nested_filename_is_not_treated_as_the_bare_basename() {
+        let stanza = "Package: hello\n\
+             Version: 2.10-3\n\
+             Architecture: amd64\n\
+             Filename: pool/main/h/hello/hello_2.10-3_amd64.deb\n\
+             Size: 55080\n\
+             SHA256: abc123\n";
+        let packages = parse_packages_stanzas(stanza, "https://deb.debian.org/debian");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].filename, "hello_2.10-3_amd64.deb");
+        assert_eq!(
+            packages[0].download_url,
+            "https://deb.debian.org/debian/pool/main/h/hello/hello_2.10-3_amd64.deb"
+        );
+    }
+
+    #[test]
+    fn version_cmp_orders_epoch_above_everything_else() {
+        use std::cmp::Ordering;
+        assert_eq!(version_cmp("1:1.0-1", "9.0-1"), Ordering::Greater);
+        assert_eq!(version_cmp("1.0-1", "1:0.1-1"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_orders_numeric_segments_numerically() {
+        use std::cmp::Ordering;
+        assert_eq!(version_cmp("1.2-1", "1.10-1"), Ordering::Less);
+        assert_eq!(version_cmp("1.0-1", "1.0-2"), Ordering::Less);
+        assert_eq!(version_cmp("1.0-1", "1.0-1"), Ordering::Equal);
+    }
+
+    #[test]
+    fn version_cmp_orders_a_tilde_prerelease_below_its_release() {
+        use std::cmp::Ordering;
+        // dpkg's canonical example: `1.0~beta1` precedes `1.0`.
+        assert_eq!(version_cmp("1.0~beta1-1", "1.0-1"), Ordering::Less);
+        assert_eq!(version_cmp("1.0~~", "1.0~"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_ranks_punctuation_above_letters_like_real_dpkg() {
+        use std::cmp::Ordering;
+        // dpkg's own rule: letters sort by raw ordinal, non-letters (other
+        // than `~`) sort at ordinal+256, so any punctuation outranks any
+        // letter at the same position — `1.0+b1` (a `+`-separated build
+        // tag) is newer than `1.0rc1` (a letter-led prerelease tag).
+        assert_eq!(version_cmp("1.0+b1-1", "1.0rc1-1"), Ordering::Greater);
+        assert_eq!(version_cmp("1.0rc1-1", "1.0+b1-1"), Ordering::Less);
     }
 }

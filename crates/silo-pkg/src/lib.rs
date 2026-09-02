@@ -32,6 +32,11 @@ pub mod npm;
 pub mod pacman;
 pub mod repodata;
 pub mod rpm;
+pub mod upstream;
+
+pub use upstream::{
+    UpstreamError, UpstreamFetchOptions, UpstreamHttp, UpstreamIndex, UpstreamPackage,
+};
 
 use std::fmt;
 use std::str::FromStr;
@@ -82,6 +87,48 @@ impl PackageFormat {
         }
     }
 
+    /// Compares two `(epoch, version, release)` triples in this format's
+    /// own version ordering — what decides whether an upstream package is
+    /// newer than a locally cached one. Dispatches to each format's own
+    /// comparator (`rpm::version_cmp`, `apk::version_cmp`, ...), since the
+    /// five ecosystems don't share one: apk/npm have no separate release
+    /// field, apk has no epoch at all, and each has its own tie-breaking
+    /// rules within the version string itself. See each comparator's own
+    /// doc for the specific algorithm and its known limitations.
+    pub fn compare_versions(
+        &self,
+        a: (u32, &str, &str),
+        b: (u32, &str, &str),
+    ) -> std::cmp::Ordering {
+        match self {
+            PackageFormat::Rpm => rpm::version_cmp(a.0, a.1, a.2, b.0, b.1, b.2),
+            PackageFormat::Apk => apk::version_cmp(a.1, b.1),
+            PackageFormat::Npm => npm::version_cmp(a.1, b.1),
+            PackageFormat::Pacman => a.0.cmp(&b.0).then_with(|| {
+                pacman::version_cmp(
+                    &join_version_release(a.1, a.2),
+                    &join_version_release(b.1, b.2),
+                )
+            }),
+            PackageFormat::Deb => deb::version_cmp(
+                &join_epoch_version_release(a),
+                &join_epoch_version_release(b),
+            ),
+        }
+    }
+
+    /// The upstream-index counterpart to [`Self::handler`]: fetching and
+    /// parsing a *third party's* index, rather than rendering silo's own.
+    pub fn upstream_handler(&self) -> &'static dyn UpstreamIndex {
+        match self {
+            PackageFormat::Rpm => &rpm::RpmUpstream,
+            PackageFormat::Apk => &apk::ApkUpstream,
+            PackageFormat::Npm => &npm::NpmUpstream,
+            PackageFormat::Pacman => &pacman::PacmanUpstream,
+            PackageFormat::Deb => &deb::DebUpstream,
+        }
+    }
+
     /// Best-effort format detection from a filename, used by the CLI so
     /// `silo publish ./foo.apk` doesn't need an explicit `--format`.
     pub fn from_filename(filename: &str) -> Option<Self> {
@@ -102,6 +149,23 @@ impl PackageFormat {
         } else {
             None
         }
+    }
+}
+
+fn join_version_release(version: &str, release: &str) -> String {
+    if release.is_empty() {
+        version.to_string()
+    } else {
+        format!("{version}-{release}")
+    }
+}
+
+fn join_epoch_version_release((epoch, version, release): (u32, &str, &str)) -> String {
+    let joined = join_version_release(version, release);
+    if epoch == 0 {
+        joined
+    } else {
+        format!("{epoch}:{joined}")
     }
 }
 
@@ -585,6 +649,36 @@ mod tests {
         assert_eq!(
             drain_capped(&mut decoder, MAX_INFLATED_BYTES).unwrap(),
             4096
+        );
+    }
+
+    #[test]
+    fn compare_versions_dispatches_epoch_correctly_per_format() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            PackageFormat::Rpm.compare_versions((1, "1.0", "1"), (0, "9.0", "1")),
+            Ordering::Greater
+        );
+        assert_eq!(
+            PackageFormat::Pacman.compare_versions((1, "1.0", "1"), (0, "9.0", "1")),
+            Ordering::Greater
+        );
+        assert_eq!(
+            PackageFormat::Deb.compare_versions((1, "1.0", "1"), (0, "9.0", "1")),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn compare_versions_orders_apk_and_npm_by_their_version_string_alone() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            PackageFormat::Apk.compare_versions((0, "1.0-r0", ""), (0, "1.0-r1", "")),
+            Ordering::Less
+        );
+        assert_eq!(
+            PackageFormat::Npm.compare_versions((0, "1.0.0", ""), (0, "1.0.1", "")),
+            Ordering::Less
         );
     }
 
