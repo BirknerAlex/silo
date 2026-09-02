@@ -8,13 +8,14 @@ repository.workspace = true
 [dependencies]
 tonic.workspace = true
 prost.workspace = true
+tonic-prost.workspace = true
 
 [build-dependencies]
-tonic-build.workspace = true
+tonic-prost-build.workspace = true
 
 # cargo-machete reads `use` statements, and neither of these appears in
-# any source file: `prost` is referenced by the derives in the code
-# tonic-build generates, and `tonic-build` is only ever called from
-# build.rs. Removing either breaks the build.
+# any source file: `prost` and `tonic-prost` are referenced by the code
+# tonic-prost-build generates, and `tonic-prost-build` is only ever
+# called from build.rs. Removing any of them breaks the build.
 [package.metadata.cargo-machete]
-ignored = ["prost", "tonic-build"]
+ignored = ["prost", "tonic-prost", "tonic-prost-build"]

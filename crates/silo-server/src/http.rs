@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -57,28 +57,37 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Unauthenticated on purpose — see `pacman_public_key`.
         .route("/pacman-signing-key", get(pacman_public_key))
         // dnf/yum
-        .route("/:repo/:channel/repodata/*file", get(get_repodata))
-        .route("/:repo/:channel/Packages/*file", get(get_rpm_package))
+        .route("/{repo}/{channel}/repodata/{*file}", get(get_repodata))
+        .route("/{repo}/{channel}/Packages/{*file}", get(get_rpm_package))
         // apk
-        .route("/:repo/:channel/apk/:arch/*file", get(get_apk_file))
+        .route("/{repo}/{channel}/apk/{arch}/{*file}", get(get_apk_file))
         // pacman
-        .route("/:repo/:channel/pacman/:arch/*file", get(get_pacman_file))
-        // apt — `:suite` is accepted but unused: apt appends whatever suite
+        .route(
+            "/{repo}/{channel}/pacman/{arch}/{*file}",
+            get(get_pacman_file),
+        )
+        // apt — `{suite}` is accepted but unused: apt appends whatever suite
         // its `sources.list` entry names, and silo always answers for
-        // `:channel` regardless of what that string is (see `deb.rs`'s
+        // `{channel}` regardless of what that string is (see `deb.rs`'s
         // module doc for why component and suite aren't independent axes
         // here the way they are in a real Debian archive).
-        .route("/:repo/:channel/dists/:suite/*file", get(get_deb_release))
-        .route("/:repo/:channel/pool/*file", get(get_deb_package))
+        .route(
+            "/{repo}/{channel}/dists/{suite}/{*file}",
+            get(get_deb_release),
+        )
+        .route("/{repo}/{channel}/pool/{*file}", get(get_deb_package))
         // npm — one catch-all because scoped names (`@acme/widget`) put a
         // slash inside what npm considers a single path segment. `PUT` is
         // how `npm publish`/`yarn publish` send a new version.
-        .route("/:repo/:channel/npm/*path", get(get_npm).put(publish_npm))
-        // `*path` never matches a zero-length remainder — `/npm` and
+        .route(
+            "/{repo}/{channel}/npm/{*path}",
+            get(get_npm).put(publish_npm),
+        )
+        // `{*path}` never matches a zero-length remainder — `/npm` and
         // `/npm/` need their own routes, both mapped to the same root
         // handler. See `get_npm_root`'s doc for why this exists at all.
-        .route("/:repo/:channel/npm", get(get_npm_root))
-        .route("/:repo/:channel/npm/", get(get_npm_root))
+        .route("/{repo}/{channel}/npm", get(get_npm_root))
+        .route("/{repo}/{channel}/npm/", get(get_npm_root))
         .with_state(state)
 }
 
@@ -760,8 +769,10 @@ async fn audit_download(
         .await;
 }
 
-fn remote_addr(connect_info: Option<&ConnectInfo<std::net::SocketAddr>>) -> Option<String> {
-    connect_info.map(|ConnectInfo(addr)| addr.ip().to_string())
+fn remote_addr(
+    connect_info: Option<&Extension<ConnectInfo<std::net::SocketAddr>>>,
+) -> Option<String> {
+    connect_info.map(|Extension(ConnectInfo(addr))| addr.ip().to_string())
 }
 
 // ---------------------------------------------------------------- dnf/yum
@@ -769,7 +780,7 @@ fn remote_addr(connect_info: Option<&ConnectInfo<std::net::SocketAddr>>) -> Opti
 async fn get_repodata(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, file)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
@@ -794,7 +805,7 @@ async fn get_repodata(
 async fn get_rpm_package(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, file)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
@@ -821,7 +832,7 @@ async fn get_rpm_package(
 async fn get_apk_file(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, arch, file)): Path<(String, String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
@@ -889,7 +900,7 @@ async fn apk_key(
 async fn get_pacman_file(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, arch, file)): Path<(String, String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
@@ -989,7 +1000,7 @@ async fn pacman_key(
 async fn get_deb_release(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, _suite, file)): Path<(String, String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
@@ -1011,7 +1022,7 @@ async fn get_deb_release(
 async fn get_deb_package(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, file)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
@@ -1047,7 +1058,7 @@ async fn get_deb_package(
 async fn get_npm_root(
     State(state): State<Arc<AppState>>,
     Path((repo, channel)): Path<(String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
@@ -1074,7 +1085,7 @@ async fn get_npm_root(
 async fn get_npm(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, path)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
@@ -1225,7 +1236,7 @@ struct NpmAttachment<'a> {
 async fn publish_npm(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, path)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: Option<Extension<ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     request: Request,
 ) -> Response {
