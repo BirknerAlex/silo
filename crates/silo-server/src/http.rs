@@ -23,7 +23,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Request, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -57,28 +58,37 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Unauthenticated on purpose — see `pacman_public_key`.
         .route("/pacman-signing-key", get(pacman_public_key))
         // dnf/yum
-        .route("/:repo/:channel/repodata/*file", get(get_repodata))
-        .route("/:repo/:channel/Packages/*file", get(get_rpm_package))
+        .route("/{repo}/{channel}/repodata/{*file}", get(get_repodata))
+        .route("/{repo}/{channel}/Packages/{*file}", get(get_rpm_package))
         // apk
-        .route("/:repo/:channel/apk/:arch/*file", get(get_apk_file))
+        .route("/{repo}/{channel}/apk/{arch}/{*file}", get(get_apk_file))
         // pacman
-        .route("/:repo/:channel/pacman/:arch/*file", get(get_pacman_file))
-        // apt — `:suite` is accepted but unused: apt appends whatever suite
+        .route(
+            "/{repo}/{channel}/pacman/{arch}/{*file}",
+            get(get_pacman_file),
+        )
+        // apt — `{suite}` is accepted but unused: apt appends whatever suite
         // its `sources.list` entry names, and silo always answers for
-        // `:channel` regardless of what that string is (see `deb.rs`'s
+        // `{channel}` regardless of what that string is (see `deb.rs`'s
         // module doc for why component and suite aren't independent axes
         // here the way they are in a real Debian archive).
-        .route("/:repo/:channel/dists/:suite/*file", get(get_deb_release))
-        .route("/:repo/:channel/pool/*file", get(get_deb_package))
+        .route(
+            "/{repo}/{channel}/dists/{suite}/{*file}",
+            get(get_deb_release),
+        )
+        .route("/{repo}/{channel}/pool/{*file}", get(get_deb_package))
         // npm — one catch-all because scoped names (`@acme/widget`) put a
         // slash inside what npm considers a single path segment. `PUT` is
         // how `npm publish`/`yarn publish` send a new version.
-        .route("/:repo/:channel/npm/*path", get(get_npm).put(publish_npm))
-        // `*path` never matches a zero-length remainder — `/npm` and
+        .route(
+            "/{repo}/{channel}/npm/{*path}",
+            get(get_npm).put(publish_npm),
+        )
+        // `{*path}` never matches a zero-length remainder — `/npm` and
         // `/npm/` need their own routes, both mapped to the same root
         // handler. See `get_npm_root`'s doc for why this exists at all.
-        .route("/:repo/:channel/npm", get(get_npm_root))
-        .route("/:repo/:channel/npm/", get(get_npm_root))
+        .route("/{repo}/{channel}/npm", get(get_npm_root))
+        .route("/{repo}/{channel}/npm/", get(get_npm_root))
         .with_state(state)
 }
 
@@ -760,8 +770,33 @@ async fn audit_download(
         .await;
 }
 
-fn remote_addr(connect_info: Option<&ConnectInfo<std::net::SocketAddr>>) -> Option<String> {
-    connect_info.map(|ConnectInfo(addr)| addr.ip().to_string())
+/// A best-effort `ConnectInfo<SocketAddr>` that yields `None` instead of
+/// rejecting when the router wasn't served via
+/// `into_make_service_with_connect_info` — as in tests that exercise the
+/// app directly. axum 0.8 dropped the blanket `Option<T>` extractor for
+/// arbitrary `FromRequestParts` impls (see `OptionalFromRequestParts`), so
+/// `Option<ConnectInfo<_>>` no longer compiles; this reads the same
+/// extension by hand instead.
+struct MaybeConnectInfo(Option<std::net::SocketAddr>);
+
+impl<S> FromRequestParts<S> for MaybeConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(MaybeConnectInfo(
+            parts
+                .extensions
+                .get::<ConnectInfo<std::net::SocketAddr>>()
+                .map(|ConnectInfo(addr)| *addr),
+        ))
+    }
+}
+
+fn remote_addr(connect_info: &MaybeConnectInfo) -> Option<String> {
+    connect_info.0.map(|addr| addr.ip().to_string())
 }
 
 // ---------------------------------------------------------------- dnf/yum
@@ -769,15 +804,13 @@ fn remote_addr(connect_info: Option<&ConnectInfo<std::net::SocketAddr>>) -> Opti
 async fn get_repodata(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, file)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
         return resp;
     }
-    if let Err(resp) =
-        authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await
-    {
+    if let Err(resp) = authorize_read(&state, &headers, remote_addr(&connect_info), &repo).await {
         return resp;
     }
     if let Err(resp) = reject_traversal(&file) {
@@ -794,17 +827,16 @@ async fn get_repodata(
 async fn get_rpm_package(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, file)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
         return resp;
     }
-    let auth =
-        match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
-            Ok(auth) => auth,
-            Err(resp) => return resp,
-        };
+    let auth = match authorize_read(&state, &headers, remote_addr(&connect_info), &repo).await {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
     if let Err(resp) = reject_traversal(&file) {
         return resp;
     }
@@ -821,17 +853,16 @@ async fn get_rpm_package(
 async fn get_apk_file(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, arch, file)): Path<(String, String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
         return resp;
     }
-    let auth =
-        match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
-            Ok(auth) => auth,
-            Err(resp) => return resp,
-        };
+    let auth = match authorize_read(&state, &headers, remote_addr(&connect_info), &repo).await {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
     if let Err(resp) = reject_traversal(&file) {
         return resp;
     }
@@ -889,17 +920,16 @@ async fn apk_key(
 async fn get_pacman_file(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, arch, file)): Path<(String, String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
         return resp;
     }
-    let auth =
-        match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
-            Ok(auth) => auth,
-            Err(resp) => return resp,
-        };
+    let auth = match authorize_read(&state, &headers, remote_addr(&connect_info), &repo).await {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
     if let Err(resp) = reject_traversal(&file) {
         return resp;
     }
@@ -989,15 +1019,13 @@ async fn pacman_key(
 async fn get_deb_release(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, _suite, file)): Path<(String, String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
         return resp;
     }
-    if let Err(resp) =
-        authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await
-    {
+    if let Err(resp) = authorize_read(&state, &headers, remote_addr(&connect_info), &repo).await {
         return resp;
     }
     if let Err(resp) = reject_traversal(&file) {
@@ -1011,17 +1039,16 @@ async fn get_deb_release(
 async fn get_deb_package(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, file)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
         return resp;
     }
-    let auth =
-        match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
-            Ok(auth) => auth,
-            Err(resp) => return resp,
-        };
+    let auth = match authorize_read(&state, &headers, remote_addr(&connect_info), &repo).await {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
     if let Err(resp) = reject_traversal(&file) {
         return resp;
     }
@@ -1047,15 +1074,13 @@ async fn get_deb_package(
 async fn get_npm_root(
     State(state): State<Arc<AppState>>,
     Path((repo, channel)): Path<(String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
         return resp;
     }
-    if let Err(resp) =
-        authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await
-    {
+    if let Err(resp) = authorize_read(&state, &headers, remote_addr(&connect_info), &repo).await {
         return resp;
     }
     state
@@ -1074,17 +1099,16 @@ async fn get_npm_root(
 async fn get_npm(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, path)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
         return resp;
     }
-    let auth =
-        match authorize_read(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
-            Ok(auth) => auth,
-            Err(resp) => return resp,
-        };
+    let auth = match authorize_read(&state, &headers, remote_addr(&connect_info), &repo).await {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
     // npm URL-encodes the slash in a scoped name (`@acme%2fwidget`) when
     // requesting a packument, but not when requesting a tarball. Decoding
     // it here makes both spellings address the same package.
@@ -1225,18 +1249,17 @@ struct NpmAttachment<'a> {
 async fn publish_npm(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, path)): Path<(String, String, String)>,
-    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    connect_info: MaybeConnectInfo,
     headers: HeaderMap,
     request: Request,
 ) -> Response {
     if let Err(resp) = validate_repo_path(&repo, &channel) {
         return resp;
     }
-    let auth =
-        match authorize_write(&state, &headers, remote_addr(connect_info.as_ref()), &repo).await {
-            Ok(auth) => auth,
-            Err(resp) => return resp,
-        };
+    let auth = match authorize_write(&state, &headers, remote_addr(&connect_info), &repo).await {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
     if let Err(resp) = reject_traversal(&path) {
         return resp;
     }
