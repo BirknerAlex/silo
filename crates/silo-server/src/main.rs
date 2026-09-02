@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -45,6 +46,11 @@ async fn main() -> anyhow::Result<()> {
     // is much harder to diagnose than one that refuses to boot.
     let signers = Signers::from_config(&config.signing)?;
     let storage = Storage::from_config(&config.storage)?;
+    let upstream_secrets = config
+        .upstream_secret
+        .as_ref()
+        .map(|c| silo_core::secret_box::SecretBox::new(&c.key))
+        .transpose()?;
 
     let db = Db::connect(
         &config
@@ -77,12 +83,26 @@ async fn main() -> anyhow::Result<()> {
             db: db.clone(),
             signers: signers.clone(),
             public_base_url: config.public_base_url.clone(),
+            upstream_index_cache: Default::default(),
         },
         config,
         storage,
         db,
         oidc,
         metrics: Metrics::new()?,
+        upstream_secrets,
+        // A connect timeout on top of every individual `UpstreamHttp`
+        // call's own request timeout (see `upstream.rs`): the request
+        // timeout bounds one fetch, but a client built with
+        // `reqwest::Client::new()`'s defaults has no connect timeout at
+        // all, so a mirror that accepts a TCP connection and then never
+        // sends anything could otherwise hang past that. This is the
+        // client every pull-through request and `maintenance::run_upstream_sync`
+        // share.
+        upstream_http: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .context("could not build the upstream HTTP client")?,
     });
 
     // gRPC and the package-manager HTTP surface share one listener. They

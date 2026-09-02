@@ -22,11 +22,16 @@
 //! HTTP layer resolves any `*.db`/`*.db.tar.{gz,zst,xz}` (and its `.sig`)
 //! request to these fixed objects; see `silo-server`'s pacman route.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 
 use serde_json::json;
 
 use crate::apk::{gzip, parse_pkginfo, tar_bytes};
+use crate::upstream::{
+    UpstreamError, UpstreamFetchOptions, UpstreamHttp, UpstreamIndex, UpstreamPackage,
+};
 use crate::{
     Format, IndexContext, IndexObject, PackageFormat, PackageRecord, ParseError, ParsedPackage,
 };
@@ -368,6 +373,259 @@ impl Compression {
     }
 }
 
+/// Fetches and parses an upstream Arch repository's database, one per
+/// configured architecture — same reasoning as apk's [`crate::apk::ApkUpstream`]:
+/// pacman has no arch-agnostic root index either.
+///
+/// Real pacman repositories name their database after the repo section a
+/// client configures (`core.db.tar.gz`, `extra.db.tar.gz`, ...), which
+/// this module has no independent way to know — so `opts.suite`
+/// (otherwise deb-only) doubles as the database's base name here,
+/// defaulting to `"repo"` when unset.
+pub struct PacmanUpstream;
+
+impl UpstreamIndex for PacmanUpstream {
+    fn format(&self) -> PackageFormat {
+        PackageFormat::Pacman
+    }
+
+    fn fetch_index<'a>(
+        &'a self,
+        http: &'a UpstreamHttp,
+        opts: &'a UpstreamFetchOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UpstreamPackage>, UpstreamError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if opts.arches.is_empty() {
+                return Err(UpstreamError::parse(
+                    "a pacman upstream needs at least one --arch",
+                ));
+            }
+            let db_name = opts.suite.as_deref().unwrap_or("repo");
+            // One database per architecture, fetched concurrently — same
+            // reasoning as apk's fetch_index.
+            let fetched =
+                futures::future::try_join_all(opts.arches.iter().map(|arch| async move {
+                    let path = format!("{arch}/{db_name}.db.tar.gz");
+                    let bytes = http.get(&path).await?;
+                    Ok::<_, UpstreamError>((arch, bytes))
+                }))
+                .await?;
+            let mut out = Vec::new();
+            for (arch, bytes) in fetched {
+                let base = format!("{}/{arch}", http.base_url().trim_end_matches('/'));
+                out.extend(parse_pacman_db_tar_gz(&bytes, &base)?);
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// Parses a fetched `{db}.tar.gz`: one directory per package, each holding
+/// a `desc` file of `%FIELD%\nvalue\n\n` blocks — the exact shape
+/// [`Format::build_index`] renders here, just read instead of written.
+pub fn parse_pacman_db_tar_gz(
+    bytes: &[u8],
+    base_url: &str,
+) -> Result<Vec<UpstreamPackage>, UpstreamError> {
+    let decoder = flate2::bufread::GzDecoder::new(bytes);
+    let inflated = crate::inflate_capped(decoder, crate::MAX_INFLATED_BYTES, "pacman db")
+        .map_err(|e| UpstreamError::parse(e.to_string()))?;
+    let mut archive = tar::Archive::new(inflated.as_slice());
+    let entries = archive
+        .entries()
+        .map_err(|e| UpstreamError::parse(format!("corrupt pacman db tar: {e}")))?;
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|e| UpstreamError::parse(format!("corrupt tar entry: {e}")))?;
+        let path = entry
+            .path()
+            .map_err(|e| UpstreamError::parse(e.to_string()))?
+            .to_string_lossy()
+            .into_owned();
+        if !path.ends_with("/desc") {
+            continue;
+        }
+        let text = crate::read_text_capped(&mut entry, "desc")
+            .map_err(|e| UpstreamError::parse(e.to_string()))?;
+        if let Some(pkg) = parse_desc(&text, base_url) {
+            out.push(pkg);
+        }
+    }
+    Ok(out)
+}
+
+/// Parses one package's `desc` file into an [`UpstreamPackage`], or `None`
+/// if it's missing the fields every real `repo-add`-generated entry has.
+/// `%DESC%`-file key -> the metadata field name [`render_desc`] reads it
+/// back from, and whether it's a multi-value (list) field. Keeping a
+/// synced package's full metadata (not just name/version) means a
+/// synthetic index entry looks the same to a client as a locally
+/// published one, before it's ever actually been fetched.
+const DESC_METADATA_FIELDS: &[(&str, &str, bool)] = &[
+    ("BASE", "pkgbase", false),
+    ("DESC", "description", false),
+    ("URL", "url", false),
+    ("LICENSE", "license", true),
+    ("ISIZE", "isize", false),
+    ("BUILDDATE", "builddate", false),
+    ("PACKAGER", "packager", false),
+    ("DEPENDS", "depends", true),
+    ("MAKEDEPENDS", "makedepends", true),
+    ("CHECKDEPENDS", "checkdepends", true),
+    ("OPTDEPENDS", "optdepends", true),
+    ("PROVIDES", "provides", true),
+    ("CONFLICTS", "conflicts", true),
+    ("REPLACES", "replaces", true),
+    ("GROUPS", "groups", true),
+];
+
+fn parse_desc(text: &str, base_url: &str) -> Option<UpstreamPackage> {
+    let fields = parse_desc_fields(text);
+    let get1 = |k: &str| fields.get(k).and_then(|v| v.first()).cloned();
+
+    let name = get1("NAME")?;
+    let filename = get1("FILENAME")?;
+    let full_version = get1("VERSION")?;
+    let (epoch, version, release) = split_pkgver(&full_version).ok()?;
+    let arch = get1("ARCH")?;
+
+    let mut metadata = serde_json::Map::new();
+    for (desc_key, meta_key, is_list) in DESC_METADATA_FIELDS {
+        let Some(values) = fields.get(*desc_key) else {
+            continue;
+        };
+        let value = if *is_list {
+            json!(values)
+        } else {
+            json!(values.first())
+        };
+        metadata.insert((*meta_key).to_string(), value);
+    }
+
+    Some(UpstreamPackage {
+        name,
+        epoch,
+        version,
+        release,
+        arch,
+        download_url: format!("{}/{filename}", base_url.trim_end_matches('/')),
+        filename,
+        size_bytes: get1("CSIZE").and_then(|s| s.parse().ok()),
+        sha256: get1("SHA256SUM"),
+        metadata: serde_json::Value::Object(metadata),
+    })
+}
+
+/// `%FIELD%\nvalue\n\n` blocks, one blank-line-separated block per field.
+/// A multi-value field (`%LICENSE%`, `%DEPENDS%`, ...) has one value per
+/// line within its block, mirroring [`push_list_field`]'s write side.
+fn parse_desc_fields(text: &str) -> HashMap<String, Vec<String>> {
+    let mut fields = HashMap::new();
+    for block in text.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        let mut lines = block.lines();
+        let Some(key_line) = lines.next() else {
+            continue;
+        };
+        let Some(key) = key_line.strip_prefix('%').and_then(|s| s.strip_suffix('%')) else {
+            continue;
+        };
+        fields.insert(key.to_string(), lines.map(str::to_string).collect());
+    }
+    fields
+}
+
+/// Compares two pacman `pkgver-pkgrel` strings (already epoch-stripped by
+/// the caller, which compares epoch separately — pacman's own vercmp
+/// treats a higher epoch as unconditionally newer regardless of the rest).
+/// Segments alternate numeric/alphabetic the same way rpm's algorithm
+/// does, with `pkgrel` compared last as a plain integer tie-breaker.
+///
+/// A pragmatic subset of `alpm`'s real `vercmp`, covering the common
+/// shapes real `PKGBUILD`s produce; not a byte-for-byte reimplementation
+/// of every corner (e.g. libalpm's specific handling of a lone trailing
+/// `.` or repeated separators).
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a_ver, a_rel) = a.rsplit_once('-').unwrap_or((a, "0"));
+    let (b_ver, b_rel) = b.rsplit_once('-').unwrap_or((b, "0"));
+    // `pkgrel` is conventionally an integer, but makepkg permits a
+    // decimal like `1.1` — `alpm`'s vercmp compares it with the same
+    // segment algorithm as `pkgver`, not as a parsed integer, so `1.1`
+    // and `1.2` don't collapse to equal the way a failed `u64` parse
+    // (falling back to `0` for both) would.
+    compare_alnum_segments(a_ver, b_ver).then_with(|| compare_alnum_segments(a_rel, b_rel))
+}
+
+fn compare_alnum_segments(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let a_parts = split_alnum(a);
+    let b_parts = split_alnum(b);
+    let mut a_iter = a_parts.iter();
+    let mut b_iter = b_parts.iter();
+
+    loop {
+        match (a_iter.next(), b_iter.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                // alpm's vercmp: a numeric segment always outranks an
+                // alphabetic one at the same position (`2.a` < `2.1`),
+                // the same rule rpm's rpmvercmp uses — falling back to a
+                // lexical compare when only one side parses would rank
+                // `2.9` above `2.10a` by first byte instead.
+                let cmp = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    (Ok(_), Err(_)) => Ordering::Greater,
+                    (Err(_), Ok(_)) => Ordering::Less,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if cmp != Ordering::Equal {
+                    return cmp;
+                }
+            }
+        }
+    }
+}
+
+/// Splits a version string into alternating digit/non-digit runs, the
+/// same tokenization `alpm`'s vercmp uses to compare `1.2` against
+/// `1.10` numerically rather than lexically.
+fn split_alnum(v: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut current_is_digit: Option<bool> = None;
+    for c in v.chars() {
+        if !c.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            current_is_digit = None;
+            continue;
+        }
+        let is_digit = c.is_ascii_digit();
+        if current_is_digit == Some(is_digit) || current.is_empty() {
+            current.push(c);
+            current_is_digit = Some(is_digit);
+        } else {
+            parts.push(std::mem::take(&mut current));
+            current.push(c);
+            current_is_digit = Some(is_digit);
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +821,45 @@ mod tests {
         assert_eq!(objects[0].name, DB_OBJECT);
         assert_eq!(objects[1].name, DB_SIG_OBJECT);
         assert_eq!(objects[1].bytes, vec![0xCD; 64]);
+    }
+
+    #[tokio::test]
+    async fn parses_an_upstream_db_round_tripped_through_our_own_renderer() {
+        let records = [record("foo", "1.0"), record("bar", "2.5")];
+        let ctx = IndexContext {
+            repo: "r",
+            channel: "edge",
+            group: "x86_64",
+            records: &records,
+            public_base_url: None,
+            signer: None,
+        };
+        let objects = PacmanFormat.build_index(&ctx).await.unwrap();
+        let db = objects.iter().find(|o| o.name == DB_OBJECT).unwrap();
+
+        let packages = parse_pacman_db_tar_gz(&db.bytes, "https://example.com/x86_64").unwrap();
+        assert_eq!(packages.len(), 2);
+        let foo = packages.iter().find(|p| p.name == "foo").unwrap();
+        assert_eq!(foo.version, "1.0");
+        assert_eq!(foo.release, "1");
+        assert_eq!(foo.arch, "x86_64");
+        assert_eq!(foo.filename, "foo-1.0-1-x86_64.pkg.tar.zst");
+        assert_eq!(
+            foo.download_url,
+            "https://example.com/x86_64/foo-1.0-1-x86_64.pkg.tar.zst"
+        );
+        assert_eq!(foo.sha256.as_deref(), Some("deadbeef"));
+        assert_eq!(foo.metadata["description"], "a test package");
+        assert_eq!(foo.metadata["depends"], json!(["glibc", "zlib"]));
+        assert_eq!(foo.metadata["license"], json!(["MIT", "Apache-2.0"]));
+    }
+
+    #[test]
+    fn version_cmp_orders_numerically_not_lexically() {
+        use std::cmp::Ordering;
+        assert_eq!(version_cmp("1.2-1", "1.10-1"), Ordering::Less);
+        assert_eq!(version_cmp("1.0-1", "1.0-2"), Ordering::Less);
+        assert_eq!(version_cmp("1.0-1", "1.0-1"), Ordering::Equal);
+        assert_eq!(version_cmp("2.0-1", "1.9-9"), Ordering::Greater);
     }
 }

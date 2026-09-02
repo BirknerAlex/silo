@@ -107,6 +107,7 @@ impl Harness {
             metrics: MetricsConfig::default(),
             prune: PruneConfig::default(),
             jobs: JobsConfig::default(),
+            upstream_secret: None,
         };
         tweak(&mut config);
 
@@ -114,19 +115,32 @@ impl Harness {
         // the index contents, and a real bucket would make them slow and
         // order-dependent without covering anything extra.
         let storage = Storage::in_memory();
+        // Derived from `config.signing` (empty unless `tweak` sets it) so
+        // a test that needs a real signer can configure one through the
+        // same `tweak` hook everything else uses, rather than every
+        // signing-aware test hand-rolling its own `AppState`.
+        let signers = Signers::from_config(&config.signing).unwrap_or_default();
 
         let state = Arc::new(AppState {
             publish: PublishContext {
                 storage: storage.clone(),
                 db: db.clone(),
-                signers: Signers::default(),
+                signers,
                 public_base_url: config.public_base_url.clone(),
+                upstream_index_cache: Default::default(),
             },
             config,
             storage,
             db: db.clone(),
             oidc: None,
             metrics: Metrics::new().expect("build metrics"),
+            upstream_secrets: Some(
+                silo_core::secret_box::SecretBox::new(
+                    &silo_core::secret_box::SecretBox::generate_key(),
+                )
+                .expect("build a test upstream secret box"),
+            ),
+            upstream_http: reqwest::Client::new(),
         });
 
         Self { state, db }

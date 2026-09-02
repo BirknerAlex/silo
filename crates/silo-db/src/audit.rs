@@ -40,6 +40,10 @@ pub mod action {
     pub const AUTH_LOGIN: &str = "auth.login";
     pub const AUTH_FAILED: &str = "auth.failed";
     pub const SERVER_BOOTSTRAP: &str = "server.bootstrap";
+    pub const UPSTREAM_ADD: &str = "upstream.add";
+    pub const UPSTREAM_UPDATE: &str = "upstream.update";
+    pub const UPSTREAM_REMOVE: &str = "upstream.remove";
+    pub const UPSTREAM_SYNC: &str = "upstream.sync";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -16,30 +16,38 @@ pub struct PruneRuleRow {
     pub channel: String,
     pub keep_last_n: Option<i32>,
     pub max_age_days: Option<i32>,
+    /// `"all"` | `"local"` | `"upstream"` — see
+    /// `silo_core::prune::OriginFilter`, which parses this column.
+    pub origin_scope: String,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
 
-const COLUMNS: &str = "repo, channel, keep_last_n, max_age_days, created_at, updated_at";
+const COLUMNS: &str =
+    "repo, channel, keep_last_n, max_age_days, origin_scope, created_at, updated_at";
 
 impl Db {
     /// Creates or replaces the rule for `(repo, channel)`. At least one of
     /// `keep_last_n`/`max_age_days` must be `Some` — enforced by a check
     /// constraint, so a caller passing both `None` gets a database error
-    /// rather than a silently-stored no-op rule.
+    /// rather than a silently-stored no-op rule. `origin_scope` is
+    /// `"all"`/`"local"`/`"upstream"`, validated by a check constraint the
+    /// same way.
     pub async fn set_prune_rule(
         &self,
         repo: &str,
         channel: &str,
         keep_last_n: Option<i32>,
         max_age_days: Option<i32>,
+        origin_scope: &str,
     ) -> anyhow::Result<PruneRuleRow> {
         Ok(sqlx::query_as(&format!(
-            "INSERT INTO prune_rules (repo, channel, keep_last_n, max_age_days) \
-             VALUES ($1, $2, $3, $4) \
+            "INSERT INTO prune_rules (repo, channel, keep_last_n, max_age_days, origin_scope) \
+             VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (repo, channel) DO UPDATE SET \
                  keep_last_n = excluded.keep_last_n, \
                  max_age_days = excluded.max_age_days, \
+                 origin_scope = excluded.origin_scope, \
                  updated_at = now() \
              RETURNING {COLUMNS}"
         ))
@@ -47,6 +55,7 @@ impl Db {
         .bind(channel)
         .bind(keep_last_n)
         .bind(max_age_days)
+        .bind(origin_scope)
         .fetch_one(self.pool())
         .await?)
     }
@@ -185,19 +194,21 @@ mod tests {
             return;
         };
         let repo = unique_repo("setrule");
-        db.set_prune_rule(&repo, "stable", Some(5), None)
+        db.set_prune_rule(&repo, "stable", Some(5), None, "all")
             .await
             .unwrap();
         let rule = db.get_prune_rule(&repo, "stable").await.unwrap().unwrap();
         assert_eq!(rule.keep_last_n, Some(5));
         assert_eq!(rule.max_age_days, None);
+        assert_eq!(rule.origin_scope, "all");
 
-        db.set_prune_rule(&repo, "stable", Some(3), Some(90))
+        db.set_prune_rule(&repo, "stable", Some(3), Some(90), "local")
             .await
             .unwrap();
         let rule = db.get_prune_rule(&repo, "stable").await.unwrap().unwrap();
         assert_eq!(rule.keep_last_n, Some(3));
         assert_eq!(rule.max_age_days, Some(90));
+        assert_eq!(rule.origin_scope, "local");
     }
 
     #[tokio::test]
@@ -207,7 +218,7 @@ mod tests {
             return;
         };
         let repo = unique_repo("clearrule");
-        db.set_prune_rule(&repo, "stable", Some(5), None)
+        db.set_prune_rule(&repo, "stable", Some(5), None, "all")
             .await
             .unwrap();
         assert!(db.clear_prune_rule(&repo, "stable").await.unwrap());
@@ -223,7 +234,7 @@ mod tests {
         };
         let repo = unique_repo("norulefields");
         assert!(db
-            .set_prune_rule(&repo, "stable", None, None)
+            .set_prune_rule(&repo, "stable", None, None, "all")
             .await
             .is_err());
     }

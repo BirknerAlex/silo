@@ -18,6 +18,7 @@ pub mod metrics;
 use std::sync::Arc;
 
 use silo_core::oidc::Verifier;
+use silo_core::secret_box::SecretBox;
 use silo_core::{Config, PublishContext, Storage};
 use silo_db::Db;
 
@@ -32,6 +33,14 @@ pub struct AppState {
     /// issuer is a boot failure, not a first-login failure.
     pub oidc: Option<Arc<Verifier>>,
     pub metrics: Metrics,
+    /// `None` unless `upstream_secret` is configured — every upstream
+    /// with a credential requires it, but a server with no credentialed
+    /// upstreams need not carry one.
+    pub upstream_secrets: Option<SecretBox>,
+    /// Shared, pooled client for outbound requests to upstreams — sync
+    /// and pull-through fetches alike, so connections to a frequently-hit
+    /// upstream are reused rather than reopened per request.
+    pub upstream_http: reqwest::Client,
 }
 
 impl AppState {

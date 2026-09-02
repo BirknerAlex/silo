@@ -80,6 +80,11 @@ pub struct PublishContext {
     pub db: Db,
     pub signers: Signers,
     pub public_base_url: Option<String>,
+    /// The opt-in in-memory accelerator for upstreams with
+    /// `cache_index_in_memory` set. Always present (empty until an
+    /// upstream actually opts in) so every `PublishContext` constructor
+    /// doesn't need its own decision about whether to build one.
+    pub upstream_index_cache: std::sync::Arc<crate::upstream_index_cache::UpstreamIndexCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +116,29 @@ pub async fn publish(
     format: PackageFormat,
     bytes: Vec<u8>,
     actor: &Actor,
+) -> anyhow::Result<PublishOutcome> {
+    publish_with_origin(ctx, repo, channel, format, bytes, actor, None).await
+}
+
+/// Identical to [`publish`], except the resulting `packages` row is tagged
+/// with the upstream it was pulled through from.
+///
+/// This is the pull-through cache's only way to persist a fetched
+/// artifact — it is deliberately not a separate "just drop the bytes in
+/// storage" path, so a cache-mode pull-through inherits the exact same
+/// advisory-lock-scoped, DB-driven index regeneration a real publish gets
+/// (see the module doc). That's what makes it safe against racing a
+/// concurrent real publish, or another concurrent pull-through, to the
+/// same index group: both go through one lock, the same way two real
+/// publishes already do.
+pub async fn publish_with_origin(
+    ctx: &PublishContext,
+    repo: &str,
+    channel: &str,
+    format: PackageFormat,
+    bytes: Vec<u8>,
+    actor: &Actor,
+    origin_upstream_id: Option<silo_db::Uuid>,
 ) -> anyhow::Result<PublishOutcome> {
     validate_repo_name("repo", repo)?;
     validate_repo_name("channel", channel)?;
@@ -167,6 +195,7 @@ pub async fn publish(
         metadata,
         published_by_token: actor.token_id,
         published_by_user: actor.user_id,
+        origin_upstream_id,
     };
     packages::upsert(locked.conn(), &new_package).await?;
 
@@ -279,7 +308,17 @@ async fn regenerate_index_locked(
     let mut groups = vec![index_group.to_string()];
     groups.extend(handler.shared_groups(index_group));
     let rows = packages::list_groups(locked.conn(), repo, channel, format, &groups).await?;
-    let records: Vec<silo_pkg::PackageRecord> = rows.iter().map(|r| r.to_record()).collect();
+    let mut records: Vec<silo_pkg::PackageRecord> = rows.iter().map(|r| r.to_record()).collect();
+    merge_upstream_records(
+        ctx,
+        locked,
+        repo,
+        channel,
+        format,
+        index_group,
+        &mut records,
+    )
+    .await?;
 
     let prefix = handler.index_prefix(repo, channel, index_group);
 
@@ -318,6 +357,294 @@ async fn regenerate_index_locked(
     prune_stale_index_objects(ctx, &prefix, &written, &protected).await;
 
     Ok(written)
+}
+
+/// Rebuilds whichever index group(s) an upstream sync just changed the
+/// availability of, so a repo/channel that has *never* had a local
+/// publish still gets a real index a client can fetch.
+///
+/// Without this, [`merge_upstream_records`] would only ever run as a side
+/// effect of some *other* publish landing in the same group — a
+/// pure-mirror repo, published to only through pull-through, would have
+/// no `repodata`/`APKINDEX`/`Release`/`db.tar.gz` at all until then, and
+/// `dnf`/`apk`/`apt`/`pacman` all fetch that whole-index file before ever
+/// asking for one artifact by name. Called after `add-upstream`,
+/// `sync-upstream`, and the periodic sync job.
+///
+/// npm is excluded: it has no eager index to rebuild (see the `silo-pkg`
+/// `npm` module doc) — its packument is rebuilt lazily, per name, on the
+/// first request for it (see `silo-server`'s `get_npm`).
+pub async fn rebuild_index_for_upstream(
+    ctx: &PublishContext,
+    repo: &str,
+    channel: &str,
+    format: PackageFormat,
+    arches: &[String],
+    actor: &Actor,
+) -> anyhow::Result<()> {
+    let groups: Vec<String> = match format {
+        PackageFormat::Rpm | PackageFormat::Deb => vec![String::new()],
+        PackageFormat::Apk | PackageFormat::Pacman => arches.to_vec(),
+        PackageFormat::Npm => Vec::new(),
+    };
+    for group in groups {
+        regenerate_index(ctx, repo, channel, format, &group, actor).await?;
+    }
+    Ok(())
+}
+
+/// Folds every configured upstream's synced index into `records` for
+/// packages this repo/channel/format doesn't already have locally.
+///
+/// This is what makes pull-through visible to a client at all: `dnf`/
+/// `apk`/`apt`/`pacman`/`npm` only ever request a file their already-
+/// downloaded index told them about, so an upstream package has to appear
+/// in the rendered index — pointing at the same storage key a real
+/// publish of it would use — before a request for it can ever reach the
+/// storage-miss path `pull_through` handles. A local row always wins over
+/// an upstream one with the same filename (a cached copy is the same
+/// bytes either way, so there's nothing to prefer).
+async fn merge_upstream_records(
+    ctx: &PublishContext,
+    locked: &mut lock::LockedTx<'_>,
+    repo: &str,
+    channel: &str,
+    format: PackageFormat,
+    index_group: &str,
+    records: &mut Vec<silo_pkg::PackageRecord>,
+) -> anyhow::Result<()> {
+    let upstreams = locked.list_upstreams(repo, channel).await?;
+    if upstreams.iter().all(|u| u.format != format.as_str()) {
+        return Ok(());
+    }
+    let handler = format.handler();
+
+    // Tracks every filename already emitted — local rows up front, then
+    // each synthetic upstream row as it's pushed — so a repo/channel with
+    // several upstreams of the same format (two mirrors of the same
+    // distribution, say) can't advertise the same filename twice.
+    let mut seen_filenames: std::collections::HashSet<String> =
+        records.iter().map(|r| r.filename.clone()).collect();
+
+    // RPM is the one format whose bytes change on capture: signing
+    // rewrites the header, which moves the byte range primary.xml points
+    // at and changes the file's size/checksum (see `index_metadata`'s own
+    // doc). A synthetic entry's checksum is copied from the upstream's
+    // *unsigned* index, so if it were merged in and a client fetched the
+    // index in that window, the checksum dnf just cached would stop
+    // matching the instant a `cache`-mode fetch signs and re-publishes
+    // the real file — a checksum-mismatch dnf reports as corruption, not
+    // staleness. `no_cache` never mutates bytes (nothing is ever
+    // captured), so it isn't affected and keeps merging normally.
+    let rpm_signing_would_invalidate_the_checksum =
+        format == PackageFormat::Rpm && ctx.signers.gpg.is_some();
+
+    for upstream in upstreams.iter().filter(|u| u.format == format.as_str()) {
+        if rpm_signing_would_invalidate_the_checksum && upstream.cache_mode == "cache" {
+            continue;
+        }
+        let synced = upstream_packages_for_locked(ctx, locked, upstream).await?;
+        for row in synced.iter() {
+            if seen_filenames.contains(&row.filename) {
+                continue;
+            }
+            // Every format but rpm/deb partitions its index by
+            // architecture (apk/pacman) or by package name (npm); an
+            // upstream entry only belongs in *this* group's index.
+            // rpm/deb render every architecture into one group (`""`),
+            // so nothing to filter there.
+            //
+            // A noarch/any upstream package has to fold into every
+            // *concrete* architecture's group too, not just its own —
+            // apk-tools and pacman each only ever fetch their own host
+            // architecture's index and never look in a noarch/any tree of
+            // their own accord (see `apk.rs`'s module doc). Local rows
+            // get this for free via `Format::shared_groups` when their
+            // own group is regenerated; a synthetic upstream row needs
+            // the same check applied explicitly, since it never goes
+            // through that regeneration path itself.
+            let belongs = match format {
+                PackageFormat::Apk | PackageFormat::Pacman => {
+                    row.arch == index_group
+                        || handler.shared_groups(index_group).contains(&row.arch)
+                }
+                PackageFormat::Npm => row.name == index_group,
+                PackageFormat::Rpm | PackageFormat::Deb => true,
+            };
+            if !belongs {
+                continue;
+            }
+            // rpm/deb/pacman all render `size_bytes`/`sha256` straight
+            // into a field the client trusts for integrity (repodata's
+            // checksum, `Size:`/`SHA256:`, `CSIZE`/`SHA256SUM`) with no
+            // fallback if it's missing — publishing `0`/`""` there reads
+            // to the client as a hash or size *mismatch*, not as "unknown
+            // yet," so a package that would otherwise just be fetched
+            // fails outright. Better to leave it out of this index
+            // regeneration and pick it up once the values are known (the
+            // next successful sync, or the real fetch on first
+            // download). apk keeps its checksum in `metadata["checksum"]`
+            // instead of this field, and npm only uses `sha256` as a
+            // fallback when the preserved upstream `dist` has none, so
+            // neither is at risk the same way.
+            if matches!(
+                format,
+                PackageFormat::Rpm | PackageFormat::Deb | PackageFormat::Pacman
+            ) && (row.size_bytes.is_none() || row.sha256.is_none())
+            {
+                continue;
+            }
+            seen_filenames.insert(row.filename.clone());
+            records.push(synthetic_record(format, repo, channel, row));
+        }
+    }
+    Ok(())
+}
+
+/// Every synced entry for one upstream, via the opt-in in-memory cache
+/// when the upstream has it enabled, falling through to (and repopulating
+/// from) the database otherwise. Public so `silo-server`'s pull-through
+/// artifact-fetch path reads through the identical cache rather than
+/// keeping a second one.
+pub async fn upstream_packages_for(
+    ctx: &PublishContext,
+    upstream: &silo_db::upstreams::UpstreamRow,
+) -> anyhow::Result<std::sync::Arc<Vec<silo_db::upstreams::UpstreamPackageRow>>> {
+    if let Some(cached) = cached_upstream_packages(ctx, upstream) {
+        return Ok(cached);
+    }
+    let rows = ctx.db.list_all_upstream_packages(upstream.id).await?;
+    Ok(cache_upstream_packages(ctx, upstream, rows))
+}
+
+/// [`upstream_packages_for`], but reading through `locked`'s own
+/// connection on a cache miss instead of taking a second one from the
+/// pool — the difference matters here specifically because the only
+/// caller already holds `locked`'s connection for an index regeneration
+/// it won't release until this returns; see [`lock::LockedTx::list_upstreams`]'s
+/// doc for the pool-exhaustion scenario a second borrowed connection
+/// risks.
+async fn upstream_packages_for_locked(
+    ctx: &PublishContext,
+    locked: &mut lock::LockedTx<'_>,
+    upstream: &silo_db::upstreams::UpstreamRow,
+) -> anyhow::Result<std::sync::Arc<Vec<silo_db::upstreams::UpstreamPackageRow>>> {
+    if let Some(cached) = cached_upstream_packages(ctx, upstream) {
+        return Ok(cached);
+    }
+    let rows = locked.list_all_upstream_packages(upstream.id).await?;
+    Ok(cache_upstream_packages(ctx, upstream, rows))
+}
+
+fn cached_upstream_packages(
+    ctx: &PublishContext,
+    upstream: &silo_db::upstreams::UpstreamRow,
+) -> Option<std::sync::Arc<Vec<silo_db::upstreams::UpstreamPackageRow>>> {
+    if !upstream.cache_index_in_memory {
+        return None;
+    }
+    ctx.upstream_index_cache.get(upstream.id)
+}
+
+fn cache_upstream_packages(
+    ctx: &PublishContext,
+    upstream: &silo_db::upstreams::UpstreamRow,
+    rows: Vec<silo_db::upstreams::UpstreamPackageRow>,
+) -> std::sync::Arc<Vec<silo_db::upstreams::UpstreamPackageRow>> {
+    let rows = std::sync::Arc::new(rows);
+    if upstream.cache_index_in_memory {
+        ctx.upstream_index_cache.put(upstream.id, rows.clone());
+    }
+    rows
+}
+
+/// Builds a [`silo_pkg::PackageRecord`] for an unfetched upstream package,
+/// with a `storage_key` computed the same way a real publish of it would
+/// (via [`Format::storage_key`]) so a client's request for it lands on
+/// exactly the object key [`publish_with_origin`] will eventually write.
+fn synthetic_record(
+    format: PackageFormat,
+    repo: &str,
+    channel: &str,
+    row: &silo_db::upstreams::UpstreamPackageRow,
+) -> silo_pkg::PackageRecord {
+    let pseudo = silo_pkg::ParsedPackage {
+        format,
+        name: row.name.clone(),
+        epoch: row.epoch.max(0) as u32,
+        version: row.version.clone(),
+        release: row.release.clone(),
+        arch: row.arch.clone(),
+        filename: row.filename.clone(),
+        metadata: serde_json::Value::Null,
+        payload: Vec::new(),
+    };
+    let storage_key = format.handler().storage_key(repo, channel, &pseudo);
+
+    silo_pkg::PackageRecord {
+        format,
+        name: row.name.clone(),
+        epoch: row.epoch.max(0) as u32,
+        version: row.version.clone(),
+        release: row.release.clone(),
+        arch: row.arch.clone(),
+        filename: row.filename.clone(),
+        storage_key,
+        size_bytes: row.size_bytes.unwrap_or(0),
+        sha256: row.sha256.clone().unwrap_or_default(),
+        metadata: synthetic_metadata(format, row),
+        published_at: row.synced_at.timestamp(),
+    }
+}
+
+/// Every format's `build_index` reads `record.metadata` for whatever the
+/// index needs beyond the common columns. For a package silo hasn't
+/// fetched yet, only what the upstream's own index stated is known — real
+/// rpm dependency/file-list data, for instance, only exists once the
+/// actual package has been parsed. rpm's `build_index` additionally
+/// *requires* its metadata to deserialize into a full `RepodataEntry`
+/// (see `rpm.rs`), so this fills every field the schema needs with an
+/// empty/zero default rather than the specifics only a real fetch would
+/// reveal — a synthesized rpm entry renders with no dependencies or file
+/// list until it's actually pulled through once.
+fn synthetic_metadata(
+    format: PackageFormat,
+    row: &silo_db::upstreams::UpstreamPackageRow,
+) -> serde_json::Value {
+    match format {
+        PackageFormat::Rpm => serde_json::json!({
+            "name": row.name,
+            "arch": row.arch,
+            "epoch": row.epoch.max(0) as u32,
+            "version": row.version,
+            "release": row.release,
+            "summary": "",
+            "description": "",
+            "packager": "",
+            "url": "",
+            "license": "",
+            "vendor": "",
+            "group": "",
+            "build_host": "",
+            "source_rpm": "",
+            "build_time": 0,
+            "installed_size": 0,
+            "archive_size": row.size_bytes.unwrap_or(0).max(0),
+            "header_start": 0,
+            "header_end": 0,
+            "files": [],
+            "provides": [],
+            "requires": [],
+            "conflicts": [],
+            "obsoletes": [],
+            "recommends": [],
+            "suggests": [],
+            "supplements": [],
+            "enhances": [],
+            "changelogs": [],
+        }),
+        _ => row.metadata.clone(),
+    }
 }
 
 /// Rewrites every group that borrows from `changed`, if `changed` is a

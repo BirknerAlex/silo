@@ -52,6 +52,12 @@ pub struct Config {
 
     #[serde(default)]
     pub jobs: JobsConfig,
+
+    /// Required only once an upstream with a credential is configured —
+    /// see `silo_core::secret_box`. Absent, `add-upstream`/`update-upstream`
+    /// reject any request that sets `auth`.
+    #[serde(default)]
+    pub upstream_secret: Option<UpstreamSecretConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -297,6 +303,12 @@ pub struct JobsConfig {
     pub audit_prune: String,
     #[serde(default)]
     pub package_prune: Option<String>,
+    /// Refreshes every configured upstream's synced index. Opt-in like
+    /// `package_prune`: hitting third-party registries on a schedule
+    /// shouldn't be silently on by default. `add-upstream`/
+    /// `sync-upstream` still sync on demand regardless of this setting.
+    #[serde(default)]
+    pub upstream_sync: Option<String>,
 }
 
 fn default_session_cleanup_schedule() -> String {
@@ -313,8 +325,18 @@ impl Default for JobsConfig {
             session_cleanup: default_session_cleanup_schedule(),
             audit_prune: default_audit_prune_schedule(),
             package_prune: None,
+            upstream_sync: None,
         }
     }
+}
+
+/// The key that encrypts upstream credentials at rest. See
+/// `silo_core::secret_box` — generate one with `SecretBox::generate_key()`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UpstreamSecretConfig {
+    /// 32 raw bytes, base64-encoded. Never stored in the database;
+    /// rotating it invalidates every stored upstream credential.
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -401,6 +423,13 @@ impl Config {
         validate_schedule("jobs.audit_prune", &self.jobs.audit_prune)?;
         if let Some(schedule) = &self.jobs.package_prune {
             validate_schedule("jobs.package_prune", schedule)?;
+        }
+        if let Some(schedule) = &self.jobs.upstream_sync {
+            validate_schedule("jobs.upstream_sync", schedule)?;
+        }
+        if let Some(secret) = &self.upstream_secret {
+            crate::secret_box::SecretBox::new(&secret.key)
+                .map_err(|e| anyhow::anyhow!("`upstream_secret.key` is invalid: {e}"))?;
         }
         Ok(())
     }

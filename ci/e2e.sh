@@ -33,15 +33,20 @@ PROJECT=silo-e2e
 WORK=${WORK:-$ROOT/target/e2e}
 COMPOSE="docker compose -f ci/e2e/docker-compose.yaml -p $PROJECT"
 
-# The host port the stack binds. Deliberately not 8080: a developer
+# The host ports the stack binds. Deliberately not 8080: a developer
 # running this locally very likely has something on that already.
 HTTP_PORT=18190
+# The second silo, standing in for a pull-through cache's upstream — see
+# the "pull-through cache" section below.
+HTTP_PORT_UPSTREAM=18191
 
 # Exported before anything can fail, because the EXIT trap runs
 # `docker compose down` and compose refuses to parse its own file with
 # these unset.
 export SILO_E2E_CONFIG_DIR="$WORK/config"
 export SILO_E2E_HTTP_PORT="$HTTP_PORT"
+export SILO_E2E_UPSTREAM_CONFIG_DIR="$WORK/config-upstream"
+export SILO_E2E_UPSTREAM_HTTP_PORT="$HTTP_PORT_UPSTREAM"
 
 REPO=example
 CHANNEL=stable
@@ -117,6 +122,14 @@ docker run --rm -v "$WORK/keys:/keys" alpine:3.20 sh -c '
 grep -q "BEGIN PGP PRIVATE KEY BLOCK" "$WORK/keys/pacman-gpg-private.asc" \
     || fail "pacman gpg key generation produced no private key"
 ok "pacman OpenPGP keypair"
+
+# The pull-through cache scenario below configures a credentialed
+# upstream, which needs `upstream_secret.key` set on the primary to
+# encrypt it at rest.
+UPSTREAM_SECRET_KEY=$(docker run --rm alpine:3.20 sh -c \
+    'apk add --no-cache openssl >/dev/null 2>&1; openssl rand -base64 32')
+[ -n "$UPSTREAM_SECRET_KEY" ] || fail "upstream secret key generation produced nothing"
+ok "upstream credential encryption key"
 
 # ------------------------------------------------------- example packages
 
@@ -259,6 +272,38 @@ signing:
     key_name: "$APK_KEY_NAME"
   pacman:
     key_path: /etc/silo/pacman-gpg-private.asc
+
+upstream_secret:
+  key: "$UPSTREAM_SECRET_KEY"
+EOF
+
+# The second silo below stands in for a pull-through cache's upstream —
+# see the "pull-through cache" section further down. It never has to be
+# signed or trusted by any client: whatever it serves gets re-published
+# (and, for rpm, re-signed) through the primary the normal way the moment
+# it's actually pulled through.
+mkdir -p "$WORK/config-upstream"
+cat > "$WORK/config-upstream/config.yaml" <<EOF
+addr: "0.0.0.0:8080"
+public_base_url: "http://silo-upstream:8080"
+
+database:
+  url: "postgres://silo:silo@postgres-upstream:5432/silo"
+
+storage:
+  bucket: "silo-upstream"
+  region: "us-east-1"
+  access_key_id: "siloadmin"
+  secret_access_key: "siloadmin"
+  endpoint: "http://seaweedfs:8333"
+  allow_http: true
+
+auth:
+  bootstrap: true
+
+metrics:
+  enabled: true
+  require_auth: false
 EOF
 
 $COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true
@@ -279,6 +324,17 @@ ok "ready"
 # to the build we just made, not a stale image.
 SERVER_VERSION=$(curl -fsS "http://localhost:$HTTP_PORT/version")
 ok "version  $SERVER_VERSION"
+
+log "waiting for the upstream silo to become ready"
+for i in $(seq 1 90); do
+    if curl -fsS "http://localhost:$HTTP_PORT_UPSTREAM/readyz" >/dev/null 2>&1; then break; fi
+    if [ "$i" = 90 ]; then
+        $COMPOSE logs --no-color --tail 50 silo-upstream
+        fail "the upstream silo did not become ready within 90s"
+    fi
+    sleep 1
+done
+ok "ready"
 
 # ---------------------------------------------------------- authenticate
 
@@ -321,6 +377,42 @@ READ_TOKEN=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" silo \
     | tr -d '\r' | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
 [ -n "$READ_TOKEN" ] || fail "read token create produced no token"
 ok "created a read token"
+
+# The upstream silo, authenticated the same way.
+MIRROR_REPO=mirror
+UPSTREAM_BOOTSTRAP_PASSWORD=""
+for _ in $(seq 1 30); do
+    UPSTREAM_BOOTSTRAP_PASSWORD=$($COMPOSE logs --no-color silo-upstream 2>/dev/null \
+        | sed -n 's/.*password: *\([A-Za-z0-9]*\).*/\1/p' | head -1)
+    [ -n "$UPSTREAM_BOOTSTRAP_PASSWORD" ] && break
+    sleep 1
+done
+[ -n "$UPSTREAM_BOOTSTRAP_PASSWORD" ] || fail "could not find the upstream's bootstrap password in its log"
+
+silo_upstream() { $COMPOSE exec -T silo-upstream /usr/local/bin/silo "$@"; }
+
+UPSTREAM_ADMIN_TOKEN=$($COMPOSE exec -T \
+    -e SILO_USERNAME=admin -e "SILO_PASSWORD=$UPSTREAM_BOOTSTRAP_PASSWORD" \
+    silo-upstream /usr/local/bin/silo login --server http://localhost:8080 --print-token 2>/dev/null | tr -d '\r')
+[ -n "$UPSTREAM_ADMIN_TOKEN" ] || fail "login to the upstream silo produced no token"
+ok "logged in to the upstream silo as admin"
+
+UPSTREAM_PUBLISH_TOKEN=$($COMPOSE exec -T -e "SILO_TOKEN=$UPSTREAM_ADMIN_TOKEN" silo-upstream \
+    /usr/local/bin/silo --server http://localhost:8080 \
+    token create --name e2e-mirror-publisher --permission write --repo "$MIRROR_REPO" --json 2>/dev/null \
+    | tr -d '\r' | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
+[ -n "$UPSTREAM_PUBLISH_TOKEN" ] || fail "upstream token create produced no token"
+
+# The credential the primary's upstream config will carry — deliberately
+# real, not a public/anonymous mirror, so this exercises the credentialed
+# pull-through path (silo authenticating outbound with a stored token) end
+# to end, not just the simpler unauthenticated case.
+UPSTREAM_READ_TOKEN=$($COMPOSE exec -T -e "SILO_TOKEN=$UPSTREAM_ADMIN_TOKEN" silo-upstream \
+    /usr/local/bin/silo --server http://localhost:8080 \
+    token create --name e2e-mirror-reader --permission read --repo "$MIRROR_REPO" --json 2>/dev/null \
+    | tr -d '\r' | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
+[ -n "$UPSTREAM_READ_TOKEN" ] || fail "upstream read token create produced no token"
+ok "created write and read tokens scoped to the upstream's $MIRROR_REPO repo"
 
 # -------------------------------------------------------------- publish
 
@@ -386,6 +478,276 @@ verify apk    alpine:3.20      verify-apk.sh
 verify npm    node:22-alpine   verify-npm.sh
 verify pacman archlinux:base   verify-pacman.sh
 verify apt    debian:12        verify-apt.sh
+
+# ---------------------------------------------------- pull-through cache
+
+log "publishing the same packages to the upstream silo, never to the primary"
+
+docker cp "$WORK/packages/." "$($COMPOSE ps -q silo-upstream)":/tmp/packages/ 2>/dev/null \
+    || { $COMPOSE exec -T silo-upstream mkdir -p /tmp/packages; docker cp "$WORK/packages/." "$($COMPOSE ps -q silo-upstream)":/tmp/packages/; }
+
+publish_upstream() {
+    local file=$1
+    $COMPOSE exec -T -e "SILO_TOKEN=$UPSTREAM_PUBLISH_TOKEN" -e SILO_SERVER=http://localhost:8080 silo-upstream \
+        /usr/local/bin/silo publish "/tmp/packages/$file" --repo "$MIRROR_REPO" --channel "$CHANNEL"
+}
+
+publish_upstream "$(basename "$RPM_FILE")" | sed 's/^/    /'
+publish_upstream "$(basename "$APK_FILE")" | sed 's/^/    /'
+publish_upstream "$(basename "$NPM_FILE")" | sed 's/^/    /'
+publish_upstream "$(basename "$PACMAN_FILE")" | sed 's/^/    /'
+publish_upstream "$(basename "$DEB_FILE")" | sed 's/^/    /'
+ok "published all five formats to the upstream silo only"
+
+log "configuring the primary's pull-through upstreams"
+
+# apk and pacman fetch by the client's own architecture, which the build
+# containers above never had to report — determined here the same way the
+# real clients determine it for themselves.
+APK_ARCH=$(docker run --rm alpine:3.20 apk --print-arch)
+PACMAN_ARCH=$(docker run --rm archlinux:base-devel uname -m)
+UPSTREAM_URL="http://silo-upstream:8080/$MIRROR_REPO/$CHANNEL"
+
+add_upstream() {
+    $COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+        /usr/local/bin/silo repo add-upstream "$MIRROR_REPO" --channel "$CHANNEL" "$@"
+}
+
+# `--cache` throughout: the verifiers below need real, primary-signed
+# bytes, which only happens once a package is actually captured (see
+# repo::publish_with_origin) — a `--no-cache` upstream would only ever
+# redirect/proxy the upstream's own unsigned bytes, which apk's and dnf's
+# signature checks would reject. `--bearer-token` exercises the
+# credentialed pull-through path, not just an open mirror.
+add_upstream --name rpm-upstream --format rpm \
+    --url "$UPSTREAM_URL" --cache --bearer-token "$UPSTREAM_READ_TOKEN" | sed 's/^/    /'
+add_upstream --name apk-upstream --format apk \
+    --url "$UPSTREAM_URL/apk" --cache --bearer-token "$UPSTREAM_READ_TOKEN" --arch "$APK_ARCH" | sed 's/^/    /'
+add_upstream --name npm-upstream --format npm \
+    --url "$UPSTREAM_URL/npm" --cache --bearer-token "$UPSTREAM_READ_TOKEN" | sed 's/^/    /'
+add_upstream --name pacman-upstream --format pacman \
+    --url "$UPSTREAM_URL/pacman" --cache --bearer-token "$UPSTREAM_READ_TOKEN" --arch "$PACMAN_ARCH" \
+    --suite db | sed 's/^/    /'
+add_upstream --name deb-upstream --format deb \
+    --url "$UPSTREAM_URL" --cache --bearer-token "$UPSTREAM_READ_TOKEN" \
+    --suite "$CHANNEL" --component main --arch "$DEB_ARCH" | sed 's/^/    /'
+ok "configured 5 pull-through upstreams on the primary, all pointing at the upstream silo"
+
+# A separate write+read token pair, scoped to the *primary's* mirror repo
+# — distinct from the upstream silo's own tokens above, which authenticate
+# the primary *to the upstream*, not a client to the primary.
+MIRROR_PUBLISH_TOKEN=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" silo \
+    /usr/local/bin/silo --server http://localhost:8080 \
+    token create --name e2e-mirror-publisher --permission write --repo "$MIRROR_REPO" --json 2>/dev/null \
+    | tr -d '\r' | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
+MIRROR_READ_TOKEN=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" silo \
+    /usr/local/bin/silo --server http://localhost:8080 \
+    token create --name e2e-mirror-reader --permission read --repo "$MIRROR_REPO" --json 2>/dev/null \
+    | tr -d '\r' | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
+if [ -z "$MIRROR_PUBLISH_TOKEN" ] || [ -z "$MIRROR_READ_TOKEN" ]; then
+    fail "could not create tokens scoped to the primary's $MIRROR_REPO repo"
+fi
+
+$COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+    /usr/local/bin/silo repo set "$MIRROR_REPO" --mode=public | sed 's/^/    /'
+ok "$MIRROR_REPO is public"
+
+# rpm's per-package signature means capturing it through the cache
+# rewrites its bytes (see repo.rs's `merge_upstream_records` doc), so a
+# never-fetched signed-rpm upstream package deliberately does not appear
+# in the index — merging in a checksum that's about to go stale the
+# moment it's actually captured would turn "not cached yet" into a
+# checksum-mismatch error dnf reports as corruption. A real deployment
+# either accepts that `dnf install <name>` only resolves a brand new
+# upstream package from the second sync onward, or pre-warms it exactly
+# like this: one direct fetch by the exact filename, which is enough to
+# capture, sign, and re-index it so the dnf verifier below can then find
+# it the normal, index-driven way.
+curl -fsS -u "x:$MIRROR_READ_TOKEN" \
+    "http://localhost:$HTTP_PORT/$MIRROR_REPO/$CHANNEL/Packages/$(basename "$RPM_FILE")" \
+    -o /dev/null || fail "pre-warming the rpm pull-through cache failed"
+ok "pre-warmed the rpm package (see the comment above for why)"
+
+log "verifying pull-through with real clients"
+
+# Reuses the exact same verifiers as the direct-publish scenario above,
+# pointed at the mirror repo instead — proving pull-through is invisible
+# to the client: the same dnf/apk/npm/pacman/apt commands, against
+# packages that were never published to this server directly, only
+# fetched on demand from a completely separate silo.
+ORIGINAL_REPO=$REPO
+ORIGINAL_READ_TOKEN=$READ_TOKEN
+ORIGINAL_PUBLISH_TOKEN=$PUBLISH_TOKEN
+REPO=$MIRROR_REPO
+READ_TOKEN=$MIRROR_READ_TOKEN
+PUBLISH_TOKEN=$MIRROR_PUBLISH_TOKEN
+
+verify dnf    fedora:41        verify-dnf.sh
+verify apk    alpine:3.20      verify-apk.sh
+verify npm    node:22-alpine   verify-npm.sh
+verify pacman archlinux:base   verify-pacman.sh
+verify apt    debian:12        verify-apt.sh
+
+# The repair section below re-tests the original direct-publish repo, not
+# the mirror — restore what `verify` reads before it runs.
+REPO=$ORIGINAL_REPO
+READ_TOKEN=$ORIGINAL_READ_TOKEN
+PUBLISH_TOKEN=$ORIGINAL_PUBLISH_TOKEN
+
+# ------------------------------------------------- real upstream mirrors
+
+log "pull-through against real, public upstream mirrors (best-effort)"
+
+# Unlike everything above, these are services we don't control — a
+# mirror's downtime, rate-limiting, or a renamed/moved package shouldn't
+# make our own CI flaky. So every check here is independent and logged
+# rather than fatal. What it actually proves that the silo-to-silo
+# scenario above cannot: whether silo's upstream-index parsers handle
+# *real-world* repodata/APKINDEX/Packages/db shapes, not just the ones
+# our own silo-upstream produces — which, being silo too, only proves
+# parsing is self-consistent, not that it's compatible with anything
+# else. `add-upstream` itself is the real test (it fully parses the whole
+# real index to validate); the artifact fetch after it is a bonus check
+# that the redirect path also works against a real host.
+#
+# `--no-cache` throughout: never write a third party's content into our
+# own storage, and (for rpm in particular) never risk the
+# capture-then-resign checksum window `merge_upstream_records` guards
+# against elsewhere in this suite — no-cache never mutates bytes, so
+# there's nothing to guard against here.
+REAL_REPO=real
+REAL_READ_TOKEN=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" silo \
+    /usr/local/bin/silo --server http://localhost:8080 \
+    token create --name e2e-real-reader --permission read --repo "$REAL_REPO" --json 2>/dev/null \
+    | tr -d '\r' | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
+[ -n "$REAL_READ_TOKEN" ] || fail "could not create a token scoped to $REAL_REPO"
+
+real_add_upstream() {
+    $COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+        /usr/local/bin/silo repo add-upstream "$REAL_REPO" --channel stable --no-cache "$@"
+}
+
+# Fetches through the primary and reports ok/skip — never fail() — so an
+# unreachable or reshaped real mirror only costs a warning line.
+real_fetch_check() {
+    local name=$1 url=$2
+    if curl -fsS -u "x:$REAL_READ_TOKEN" "$url" -o /dev/null; then
+        ok "$name (real upstream)"
+    else
+        printf '    \033[33mskip\033[0m  %s: artifact fetch failed (real upstream, not a silo bug per se)\n' "$name"
+    fi
+}
+
+# Every target below is each distro's rolling/always-current branch, not
+# a pinned release — a pinned one eventually gets archived or EOL'd out
+# from under this suite. That also means no package version can be
+# hardcoded: every check below discovers whatever the real index's first
+# entry actually is right now and fetches exactly that, straight from the
+# mirror (not through silo) to build the expected filename, so drift in
+# what a rolling repo currently contains can never break this suite. A
+# discovery step is written to a file rather than streamed straight into
+# a decompressor/`awk`: `awk`'s `exit` after the first match closes the
+# pipe early, and under `set -o pipefail` that turns into a spurious
+# failure of whichever upstream process is still writing to it.
+
+# rpm: Fedora rawhide, the permanent rolling-development alias.
+# $APK_ARCH doubles as Fedora's own architecture name ("x86_64"/
+# "aarch64") — the two ecosystems happen to spell it identically.
+FEDORA_URL="https://dl.fedoraproject.org/pub/fedora/linux/development/rawhide/Everything/$APK_ARCH/os"
+if real_add_upstream --name real-fedora --format rpm --url "$FEDORA_URL" 2>&1 | sed 's/^/    /'; then
+    curl -fsS "$FEDORA_URL/repodata/repomd.xml" -o "$WORK/real-fedora-repomd.xml" 2>/dev/null || true
+    FEDORA_PRIMARY_HREF=""
+    if [ -s "$WORK/real-fedora-repomd.xml" ]; then
+        FEDORA_PRIMARY_HREF=$(grep -A5 '<data type="primary">' "$WORK/real-fedora-repomd.xml" \
+            | grep -o 'href="[^"]*"' | head -1 | sed 's/href="//;s/"$//') || true
+    fi
+    FEDORA_FIRST=""
+    if [ -n "$FEDORA_PRIMARY_HREF" ]; then
+        curl -fsS "$FEDORA_URL/$FEDORA_PRIMARY_HREF" -o "$WORK/real-fedora-primary" 2>/dev/null || true
+        case "$FEDORA_PRIMARY_HREF" in
+            *.xml.gz)  DECOMPRESS="gunzip -c" ;;
+            *.xml.zst) DECOMPRESS="zstd -dc" ;;
+            *) DECOMPRESS="" ;;
+        esac
+        if [ -n "$DECOMPRESS" ] && [ -s "$WORK/real-fedora-primary" ]; then
+            FEDORA_FIRST=$($DECOMPRESS "$WORK/real-fedora-primary" 2>/dev/null \
+                | grep -m1 -o 'href="Packages/[^"]*"' | sed 's/href="//;s/"$//') || true
+        fi
+    fi
+    if [ -n "$FEDORA_FIRST" ]; then
+        real_fetch_check rpm "http://localhost:$HTTP_PORT/$REAL_REPO/stable/Packages/$(basename "$FEDORA_FIRST")"
+    else
+        printf '    \033[33mskip\033[0m  rpm: could not determine a package to fetch from the real index\n'
+    fi
+else
+    printf '    \033[33mskip\033[0m  rpm: could not validate the real Fedora mirror\n'
+fi
+
+# apk: Alpine edge, its own permanent rolling branch.
+if real_add_upstream --name real-alpine --format apk --arch "$APK_ARCH" \
+    --url "https://dl-cdn.alpinelinux.org/alpine/edge/main" \
+    2>&1 | sed 's/^/    /'
+then
+    curl -fsS "https://dl-cdn.alpinelinux.org/alpine/edge/main/$APK_ARCH/APKINDEX.tar.gz" \
+        -o "$WORK/real-alpine-index.tar.gz" 2>/dev/null || true
+    ALPINE_FIRST=""
+    if [ -s "$WORK/real-alpine-index.tar.gz" ]; then
+        ALPINE_FIRST=$(tar -xzO APKINDEX < "$WORK/real-alpine-index.tar.gz" 2>/dev/null \
+            | awk '/^P:/{p=substr($0,3)} /^V:/{print p"-"substr($0,3); exit}') || true
+    fi
+    if [ -n "$ALPINE_FIRST" ]; then
+        real_fetch_check apk \
+            "http://localhost:$HTTP_PORT/$REAL_REPO/stable/apk/$APK_ARCH/$ALPINE_FIRST.apk"
+    else
+        printf '    \033[33mskip\033[0m  apk: could not determine a package to fetch from the real index\n'
+    fi
+else
+    printf '    \033[33mskip\033[0m  apk: could not validate the real Alpine mirror\n'
+fi
+
+# deb: Debian sid (unstable), the permanent rolling alias — unlike
+# "bookworm", it is never itself the thing that gets renamed to
+# "oldstable" and eventually archived off deb.debian.org.
+DEBIAN_URL="https://deb.debian.org/debian"
+if real_add_upstream --name real-debian --format deb --suite sid --component main --arch "$DEB_ARCH" \
+    --url "$DEBIAN_URL" \
+    2>&1 | sed 's/^/    /'
+then
+    curl -fsS "$DEBIAN_URL/dists/sid/main/binary-$DEB_ARCH/Packages.gz" \
+        -o "$WORK/real-debian-packages.gz" 2>/dev/null || true
+    DEBIAN_FIRST=""
+    if [ -s "$WORK/real-debian-packages.gz" ]; then
+        DEBIAN_FIRST=$(gunzip -c "$WORK/real-debian-packages.gz" 2>/dev/null \
+            | awk '/^Filename: / {print $2; exit}') || true
+    fi
+    if [ -n "$DEBIAN_FIRST" ]; then
+        real_fetch_check deb "http://localhost:$HTTP_PORT/$REAL_REPO/stable/pool/$(basename "$DEBIAN_FIRST")"
+    else
+        printf '    \033[33mskip\033[0m  deb: could not determine a package to fetch from the real index\n'
+    fi
+else
+    printf '    \033[33mskip\033[0m  deb: could not validate the real Debian mirror\n'
+fi
+
+# npm: the real, public npmjs.org registry — a registry has no
+# "release"/"rolling" distinction to begin with, and `add-upstream`'s own
+# validation (a real reachability probe against it) is the whole check;
+# there is no package identity to discover or pin here at all.
+if real_add_upstream --name real-npmjs --format npm --url "https://registry.npmjs.org" \
+    2>&1 | sed 's/^/    /'
+then
+    ok "npm (real upstream)"
+else
+    printf '    \033[33mskip\033[0m  npm: could not validate the real npmjs.org registry\n'
+fi
+
+# pacman: deliberately skipped. Arch Linux has no official non-x86_64
+# repository — ARM builds are a separate project (Arch Linux ARM) with a
+# different layout — so there is no single real mirror URL that works
+# regardless of which architecture this suite happens to run on. Its
+# "core" repo is already Arch's own rolling branch (Arch has no other
+# kind), so there would be nothing to change here even if it weren't
+# skipped.
 
 # ---------------------------------------------------------------- repair
 

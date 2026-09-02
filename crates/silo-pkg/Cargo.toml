@@ -22,9 +22,13 @@ zstd = "0.13"
 liblzma = "0.4"
 ar = "0.9"
 chrono.workspace = true
+reqwest = { workspace = true }
+quick-xml.workspace = true
+futures.workspace = true
 
 [features]
 test-util = []
 
 [dev-dependencies]
 tokio = { workspace = true }
+wiremock = "0.6"

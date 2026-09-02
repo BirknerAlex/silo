@@ -232,7 +232,7 @@ mod tests {
         };
         let repo = unique_repo("delempty");
         db.create_repo(&repo, false).await.unwrap();
-        db.set_prune_rule(&repo, "stable", Some(5), None)
+        db.set_prune_rule(&repo, "stable", Some(5), None, "all")
             .await
             .unwrap();
         db.add_prune_exemption(&repo, "stable", "pkg")

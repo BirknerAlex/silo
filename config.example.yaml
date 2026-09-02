@@ -75,13 +75,24 @@ metrics:
 
 # Cron schedules for background jobs (6 fields, seconds first). Every job
 # has a built-in default that preserves silo's historical housekeeping
-# cadence, except `package_prune`, which runs automatically only once you
-# set a schedule for it here — otherwise pruning happens exclusively when
-# `silo prune` is run by hand.
+# cadence, except `package_prune` and `upstream_sync`, which run
+# automatically only once you set a schedule for them here — otherwise
+# pruning/upstream syncing happens exclusively when `silo prune` /
+# `silo repo sync-upstream` is run by hand (an upstream is always synced
+# once, synchronously, when it's first added regardless of this setting).
 # jobs:
 #   session_cleanup: "0 */5 * * * *"
 #   audit_prune: "0 0 * * * *"
 #   package_prune: "0 0 3 * * *"
+#   upstream_sync: "0 0 * * * *"
+
+# Encrypts credentials for pull-through upstreams that need one (see
+# `silo repo add-upstream --basic-auth`/`--bearer-token`). Required only
+# once such an upstream is configured; generate a key with
+# `silo generate-upstream-secret-key` (32 raw bytes, base64). Never stored
+# in the database — rotating it invalidates every stored upstream credential.
+# upstream_secret:
+#   key: "${SILO_UPSTREAM_SECRET_KEY}"
 
 # Optional single sign-on. The CLI runs the device authorization grant
 # directly against the provider, so the server never sees user credentials

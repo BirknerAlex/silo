@@ -24,14 +24,16 @@ use silo_proto::v1::publish_request::Payload;
 use silo_proto::v1::publish_service_client::PublishServiceClient;
 use silo_proto::v1::read_service_client::ReadServiceClient;
 use silo_proto::v1::{
-    ClearPruneRuleRequest, CreateRepoRequest, CreateTokenRequest, CreateUserRequest,
-    DeletePackageRequest, DeleteRepoRequest, DeleteUserRequest, GetAuthInfoRequest,
-    GetPruneRuleRequest, GetVersionRequest, ListPackagesRequest, ListPruneExemptionsRequest,
-    ListReposRequest, ListTokensRequest, ListUsersRequest, LoginOidcRequest, LoginRequest,
-    PackageFormat as ProtoFormat, PublishMetadata, PublishRequest, QueryAuditRequest,
-    RebuildIndexRequest, RepoMode, RevokeTokenRequest, RunPruneRequest, SetPruneExemptionRequest,
-    SetPruneRuleRequest, SetRepoModeRequest, SetUserDisabledRequest, SetUserPasswordRequest,
-    TokenScope, WhoAmIRequest,
+    AddUpstreamRequest, ClearPruneRuleRequest, CreateRepoRequest, CreateTokenRequest,
+    CreateUserRequest, DeletePackageRequest, DeleteRepoRequest, DeleteUserRequest,
+    GetAuthInfoRequest, GetPruneRuleRequest, GetVersionRequest, ListPackagesRequest,
+    ListPruneExemptionsRequest, ListReposRequest, ListTokensRequest, ListUpstreamsRequest,
+    ListUsersRequest, LoginOidcRequest, LoginRequest, OriginScope, PackageFormat as ProtoFormat,
+    PublishMetadata, PublishRequest, QueryAuditRequest, RebuildIndexRequest, RemoveUpstreamRequest,
+    RepoMode, RevokeTokenRequest, RunPruneRequest, SetPruneExemptionRequest, SetPruneRuleRequest,
+    SetRepoModeRequest, SetUserDisabledRequest, SetUserPasswordRequest, SyncUpstreamRequest,
+    TokenScope, UpdateUpstreamRequest, UpstreamAuth, UpstreamCacheMode, UpstreamInfo,
+    WhoAmIRequest,
 };
 use tonic::transport::{Channel, ClientTlsConfig};
 
@@ -114,6 +116,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Generates a fresh key for `upstream_secret.key` in server config —
+    /// the encryption key for pull-through upstream credentials. Purely
+    /// local: talks to no server. Run once per server (or per key
+    /// rotation); rotating invalidates every stored upstream credential.
+    GenerateUpstreamSecretKey,
 }
 
 #[derive(Args)]
@@ -217,6 +224,11 @@ enum RepoCommand {
         /// Remove the rule entirely. Mutually exclusive with the flags above.
         #[arg(long, conflicts_with_all = ["keep_last", "max_age_days"])]
         clear: bool,
+        /// Which packages this rule prunes: "all" (default), "local"
+        /// (only ones published directly), or "upstream" (only ones
+        /// pulled through from a configured upstream).
+        #[arg(long, default_value = "all")]
+        origin: String,
     },
     /// Show the prune rule configured for a repo/channel, if any.
     GetPruneRule {
@@ -241,6 +253,148 @@ enum RepoCommand {
         repo: String,
         #[arg(long)]
         channel: String,
+    },
+    /// Add a pull-through upstream to a repo/channel. Validates and does
+    /// a first sync synchronously; a first sync that fails rejects the
+    /// call and creates nothing. Admin only.
+    AddUpstream {
+        repo: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        name: String,
+        /// rpm, apk, npm, pacman, or deb.
+        #[arg(long)]
+        format: String,
+        #[arg(long)]
+        url: String,
+        /// Persist pulled-through packages in silo's own storage.
+        /// Mutually exclusive with `--no-cache`.
+        #[arg(long, conflicts_with = "no_cache")]
+        cache: bool,
+        /// Never persist; only proxy/redirect. Mutually exclusive with
+        /// `--cache`.
+        #[arg(long, conflicts_with = "cache")]
+        no_cache: bool,
+        /// Also keep an in-memory copy of the synced index for faster
+        /// lookups. Unrelated to `--cache`/`--no-cache`, which govern
+        /// package artifacts, not index metadata.
+        #[arg(long)]
+        cache_index_in_memory: bool,
+        /// `user:password` — mutually exclusive with `--bearer-token`.
+        /// Also readable from `SILO_UPSTREAM_BASIC_AUTH`, which avoids
+        /// putting the credential in shell history or a process listing;
+        /// a value from either source still conflicts with
+        /// `--bearer-token`/`SILO_UPSTREAM_BEARER_TOKEN`.
+        #[arg(
+            long,
+            env = "SILO_UPSTREAM_BASIC_AUTH",
+            hide_env_values = true,
+            conflicts_with = "bearer_token"
+        )]
+        basic_auth: Option<String>,
+        /// Also readable from `SILO_UPSTREAM_BEARER_TOKEN` — see
+        /// `--basic-auth`.
+        #[arg(
+            long,
+            env = "SILO_UPSTREAM_BEARER_TOKEN",
+            hide_env_values = true,
+            conflicts_with = "basic_auth"
+        )]
+        bearer_token: Option<String>,
+        /// apk/pacman/deb: which architectures to sync. Repeat for several.
+        #[arg(long = "arch")]
+        arches: Vec<String>,
+        /// deb only.
+        #[arg(long)]
+        suite: Option<String>,
+        /// deb only. Repeat for several.
+        #[arg(long = "component")]
+        components: Vec<String>,
+    },
+    /// Updates an existing upstream's settings in place. Identity
+    /// (repo/channel/name/format) can't change this way. Admin only.
+    UpdateUpstream {
+        repo: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long, conflicts_with = "no_cache")]
+        cache: bool,
+        #[arg(long, conflicts_with = "cache")]
+        no_cache: bool,
+        #[arg(long, conflicts_with = "no_cache_index_in_memory")]
+        cache_index_in_memory: bool,
+        #[arg(long, conflicts_with = "cache_index_in_memory")]
+        no_cache_index_in_memory: bool,
+        /// Also readable from `SILO_UPSTREAM_BASIC_AUTH` — see
+        /// `add-upstream --basic-auth`. A value from either source still
+        /// conflicts with `--bearer-token`/`SILO_UPSTREAM_BEARER_TOKEN`
+        /// and with `--clear-auth`.
+        #[arg(
+            long,
+            env = "SILO_UPSTREAM_BASIC_AUTH",
+            hide_env_values = true,
+            conflicts_with_all = ["bearer_token", "clear_auth"]
+        )]
+        basic_auth: Option<String>,
+        /// Also readable from `SILO_UPSTREAM_BEARER_TOKEN` — see
+        /// `add-upstream --basic-auth`.
+        #[arg(
+            long,
+            env = "SILO_UPSTREAM_BEARER_TOKEN",
+            hide_env_values = true,
+            conflicts_with_all = ["basic_auth", "clear_auth"]
+        )]
+        bearer_token: Option<String>,
+        /// Removes the stored credential entirely.
+        #[arg(long, conflicts_with_all = ["basic_auth", "bearer_token"])]
+        clear_auth: bool,
+        #[arg(long = "arch")]
+        arches: Vec<String>,
+        #[arg(long)]
+        suite: Option<String>,
+        #[arg(long = "component")]
+        components: Vec<String>,
+        /// Empties the arch list rather than leaving it unchanged — a
+        /// bare `--arch` with nothing after it isn't distinguishable
+        /// from omitting the flag, so clearing needs its own switch.
+        #[arg(long, conflicts_with = "arches")]
+        clear_arches: bool,
+        /// Same as `--clear-arches`, for the component list.
+        #[arg(long, conflicts_with = "components")]
+        clear_components: bool,
+    },
+    /// Removes an upstream. Cached packages it produced keep serving,
+    /// relabeled as local, unless `--prune` is given. Admin only.
+    RemoveUpstream {
+        repo: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Lists the upstreams configured for a repo/channel.
+    ListUpstreams {
+        repo: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-syncs one upstream's index immediately, ignoring the schedule.
+    /// Admin only.
+    SyncUpstream {
+        repo: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        name: String,
     },
 }
 
@@ -398,6 +552,10 @@ async fn main() -> anyhow::Result<()> {
                 json,
             )
             .await
+        }
+        Command::GenerateUpstreamSecretKey => {
+            println!("{}", silo_core::secret_box::SecretBox::generate_key());
+            Ok(())
         }
     }
 }
@@ -948,6 +1106,7 @@ async fn cmd_list(config_path: &str, server: Option<&str>, args: ListArgs) -> an
                     "size_bytes": p.size_bytes,
                     "sha256": p.sha256,
                     "published_at": p.published_at,
+                    "origin": package_origin(&p.origin_upstream),
                 })
             })
             .collect();
@@ -962,6 +1121,7 @@ async fn cmd_list(config_path: &str, server: Option<&str>, args: ListArgs) -> an
         "ARCH",
         "SIZE",
         "PUBLISHED",
+        "ORIGIN",
     ]);
     for pkg in &response.packages {
         let version = if pkg.release.is_empty() {
@@ -977,10 +1137,19 @@ async fn cmd_list(config_path: &str, server: Option<&str>, args: ListArgs) -> an
             dash_if_empty(&pkg.arch),
             fmt_bytes(pkg.size_bytes),
             timestamp(pkg.published_at),
+            package_origin(&pkg.origin_upstream),
         ]);
     }
     table.print(&format!("no packages in {}/{}", args.repo, args.channel));
     Ok(())
+}
+
+fn package_origin(origin_upstream: &str) -> String {
+    if origin_upstream.is_empty() {
+        "local".to_string()
+    } else {
+        format!("upstream:{origin_upstream}")
+    }
 }
 
 async fn cmd_repos(config_path: &str, server: Option<&str>, json: bool) -> anyhow::Result<()> {
@@ -1095,6 +1264,7 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
             keep_last,
             max_age_days,
             clear,
+            origin,
         } => {
             if clear {
                 let response = client
@@ -1116,6 +1286,14 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
                     "at least one of --keep-last or --max-age-days is required (or pass --clear)"
                 );
             }
+            let origin_scope = match origin.to_ascii_lowercase().as_str() {
+                "all" => OriginScope::All,
+                "local" => OriginScope::Local,
+                "upstream" => OriginScope::Upstream,
+                other => {
+                    anyhow::bail!("--origin must be `all`, `local`, or `upstream`, got `{other}`")
+                }
+            };
             let response = client
                 .set_prune_rule(with_auth(
                     SetPruneRuleRequest {
@@ -1123,6 +1301,7 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
                         channel,
                         keep_last_n: keep_last,
                         max_age_days,
+                        origin_scope: origin_scope as i32,
                     },
                     &session.token,
                 )?)
@@ -1183,8 +1362,266 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
                 }
             }
         }
+        RepoCommand::AddUpstream {
+            repo,
+            channel,
+            name,
+            format,
+            url,
+            cache,
+            no_cache,
+            cache_index_in_memory,
+            basic_auth,
+            bearer_token,
+            arches,
+            suite,
+            components,
+        } => {
+            if !cache && !no_cache {
+                anyhow::bail!("one of --cache or --no-cache is required");
+            }
+            let cache_mode = if cache {
+                UpstreamCacheMode::Cache
+            } else {
+                UpstreamCacheMode::NoCache
+            };
+            let format = to_proto_format(parse_format(&format)?);
+            let auth = build_upstream_auth(basic_auth, bearer_token)?;
+
+            let response = client
+                .add_upstream(with_auth(
+                    AddUpstreamRequest {
+                        repo,
+                        channel,
+                        name,
+                        format: format as i32,
+                        base_url: url,
+                        cache_mode: cache_mode as i32,
+                        cache_index_in_memory,
+                        auth,
+                        arches,
+                        suite: suite.unwrap_or_default(),
+                        components,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            print_upstream(response.upstream.as_ref());
+        }
+        RepoCommand::UpdateUpstream {
+            repo,
+            channel,
+            name,
+            url,
+            cache,
+            no_cache,
+            cache_index_in_memory,
+            no_cache_index_in_memory,
+            basic_auth,
+            bearer_token,
+            clear_auth,
+            arches,
+            suite,
+            components,
+            clear_arches,
+            clear_components,
+        } => {
+            let cache_mode = match (cache, no_cache) {
+                (true, false) => Some(UpstreamCacheMode::Cache as i32),
+                (false, true) => Some(UpstreamCacheMode::NoCache as i32),
+                _ => None,
+            };
+            let cache_index_in_memory = match (cache_index_in_memory, no_cache_index_in_memory) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            };
+            let auth = if clear_auth {
+                Some(UpstreamAuth {
+                    kind: String::new(),
+                    username: String::new(),
+                    secret: String::new(),
+                })
+            } else {
+                build_upstream_auth(basic_auth, bearer_token)?
+            };
+
+            let response = client
+                .update_upstream(with_auth(
+                    UpdateUpstreamRequest {
+                        repo,
+                        channel,
+                        name,
+                        base_url: url,
+                        cache_mode,
+                        cache_index_in_memory,
+                        auth,
+                        arches,
+                        suite,
+                        components,
+                        clear_arches,
+                        clear_components,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            print_upstream(response.upstream.as_ref());
+        }
+        RepoCommand::RemoveUpstream {
+            repo,
+            channel,
+            name,
+            prune,
+        } => {
+            let response = client
+                .remove_upstream(with_auth(
+                    RemoveUpstreamRequest {
+                        repo,
+                        channel,
+                        name,
+                        prune,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            println!(
+                "removed: {} ({} package(s) pruned)",
+                response.removed, response.packages_pruned
+            );
+        }
+        RepoCommand::ListUpstreams {
+            repo,
+            channel,
+            json,
+        } => {
+            let response = client
+                .list_upstreams(with_auth(
+                    ListUpstreamsRequest { repo, channel },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            if json {
+                let upstreams: Vec<_> = response
+                    .upstreams
+                    .iter()
+                    .map(|u| {
+                        json!({
+                            "id": u.id,
+                            "name": u.name,
+                            "format": format_name(u.format),
+                            "base_url": u.base_url,
+                            "cache_mode": upstream_cache_mode_name(u.cache_mode),
+                            "cache_index_in_memory": u.cache_index_in_memory,
+                            "auth_configured": u.auth_configured,
+                            "status": u.status,
+                            "last_sync_at": u.last_sync_at,
+                            "last_sync_error": u.last_sync_error,
+                        })
+                    })
+                    .collect();
+                return print_json(&json!(upstreams));
+            }
+            let mut table = Table::new(&[
+                "NAME",
+                "FORMAT",
+                "BASE_URL",
+                "CACHE",
+                "AUTH",
+                "STATUS",
+                "LAST_SYNC",
+            ]);
+            for u in &response.upstreams {
+                table.row(vec![
+                    u.name.clone(),
+                    format_name(u.format),
+                    u.base_url.clone(),
+                    upstream_cache_mode_name(u.cache_mode).to_string(),
+                    u.auth_configured.to_string(),
+                    u.status.clone(),
+                    timestamp(u.last_sync_at),
+                ]);
+            }
+            table.print("no upstreams configured");
+        }
+        RepoCommand::SyncUpstream {
+            repo,
+            channel,
+            name,
+        } => {
+            let response = client
+                .sync_upstream(with_auth(
+                    SyncUpstreamRequest {
+                        repo,
+                        channel,
+                        name,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            println!("synced {} package(s)", response.packages_synced);
+            print_upstream(response.upstream.as_ref());
+        }
     }
     Ok(())
+}
+
+/// `user:password` or a bearer token into the wire shape `AddUpstream`/
+/// `UpdateUpstream` expect. `None` for both means "no auth given".
+fn build_upstream_auth(
+    basic_auth: Option<String>,
+    bearer_token: Option<String>,
+) -> anyhow::Result<Option<UpstreamAuth>> {
+    if let Some(basic) = basic_auth {
+        let (username, secret) = basic
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("--basic-auth must be `user:password`"))?;
+        return Ok(Some(UpstreamAuth {
+            kind: "basic".to_string(),
+            username: username.to_string(),
+            secret: secret.to_string(),
+        }));
+    }
+    if let Some(token) = bearer_token {
+        return Ok(Some(UpstreamAuth {
+            kind: "bearer".to_string(),
+            username: String::new(),
+            secret: token,
+        }));
+    }
+    Ok(None)
+}
+
+fn upstream_cache_mode_name(value: i32) -> &'static str {
+    match UpstreamCacheMode::try_from(value).unwrap_or(UpstreamCacheMode::Unspecified) {
+        UpstreamCacheMode::Cache => "cache",
+        UpstreamCacheMode::NoCache => "no_cache",
+        UpstreamCacheMode::Unspecified => "-",
+    }
+}
+
+fn print_upstream(upstream: Option<&UpstreamInfo>) {
+    let Some(u) = upstream else {
+        println!("no such upstream");
+        return;
+    };
+    println!("{}/{}/{}", u.repo, u.channel, u.name);
+    println!("  format:      {}", format_name(u.format));
+    println!("  base_url:    {}", u.base_url);
+    println!("  cache_mode:  {}", upstream_cache_mode_name(u.cache_mode));
+    println!("  index cache: {}", u.cache_index_in_memory);
+    println!(
+        "  auth:        {}",
+        if u.auth_configured { "configured" } else { "-" }
+    );
+    println!("  status:      {}", u.status);
+    if !u.last_sync_error.is_empty() {
+        println!("  last error:  {}", u.last_sync_error);
+    }
 }
 
 fn print_prune_rule(rule: Option<&silo_proto::v1::PruneRule>) {
@@ -1201,6 +1638,15 @@ fn print_prune_rule(rule: Option<&silo_proto::v1::PruneRule>) {
         "  max_age_days: {}",
         rule.max_age_days.map_or("-".into(), |n| n.to_string())
     );
+    println!("  origin:       {}", origin_scope_name(rule.origin_scope));
+}
+
+fn origin_scope_name(value: i32) -> &'static str {
+    match OriginScope::try_from(value).unwrap_or(OriginScope::Unspecified) {
+        OriginScope::Local => "local",
+        OriginScope::Upstream => "upstream",
+        OriginScope::All | OriginScope::Unspecified => "all",
+    }
 }
 
 async fn cmd_delete(config_path: &str, server: Option<&str>, id: i64) -> anyhow::Result<()> {

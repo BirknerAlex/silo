@@ -74,6 +74,32 @@ impl<'a> LockedTx<'a> {
         &mut self.tx
     }
 
+    /// [`crate::upstreams::list_upstreams`] over this transaction's own
+    /// connection, rather than a second one taken from the pool. A caller
+    /// already holding this lock's connection for the rest of an index
+    /// regeneration would otherwise hold one pooled connection idle while
+    /// waiting on the pool for a second — harmless until enough
+    /// concurrent regenerations do it at once to exhaust the pool, at
+    /// which point every one of them is stuck holding a connection the
+    /// others need.
+    pub async fn list_upstreams(
+        &mut self,
+        repo: &str,
+        channel: &str,
+    ) -> anyhow::Result<Vec<crate::upstreams::UpstreamRow>> {
+        crate::upstreams::list_upstreams(self.conn(), repo, channel).await
+    }
+
+    /// [`crate::upstreams::list_all_upstream_packages`] over this
+    /// transaction's own connection — see [`Self::list_upstreams`] for
+    /// why.
+    pub async fn list_all_upstream_packages(
+        &mut self,
+        upstream_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::upstreams::UpstreamPackageRow>> {
+        crate::upstreams::list_all_upstream_packages(self.conn(), upstream_id).await
+    }
+
     pub async fn commit(self) -> anyhow::Result<()> {
         self.tx.commit().await?;
         Ok(())
