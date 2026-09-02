@@ -178,8 +178,17 @@ impl GpgSigner {
 
         // `&*key` derefs the signed key down to the primary secret key,
         // which is what implements the signing trait.
+        //
+        // `pgp`'s signing API is generic over `rsa::rand_core`'s `Rng` /
+        // `CryptoRng` (rand_core 0.6, pulled in transitively via `pgp`
+        // itself), which predates the `rand` 0.10 traits this crate uses
+        // elsewhere — the two `rand_core` major versions are distinct
+        // traits, so `rand::rng()` doesn't satisfy this bound. `OsRng`
+        // implements the old traits unconditionally, so borrowing it
+        // through `rsa`'s re-export sidesteps needing a second direct
+        // `rand` dependency just for these calls.
         DetachedSignature::sign_binary_data(
-            rand::thread_rng(),
+            rsa::rand_core::OsRng,
             &*key,
             &password,
             HashAlgorithm::Sha256,
@@ -210,7 +219,7 @@ impl GpgSigner {
     /// folded into one clearsigned document.
     fn clearsign_text(&self, text: &str) -> anyhow::Result<String> {
         let (key, password) = self.secret_key_and_password()?;
-        CleartextSignedMessage::sign(rand::thread_rng(), text, &*key, &password)
+        CleartextSignedMessage::sign(rsa::rand_core::OsRng, text, &*key, &password)
             .map_err(|e| anyhow::anyhow!("failed to clearsign: {e}"))?
             .to_armored_string(Default::default())
             .map_err(|e| anyhow::anyhow!("failed to armor the clearsigned message: {e}"))
