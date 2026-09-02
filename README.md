@@ -6,7 +6,9 @@ Self-hosted package registry for **RPM**, **Alpine APK**, **npm**,
 **pacman** (Arch Linux), and **Debian** (`apt`). Publish over gRPC; `dnf`,
 `apk`, `npm`, `pacman` and `apt` consume the results as real repositories
 over plain HTTP. Packages live in S3-compatible object storage, everything
-else lives in Postgres.
+else lives in Postgres. A repo/channel can also pull through one or more
+upstream registries per format, optionally caching what it fetches, so it
+doubles as a local mirror in front of the public registries.
 
 <br clear="left"/>
 

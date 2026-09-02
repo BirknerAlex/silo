@@ -14,6 +14,7 @@
 //! stored bytes, the packument is stored with [`BASE_URL_PLACEHOLDER`] and
 //! the HTTP layer substitutes the real base at serve time.
 
+use std::future::Future;
 use std::pin::Pin;
 
 use base64::Engine;
@@ -21,6 +22,9 @@ use serde_json::{json, Map, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha512};
 
+use crate::upstream::{
+    UpstreamError, UpstreamFetchOptions, UpstreamHttp, UpstreamIndex, UpstreamPackage,
+};
 use crate::{Format, IndexContext, IndexObject, PackageFormat, ParseError, ParsedPackage};
 
 pub struct NpmFormat;
@@ -354,6 +358,158 @@ fn read_package_json(bytes: &[u8]) -> Result<Map<String, Value>, ParseError> {
     ))
 }
 
+/// npm has no endpoint that lists every package a registry holds — unlike
+/// the other four formats, its upstream index cannot be pre-enumerated.
+/// `fetch_index` therefore does a best-effort reachability probe of the
+/// registry root only (still real validation for `add-upstream`, per the
+/// user's explicit ask that npm keep *some* on-add check even without
+/// eager enumeration) and returns no entries; the periodic sync job does
+/// the same probe-only check on npm upstreams. Per-name version data is
+/// populated lazily, on the pull-through request path, via
+/// [`fetch_package_versions`].
+pub struct NpmUpstream;
+
+impl UpstreamIndex for NpmUpstream {
+    fn format(&self) -> PackageFormat {
+        PackageFormat::Npm
+    }
+
+    fn fetch_index<'a>(
+        &'a self,
+        http: &'a UpstreamHttp,
+        _opts: &'a UpstreamFetchOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<UpstreamPackage>, UpstreamError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            probe_registry_root(http).await?;
+            Ok(Vec::new())
+        })
+    }
+}
+
+/// Fetches the registry root and confirms it looks like an npm registry —
+/// a JSON object response. Real npm/Verdaccio/Artifactory registries all
+/// serve *some* JSON document at `/`; a 404 or an HTML error page fails
+/// this, which is the point: it catches "this URL isn't an npm registry
+/// at all" at `add-upstream` time rather than on the first install.
+async fn probe_registry_root(http: &UpstreamHttp) -> Result<(), UpstreamError> {
+    let bytes = http.get("").await?;
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::Object(_)) => Ok(()),
+        Ok(_) | Err(_) => Err(UpstreamError::parse(
+            "registry root did not return a JSON object; is this an npm registry?",
+        )),
+    }
+}
+
+/// Fetches and parses one package's packument
+/// (`GET {base}/{name}`), the lazy per-name path npm's pull-through and
+/// sync use in place of a wholesale index fetch.
+pub async fn fetch_package_versions(
+    http: &UpstreamHttp,
+    name: &str,
+) -> Result<Vec<UpstreamPackage>, UpstreamError> {
+    let bytes = http.get(name).await?;
+    parse_packument(&bytes, name)
+}
+
+/// Parses a fetched packument document into normalized upstream packages,
+/// one per published version. Pure and separately testable from the
+/// network fetch, the same split every other format's upstream parser
+/// follows.
+pub fn parse_packument(
+    bytes: &[u8],
+    expected_name: &str,
+) -> Result<Vec<UpstreamPackage>, UpstreamError> {
+    let doc: Value = serde_json::from_slice(bytes)
+        .map_err(|e| UpstreamError::parse(format!("invalid packument JSON: {e}")))?;
+    let name = doc
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(expected_name)
+        .to_string();
+    let Some(versions) = doc.get("versions").and_then(Value::as_object) else {
+        return Err(UpstreamError::parse("packument has no `versions` object"));
+    };
+
+    let mut out = Vec::new();
+    for (version, entry) in versions {
+        let dist = entry.get("dist");
+        let Some(tarball) = dist.and_then(|d| d.get("tarball")).and_then(Value::as_str) else {
+            // A version entry with no tarball URL can't be fetched; skip
+            // rather than fail the whole packument over one bad entry.
+            continue;
+        };
+        let size_bytes = entry
+            .get("dist")
+            .and_then(|d| d.get("unpackedSize"))
+            .and_then(Value::as_i64);
+
+        out.push(UpstreamPackage {
+            name: name.clone(),
+            epoch: 0,
+            version: version.clone(),
+            release: String::new(),
+            arch: "any".to_string(),
+            filename: tarball_filename(&name, version),
+            download_url: tarball.to_string(),
+            size_bytes,
+            sha256: None,
+            // The whole version entry, not just `dist.{shasum,integrity}`
+            // — `packument_entry` uses this as the base object for the
+            // rendered packument's `versions[x.y.z]`, unconditionally
+            // overwriting `dist.tarball` with our own placeholder-based
+            // URL, so keeping the rest (license, description,
+            // dependencies, ...) here is what makes a synthetic entry
+            // indistinguishable from a locally published one.
+            metadata: entry.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Picks the version to install when a consumer asks for `name` with no
+/// version pin — npm's own `dist-tags.latest`, falling back to the
+/// highest stable semver [`latest_version`] would compute locally if the
+/// packument carries no tag (a malformed or unusual registry).
+pub fn latest_upstream_version(bytes: &[u8]) -> Option<String> {
+    let doc: Value = serde_json::from_slice(bytes).ok()?;
+    if let Some(tag) = doc
+        .get("dist-tags")
+        .and_then(|t| t.get("latest"))
+        .and_then(Value::as_str)
+    {
+        return Some(tag.to_string());
+    }
+    let versions = doc.get("versions").and_then(Value::as_object)?;
+    let parsed: Vec<semver::Version> = versions
+        .keys()
+        .filter_map(|v| semver::Version::parse(v).ok())
+        .collect();
+    parsed
+        .iter()
+        .filter(|v| v.pre.is_empty())
+        .max()
+        .or_else(|| parsed.iter().max())
+        .map(|v| v.to_string())
+}
+
+/// Compares two npm version strings via semver — the ecosystem's own
+/// ordering, already a workspace dependency and already relied on by
+/// [`latest_version`] above, so there is no separate hand-rolled
+/// comparator to get subtly wrong the way rpm/apk/pacman/deb each need
+/// one built from scratch.
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (semver::Version::parse(a), semver::Version::parse(b)) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        // An unparseable version can't be compared meaningfully; treat it
+        // as never newer, rather than panicking or silently picking one.
+        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+        (Err(_), Err(_)) => a.cmp(b),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +660,146 @@ mod tests {
             doc["versions"]["1.0.0"]["dist"]["tarball"],
             "https://silo.example.com/r/c/npm/widget/-/widget-1.0.0.tgz"
         );
+    }
+
+    #[test]
+    fn parses_a_real_shaped_packument_into_upstream_packages() {
+        let packument = json!({
+            "name": "widget",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "widget",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://registry.example.com/widget/-/widget-1.0.0.tgz",
+                        "shasum": "abc123",
+                        "integrity": "sha512-xyz",
+                        "unpackedSize": 4096,
+                    },
+                },
+                "2.0.0": {
+                    "name": "widget",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://registry.example.com/widget/-/widget-2.0.0.tgz",
+                        "shasum": "def456",
+                    },
+                },
+            },
+        });
+        let bytes = serde_json::to_vec(&packument).unwrap();
+        let packages = parse_packument(&bytes, "widget").unwrap();
+        assert_eq!(packages.len(), 2);
+        let v1 = packages.iter().find(|p| p.version == "1.0.0").unwrap();
+        assert_eq!(
+            v1.download_url,
+            "https://registry.example.com/widget/-/widget-1.0.0.tgz"
+        );
+        assert_eq!(v1.filename, "widget-1.0.0.tgz");
+        assert_eq!(v1.size_bytes, Some(4096));
+        // The whole version entry rides along in `metadata`, not just the
+        // dist checksum fields — this is what lets a synthetic packument
+        // entry carry license/description/dependencies through, the same
+        // as a locally published one.
+        assert_eq!(v1.metadata["dist"]["shasum"], "abc123");
+        assert_eq!(v1.metadata["name"], "widget");
+    }
+
+    #[test]
+    fn parse_packument_preserves_manifest_fields_beyond_dist() {
+        let packument = json!({
+            "name": "widget",
+            "versions": {
+                "1.0.0": {
+                    "name": "widget",
+                    "version": "1.0.0",
+                    "license": "MIT",
+                    "description": "a lovely widget",
+                    "dependencies": { "leftpad": "^1.0.0" },
+                    "dist": {
+                        "tarball": "https://registry.example.com/widget/-/widget-1.0.0.tgz",
+                        "shasum": "abc123",
+                    },
+                },
+            },
+        });
+        let bytes = serde_json::to_vec(&packument).unwrap();
+        let packages = parse_packument(&bytes, "widget").unwrap();
+        assert_eq!(packages[0].metadata["license"], "MIT");
+        assert_eq!(packages[0].metadata["description"], "a lovely widget");
+        assert_eq!(packages[0].metadata["dependencies"]["leftpad"], "^1.0.0");
+
+        // Rendering it through the same packument-entry logic a real
+        // publish uses must not leak the upstream's own tarball URL.
+        let doc = render_packument(
+            "r",
+            "c",
+            "widget",
+            &[crate::PackageRecord {
+                format: PackageFormat::Npm,
+                name: "widget".into(),
+                epoch: 0,
+                version: "1.0.0".into(),
+                release: String::new(),
+                arch: "any".into(),
+                filename: "widget-1.0.0.tgz".into(),
+                storage_key: "r/c/npm/widget/-/widget-1.0.0.tgz".into(),
+                size_bytes: 42,
+                sha256: "abc".into(),
+                metadata: packages[0].metadata.clone(),
+                published_at: 0,
+            }],
+        );
+        let tarball = doc["versions"]["1.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !tarball.contains("registry.example.com"),
+            "the upstream's own tarball URL must not survive rendering: {tarball}"
+        );
+        assert_eq!(doc["versions"]["1.0.0"]["license"], "MIT");
+    }
+
+    #[test]
+    fn a_version_entry_with_no_tarball_is_skipped_not_fatal() {
+        let packument = json!({
+            "name": "widget",
+            "versions": {
+                "1.0.0": { "name": "widget", "version": "1.0.0" },
+                "2.0.0": {
+                    "name": "widget",
+                    "version": "2.0.0",
+                    "dist": { "tarball": "https://registry.example.com/widget/-/widget-2.0.0.tgz" },
+                },
+            },
+        });
+        let bytes = serde_json::to_vec(&packument).unwrap();
+        let packages = parse_packument(&bytes, "widget").unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].version, "2.0.0");
+    }
+
+    #[test]
+    fn rejects_a_document_with_no_versions_object() {
+        let bytes = serde_json::to_vec(&json!({ "name": "widget" })).unwrap();
+        assert!(parse_packument(&bytes, "widget").is_err());
+    }
+
+    #[test]
+    fn picks_out_the_latest_dist_tag() {
+        let bytes = serde_json::to_vec(&json!({ "dist-tags": { "latest": "3.2.1" } })).unwrap();
+        assert_eq!(latest_upstream_version(&bytes), Some("3.2.1".to_string()));
+        assert_eq!(latest_upstream_version(b"not json"), None);
+    }
+
+    #[test]
+    fn version_cmp_orders_semver_and_treats_unparseable_as_never_newer() {
+        use std::cmp::Ordering;
+        assert_eq!(version_cmp("1.0.0", "1.0.1"), Ordering::Less);
+        assert_eq!(version_cmp("2.0.0", "1.9.9"), Ordering::Greater);
+        assert_eq!(version_cmp("1.0.0-beta", "1.0.0"), Ordering::Less);
+        assert_eq!(version_cmp("garbage", "1.0.0"), Ordering::Less);
+        assert_eq!(version_cmp("1.0.0", "garbage"), Ordering::Greater);
     }
 }

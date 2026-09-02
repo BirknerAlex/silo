@@ -50,6 +50,23 @@ service AdminService {
   // Runs pruning immediately, ignoring the schedule. Empty repo/channel
   // runs every configured rule. Requires `prune.enabled` in server config.
   rpc RunPrune(RunPruneRequest) returns (RunPruneResponse);
+
+  // Adds a pull-through upstream to a repo/channel. Validates and does a
+  // first sync synchronously — a first sync that fails rejects the call
+  // and creates nothing.
+  rpc AddUpstream(AddUpstreamRequest) returns (AddUpstreamResponse);
+  // Changes an existing upstream's settings in place (cache mode, index
+  // cache toggle, auth, arches/suite/components). Identity
+  // (repo/channel/name/format) can't be changed this way — add a new one
+  // instead.
+  rpc UpdateUpstream(UpdateUpstreamRequest) returns (UpdateUpstreamResponse);
+  // Removes an upstream. Cached packages it produced keep serving,
+  // relabeled as local, unless `prune` is set — then they're deleted
+  // first, the same way a manual delete is.
+  rpc RemoveUpstream(RemoveUpstreamRequest) returns (RemoveUpstreamResponse);
+  rpc ListUpstreams(ListUpstreamsRequest) returns (ListUpstreamsResponse);
+  // Re-syncs one upstream's index immediately, ignoring the schedule.
+  rpc SyncUpstream(SyncUpstreamRequest) returns (SyncUpstreamResponse);
 }
 
 // Which repos a token may act on.
@@ -248,6 +265,15 @@ message DeleteRepoResponse {
   int32 packages_deleted = 1;
 }
 
+// Which packages a prune rule considers. Unspecified is treated as ALL,
+// so existing callers that don't set this keep today's behavior exactly.
+enum OriginScope {
+  ORIGIN_SCOPE_UNSPECIFIED = 0;
+  ORIGIN_SCOPE_ALL = 1;
+  ORIGIN_SCOPE_LOCAL = 2;
+  ORIGIN_SCOPE_UPSTREAM = 3;
+}
+
 message PruneRule {
   string repo = 1;
   string channel = 2;
@@ -256,6 +282,7 @@ message PruneRule {
   optional int32 keep_last_n = 3;
   optional int32 max_age_days = 4;
   int64 updated_at = 5;
+  OriginScope origin_scope = 6;
 }
 
 message SetPruneRuleRequest {
@@ -264,6 +291,7 @@ message SetPruneRuleRequest {
   // At least one of these is required.
   optional int32 keep_last_n = 3;
   optional int32 max_age_days = 4;
+  OriginScope origin_scope = 5;
 }
 
 message SetPruneRuleResponse {
@@ -341,4 +369,128 @@ message PruneCandidate {
   int64 published_at = 11;
   // "keep_last_n", "max_age", or both.
   repeated string matched_rules = 12;
+}
+
+// Whether a pulled-through package's bytes are stored in silo's own
+// backend (CACHE) or only ever proxied/redirected through (NO_CACHE).
+enum UpstreamCacheMode {
+  UPSTREAM_CACHE_MODE_UNSPECIFIED = 0;
+  UPSTREAM_CACHE_MODE_CACHE = 1;
+  UPSTREAM_CACHE_MODE_NO_CACHE = 2;
+}
+
+// A credential silo authenticates to the upstream with. Never echoed
+// back by any read RPC — `UpstreamInfo.auth_configured` is the only
+// trace of it a client ever sees again.
+message UpstreamAuth {
+  // "basic" or "bearer".
+  string kind = 1;
+  // Basic only.
+  string username = 2;
+  string secret = 3;
+}
+
+message UpstreamInfo {
+  string id = 1;
+  string repo = 2;
+  string channel = 3;
+  string name = 4;
+  PackageFormat format = 5;
+  string base_url = 6;
+  UpstreamCacheMode cache_mode = 7;
+  bool cache_index_in_memory = 8;
+  repeated string arches = 9;
+  string suite = 10;
+  repeated string components = 11;
+  // Never the secret itself.
+  bool auth_configured = 12;
+  // "pending", "ok", or "error".
+  string status = 13;
+  int64 last_sync_at = 14;
+  string last_sync_error = 15;
+  int64 last_success_at = 16;
+}
+
+message AddUpstreamRequest {
+  string repo = 1;
+  string channel = 2;
+  string name = 3;
+  PackageFormat format = 4;
+  string base_url = 5;
+  UpstreamCacheMode cache_mode = 6;
+  bool cache_index_in_memory = 7;
+  optional UpstreamAuth auth = 8;
+  // apk/pacman: which architectures to sync. deb: also its per-arch
+  // `Packages` axis.
+  repeated string arches = 9;
+  // deb only.
+  string suite = 10;
+  // deb only.
+  repeated string components = 11;
+}
+
+message AddUpstreamResponse {
+  UpstreamInfo upstream = 1;
+}
+
+message UpdateUpstreamRequest {
+  string repo = 1;
+  string channel = 2;
+  string name = 3;
+  optional string base_url = 4;
+  optional UpstreamCacheMode cache_mode = 5;
+  optional bool cache_index_in_memory = 6;
+  // Unset leaves the stored credential untouched. To clear it, set `auth`
+  // with an empty `kind`.
+  optional UpstreamAuth auth = 7;
+  // Empty leaves the stored arches/components untouched, matching every
+  // other field's "unset means unchanged" convention — which also means
+  // there's no way to distinguish "leave as is" from "clear the list"
+  // through the field alone. `clear_arches`/`clear_components` cover
+  // that: set one to explicitly empty the corresponding list instead
+  // (mutually exclusive with also providing a non-empty replacement).
+  repeated string arches = 8;
+  optional string suite = 9;
+  repeated string components = 10;
+  bool clear_arches = 11;
+  bool clear_components = 12;
+}
+
+message UpdateUpstreamResponse {
+  UpstreamInfo upstream = 1;
+}
+
+message RemoveUpstreamRequest {
+  string repo = 1;
+  string channel = 2;
+  string name = 3;
+  // Deletes packages that came from this upstream, through the normal
+  // delete-package path, before removing the upstream itself. Without
+  // this, they keep serving, relabeled as local.
+  bool prune = 4;
+}
+
+message RemoveUpstreamResponse {
+  bool removed = 1;
+  int32 packages_pruned = 2;
+}
+
+message ListUpstreamsRequest {
+  string repo = 1;
+  string channel = 2;
+}
+
+message ListUpstreamsResponse {
+  repeated UpstreamInfo upstreams = 1;
+}
+
+message SyncUpstreamRequest {
+  string repo = 1;
+  string channel = 2;
+  string name = 3;
+}
+
+message SyncUpstreamResponse {
+  UpstreamInfo upstream = 1;
+  int32 packages_synced = 2;
 }

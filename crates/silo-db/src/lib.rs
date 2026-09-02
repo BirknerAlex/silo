@@ -17,6 +17,7 @@ pub mod packages;
 pub mod prune;
 pub mod repos;
 pub mod tokens;
+pub mod upstreams;
 pub mod users;
 
 use std::time::Duration;

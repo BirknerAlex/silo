@@ -1,9 +1,13 @@
 pub mod config;
 pub mod oidc;
 pub mod prune;
+pub mod pull_through;
 pub mod repo;
+pub mod secret_box;
 pub mod signing;
 pub mod storage;
+pub mod upstream_index_cache;
+pub mod upstream_sync;
 pub mod version;
 
 pub use config::Config;

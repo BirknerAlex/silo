@@ -100,6 +100,11 @@ fn build_jobs(config: &silo_core::Config) -> Vec<Job> {
             config.jobs.package_prune.as_deref(),
             |state| Box::pin(async move { run_package_prune(&state).await }),
         ),
+        Job::new(
+            "upstream_sync",
+            config.jobs.upstream_sync.as_deref(),
+            |state| Box::pin(async move { run_upstream_sync(&state).await }),
+        ),
     ]
 }
 
@@ -119,6 +124,10 @@ async fn refresh_inventory(state: &AppState) {
             state.metrics.database_up.set(0);
             tracing::warn!(error = %e, "failed to refresh inventory metrics");
         }
+    }
+    match state.db.upstream_package_counts().await {
+        Ok(counts) => state.metrics.refresh_upstream_inventory(&counts),
+        Err(e) => tracing::warn!(error = %e, "failed to refresh upstream inventory metrics"),
     }
 }
 
@@ -178,6 +187,82 @@ async fn run_package_prune(state: &AppState) {
             }
         }
         Err(e) => tracing::warn!(error = %e, "scheduled package prune failed"),
+    }
+}
+
+/// Bounded concurrency for how many upstreams sync at once — protects a
+/// server with many configured upstreams from hammering all of them (and
+/// itself) in the same tick. Not (yet) configurable; a fixed, conservative
+/// default until real deployments show it needs to be.
+const UPSTREAM_SYNC_CONCURRENCY: usize = 4;
+
+/// Refreshes every configured upstream's synced index. One upstream's
+/// failure is recorded on its own row and logged, never aborting the
+/// batch — see `upstream_sync::sync_one`.
+async fn run_upstream_sync(state: &AppState) {
+    use futures::StreamExt;
+
+    let upstreams = match state.db.list_all_upstreams().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to list upstreams for scheduled sync");
+            return;
+        }
+    };
+    if upstreams.is_empty() {
+        return;
+    }
+
+    let results: Vec<(String, String, anyhow::Result<usize>)> = futures::stream::iter(upstreams)
+        .map(|upstream| async move {
+            let started = std::time::Instant::now();
+            let result = silo_core::upstream_sync::sync_one(
+                &state.db,
+                state.upstream_http.clone(),
+                state.upstream_secrets.as_ref(),
+                &upstream,
+            )
+            .await;
+            state.publish.upstream_index_cache.invalidate(upstream.id);
+            if result.is_ok() {
+                if let Ok(format) = upstream.format.parse::<silo_pkg::PackageFormat>() {
+                    if let Err(e) = silo_core::repo::rebuild_index_for_upstream(
+                        &state.publish,
+                        &upstream.repo,
+                        &upstream.channel,
+                        format,
+                        &upstream.arches,
+                        &silo_db::audit::Actor::system(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            upstream = %upstream.name, error = %e,
+                            "failed to rebuild the index after a scheduled upstream sync"
+                        );
+                    }
+                }
+            }
+            state.metrics.record_upstream_sync(
+                &upstream.format,
+                result.is_ok(),
+                started.elapsed().as_secs_f64(),
+            );
+            (upstream.name.clone(), upstream.format.clone(), result)
+        })
+        .buffer_unordered(UPSTREAM_SYNC_CONCURRENCY)
+        .collect()
+        .await;
+
+    for (name, format, result) in results {
+        match result {
+            Ok(count) => {
+                tracing::info!(upstream = %name, format = %format, packages = count, "synced upstream index")
+            }
+            Err(e) => {
+                tracing::warn!(upstream = %name, format = %format, error = %e, "upstream sync failed")
+            }
+        }
     }
 }
 

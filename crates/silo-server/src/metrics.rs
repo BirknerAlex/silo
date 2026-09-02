@@ -29,6 +29,12 @@ pub struct Metrics {
     pub packages: IntGaugeVec,
     pub package_bytes: IntGaugeVec,
     pub database_up: IntGauge,
+    pub upstream_syncs: IntCounterVec,
+    pub upstream_sync_duration: HistogramVec,
+    pub upstream_packages_synced: IntGaugeVec,
+    pub pull_through: IntCounterVec,
+    pub pull_through_fetch_duration: HistogramVec,
+    pub upstream_fetch_errors: IntCounterVec,
 }
 
 impl Metrics {
@@ -94,6 +100,52 @@ impl Metrics {
         )?;
         let database_up = IntGauge::new("database_up", "1 when the last database ping succeeded")?;
 
+        let upstream_syncs = IntCounterVec::new(
+            Opts::new(
+                "upstream_syncs_total",
+                "Upstream index syncs attempted, by format and outcome",
+            ),
+            &["format", "result"],
+        )?;
+        let upstream_sync_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "upstream_sync_duration_seconds",
+                "Time to fetch and store one upstream's index",
+            )
+            // A large mirror's sync can run minutes, not seconds — wider
+            // than `publish_duration`'s buckets for the same reason.
+            .buckets(vec![0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0]),
+            &["format"],
+        )?;
+        let upstream_packages_synced = IntGaugeVec::new(
+            Opts::new(
+                "upstream_packages_synced",
+                "Rows currently cached in this upstream's synced index",
+            ),
+            &["repo", "channel", "name"],
+        )?;
+        let pull_through = IntCounterVec::new(
+            Opts::new(
+                "pull_through_total",
+                "Pull-through decisions made serving a package request, by format and action",
+            ),
+            &["format", "action"],
+        )?;
+        let pull_through_fetch_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "pull_through_fetch_duration_seconds",
+                "Latency of the outbound fetch-from-upstream leg of a pull-through request",
+            ),
+            &["format"],
+        )?;
+        let upstream_fetch_errors = IntCounterVec::new(
+            Opts::new(
+                "upstream_fetch_errors_total",
+                "Outbound upstream fetches that failed, by format and reason",
+            ),
+            &["format", "reason"],
+        )?;
+
         registry.register(Box::new(http_requests.clone()))?;
         registry.register(Box::new(grpc_requests.clone()))?;
         registry.register(Box::new(publishes.clone()))?;
@@ -104,6 +156,12 @@ impl Metrics {
         registry.register(Box::new(packages.clone()))?;
         registry.register(Box::new(package_bytes.clone()))?;
         registry.register(Box::new(database_up.clone()))?;
+        registry.register(Box::new(upstream_syncs.clone()))?;
+        registry.register(Box::new(upstream_sync_duration.clone()))?;
+        registry.register(Box::new(upstream_packages_synced.clone()))?;
+        registry.register(Box::new(pull_through.clone()))?;
+        registry.register(Box::new(pull_through_fetch_duration.clone()))?;
+        registry.register(Box::new(upstream_fetch_errors.clone()))?;
 
         Ok(Self {
             registry,
@@ -117,7 +175,24 @@ impl Metrics {
             packages,
             package_bytes,
             database_up,
+            upstream_syncs,
+            upstream_sync_duration,
+            upstream_packages_synced,
+            pull_through,
+            pull_through_fetch_duration,
+            upstream_fetch_errors,
         })
+    }
+
+    pub fn record_upstream_sync(&self, format: &str, ok: bool, seconds: f64) {
+        self.upstream_syncs
+            .with_label_values(&[format, if ok { "ok" } else { "error" }])
+            .inc();
+        if ok {
+            self.upstream_sync_duration
+                .with_label_values(&[format])
+                .observe(seconds);
+        }
     }
 
     pub fn render(&self) -> anyhow::Result<(String, Vec<u8>)> {
@@ -154,6 +229,19 @@ impl Metrics {
             self.package_bytes
                 .with_label_values(&labels)
                 .set(summary.total_bytes);
+        }
+    }
+
+    /// Republishes `upstream_packages_synced` from the database, the same
+    /// reset-then-repopulate shape [`Self::refresh_inventory`] uses so an
+    /// upstream that's been removed stops reporting a stale count instead
+    /// of freezing at its final value forever.
+    pub fn refresh_upstream_inventory(&self, counts: &[(String, String, String, i64)]) {
+        self.upstream_packages_synced.reset();
+        for (repo, channel, name, count) in counts {
+            self.upstream_packages_synced
+                .with_label_values(&[repo.as_str(), channel.as_str(), name.as_str()])
+                .set(*count);
         }
     }
 
