@@ -26,9 +26,9 @@ repository = "https://github.com/BirknerAlex/silo"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-tonic = { version = "0.12", features = ["tls-webpki-roots"] }
-tonic-build = "0.12"
-prost = "0.13"
+tonic = { version = "0.14", features = ["tls-webpki-roots"] }
+tonic-build = "0.14"
+prost = "0.14"
 prost-types = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
