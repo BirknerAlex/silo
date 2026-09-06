@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.12.0](https://github.com/BirknerAlex/silo/compare/v0.11.0...v0.12.0) (2026-09-06)
+
+
+### Features
+
+* **actions:** add reusable publish action for silo CLI ([580ab40](https://github.com/BirknerAlex/silo/commit/580ab405118d91a6deaa562c8c955ef38bec4583))
+
+
+### Bug fixes
+
+* **server:** adapt to axum 0.8's path syntax and extractor changes ([0d9236b](https://github.com/BirknerAlex/silo/commit/0d9236b94c05ed5c53dfd5ea447a47b7ef9119c5))
+* update rand 0.10 call sites ([921bf7f](https://github.com/BirknerAlex/silo/commit/921bf7fa7a5c2895575283d0f203dedd7c54f5ea))
+
 ## [0.11.0](https://github.com/BirknerAlex/silo/compare/v0.10.0...v0.11.0) (2026-09-02)
 
 
