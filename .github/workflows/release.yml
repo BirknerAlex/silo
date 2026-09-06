@@ -233,18 +233,49 @@ jobs:
           path: publisher
 
       - name: extract the publisher binary
-        run: tar -xzf publisher/silo-*-x86_64-unknown-linux-musl.tar.gz -C publisher --strip-components=1
-
-      - name: publish to silo
-        env:
-          SILO_SERVER: ${{ vars.SILO_SERVER }}
-          SILO_TOKEN: ${{ secrets.SILO_TOKEN }}
         run: |
+          tar -xzf publisher/silo-*-x86_64-unknown-linux-musl.tar.gz -C publisher --strip-components=1
           chmod +x publisher/silo
-          for f in out/*.deb; do publisher/silo publish "$f" --repo silo --channel deb; done
-          for f in out/*.rpm; do publisher/silo publish "$f" --repo silo --channel rpm; done
-          for f in out/*.apk; do publisher/silo publish "$f" --repo silo --channel apk; done
-          for f in out/*.pkg.tar.zst; do publisher/silo publish "$f" --repo silo --channel pacman; done
+          # Puts the binary this job already built on PATH, so the
+          # publish action below reuses it instead of re-downloading the
+          # same release asset it just uploaded.
+          echo "$PWD/publisher" >> "$GITHUB_PATH"
+
+      - name: publish deb packages
+        uses: ./.github/actions/publish
+        with:
+          server: ${{ vars.SILO_SERVER }}
+          token: ${{ secrets.SILO_TOKEN }}
+          repo: silo
+          channel: deb
+          files: out/*.deb
+
+      - name: publish rpm packages
+        uses: ./.github/actions/publish
+        with:
+          server: ${{ vars.SILO_SERVER }}
+          token: ${{ secrets.SILO_TOKEN }}
+          repo: silo
+          channel: rpm
+          files: out/*.rpm
+
+      - name: publish apk packages
+        uses: ./.github/actions/publish
+        with:
+          server: ${{ vars.SILO_SERVER }}
+          token: ${{ secrets.SILO_TOKEN }}
+          repo: silo
+          channel: apk
+          files: out/*.apk
+
+      - name: publish pacman packages
+        uses: ./.github/actions/publish
+        with:
+          server: ${{ vars.SILO_SERVER }}
+          token: ${{ secrets.SILO_TOKEN }}
+          repo: silo
+          channel: pacman
+          files: out/*.pkg.tar.zst
 
   image-binaries:
     name: image binaries (${{ matrix.arch }})
