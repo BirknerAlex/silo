@@ -43,6 +43,25 @@ silo list --repo myrepo --channel stable
 The format is inferred from the file extension; pass `--format` to be
 explicit.
 
+## Publishing from CI
+
+Any repository can publish to a silo instance with the reusable action in
+this repo — it installs the matching `silo` CLI release and runs
+`publish`, so callers don't hand-roll that themselves:
+
+```yaml
+- uses: BirknerAlex/silo/.github/actions/publish@main
+  with:
+    server: https://silo.example.com
+    token: ${{ secrets.SILO_TOKEN }}
+    repo: myrepo
+    channel: stable
+    files: dist/*.tgz
+```
+
+`files` accepts multiple globs, one per line. Pin to a tag (e.g. `@v0.10.0`)
+instead of `@main` for a stable, reviewable dependency.
+
 ## Documentation
 
 The [wiki](https://github.com/BirknerAlex/silo/wiki) has the full docs:

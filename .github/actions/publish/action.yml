@@ -1,0 +1,145 @@
+name: silo-publish
+description: >-
+  Publish one or more packages to a silo instance, installing the silo
+  CLI first unless one is already on PATH. For use in any repository's
+  CI, not just this one.
+author: silo
+
+inputs:
+  server:
+    description: URL of the silo server to publish to (e.g. https://silo.example.com).
+    required: true
+  token:
+    description: Silo API token with publish access, e.g. from `silo login --print-token`.
+    required: true
+  repo:
+    description: Name of the silo repo to publish into.
+    required: true
+  channel:
+    description: Channel within the repo to publish into.
+    required: true
+  files:
+    description: >-
+      Newline- or space-separated glob(s) of package files to publish.
+      The format is inferred per-file from its extension unless `format`
+      is set.
+    required: true
+  format:
+    description: >-
+      Package format to force for every file (rpm, apk, npm, pacman,
+      deb). Leave unset to infer per-file from the extension, which is
+      right for a mixed-format glob.
+    required: false
+    default: ""
+  version:
+    description: >-
+      silo CLI release tag to install (e.g. v0.10.0). Defaults to the
+      latest release.
+    required: false
+    default: latest
+
+runs:
+  using: composite
+  steps:
+    # A caller that already put a `silo` on PATH — our own release job
+    # publishing the binary it just built, or a self-hosted runner with
+    # the CLI preinstalled — gets to use it as-is. Only true when no
+    # specific version was requested: a pinned `version` always means
+    # "fetch exactly this one".
+    - name: check for an existing silo CLI
+      id: existing
+      shell: bash
+      run: |
+        found=false
+        if [ "${{ inputs.version }}" = "latest" ] && command -v silo >/dev/null 2>&1; then
+          found=true
+        fi
+        echo "found=$found" >> "$GITHUB_OUTPUT"
+
+    - name: resolve version
+      id: resolve-version
+      if: steps.existing.outputs.found != 'true'
+      shell: bash
+      run: |
+        version="${{ inputs.version }}"
+        if [ "$version" = "latest" ]; then
+          # Read the tag off the redirect target rather than the GitHub
+          # API, so this has no rate limit and needs no token.
+          location=$(curl -sI https://github.com/BirknerAlex/silo/releases/latest | grep -i '^location:' | tr -d '\r')
+          version="${location##*/}"
+        fi
+        if [ -z "$version" ]; then
+          echo "::error::could not resolve the latest silo release; pass 'version' explicitly"
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: resolve target triple
+      id: resolve-target
+      if: steps.existing.outputs.found != 'true'
+      shell: bash
+      run: |
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64) target=x86_64-unknown-linux-musl ;;
+          Linux-ARM64) target=aarch64-unknown-linux-musl ;;
+          macOS-X64) target=x86_64-apple-darwin ;;
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          Windows-X64) target=x86_64-pc-windows-msvc ;;
+          *)
+            echo "::error::no silo CLI release for ${{ runner.os }}/${{ runner.arch }}"
+            exit 1
+            ;;
+        esac
+        echo "target=$target" >> "$GITHUB_OUTPUT"
+
+    - name: install the silo CLI
+      if: steps.existing.outputs.found != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve-version.outputs.version }}
+        TARGET: ${{ steps.resolve-target.outputs.target }}
+      run: |
+        dir="${{ runner.temp }}/silo-cli"
+        mkdir -p "$dir"
+        asset="silo-$VERSION-$TARGET.tar.gz"
+        url="https://github.com/BirknerAlex/silo/releases/download/$VERSION/$asset"
+        curl -sSL --fail -o "$dir/$asset" "$url"
+        tar -C "$dir" -xzf "$dir/$asset" --strip-components=1
+        chmod +x "$dir/silo" 2>/dev/null || true
+        echo "$dir" >> "$GITHUB_PATH"
+
+    - name: publish
+      shell: bash
+      env:
+        SILO_SERVER: ${{ inputs.server }}
+        SILO_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repo }}
+        CHANNEL: ${{ inputs.channel }}
+        FORMAT: ${{ inputs.format }}
+        FILES: ${{ inputs.files }}
+      run: |
+        shopt -s nullglob
+        format_args=()
+        [ -n "$FORMAT" ] && format_args=(--format "$FORMAT")
+
+        published_any=false
+        # Word-split FILES on newlines/spaces so callers can pass either
+        # a single glob or a multi-line list of globs.
+        while IFS= read -r pattern; do
+          [ -z "$pattern" ] && continue
+          matches=($pattern)
+          if [ ${#matches[@]} -eq 0 ]; then
+            echo "::error::no files matched '$pattern'"
+            exit 1
+          fi
+          for f in "${matches[@]}"; do
+            echo "publishing $f"
+            silo publish "$f" --repo "$REPO" --channel "$CHANNEL" "${format_args[@]}"
+            published_any=true
+          done
+        done <<< "$FILES"
+
+        if [ "$published_any" = false ]; then
+          echo "::error::'files' matched nothing"
+          exit 1
+        fi
