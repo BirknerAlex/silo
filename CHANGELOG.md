@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/BirknerAlex/silo/compare/v0.12.0...v0.12.1) (2026-09-07)
+
+
+### Bug fixes
+
+* **pacman:** dedupe repo database to one entry per package name ([a6b8cc9](https://github.com/BirknerAlex/silo/commit/a6b8cc96eb2c20ff0359a00f5520fb0261f87997))
+
 ## [0.12.0](https://github.com/BirknerAlex/silo/compare/v0.11.0...v0.12.0) (2026-09-06)
 
 
