@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.2](https://github.com/BirknerAlex/silo/compare/v0.13.1...v0.13.2) (2026-09-07)
+
+
+### Bug fixes
+
+* **pull-through:** surface a transient npm upstream failure as a retryable 502, not a permanent 404 ([98d5138](https://github.com/BirknerAlex/silo/commit/98d51386166464c2658b881fe9eef7662595dcf6))
+
 ## [0.13.1](https://github.com/BirknerAlex/silo/compare/v0.13.0...v0.13.1) (2026-09-07)
 
 
