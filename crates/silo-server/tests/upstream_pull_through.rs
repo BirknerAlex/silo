@@ -1306,3 +1306,128 @@ async fn the_npm_registry_root_answers_with_and_without_a_trailing_slash() {
     .await;
     assert_eq!(miss.status(), axum::http::StatusCode::NOT_FOUND);
 }
+
+/// Regression: a packument miss used to collapse every upstream failure —
+/// a genuine "this name doesn't exist" 404 from the upstream, and a
+/// transient network error, a 5xx, a 429, a malformed body — into the same
+/// flat 404 response. That's wrong for the transient case: npm, bun, and
+/// yarn all retry a 5xx but treat a 404 as permanent, so under load (many
+/// concurrent installs, an upstream rate-limiting or briefly failing) a
+/// package that really does exist gets permanently dropped from the
+/// install instead of retried. A confirmed-absent 404 from the upstream
+/// itself must still surface as an ordinary 404 to the client.
+#[tokio::test]
+async fn a_transient_upstream_failure_surfaces_as_a_retryable_502_not_a_permanent_404() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npmtransient");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "db_name": "registry" })),
+        )
+        .mount(&mock)
+        .await;
+    // Simulates a rate-limited/overloaded upstream — not "this package
+    // doesn't exist", which is a 404, but "try again".
+    Mock::given(method("GET"))
+        .and(path("/flaky-package"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock)
+        .await;
+
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "npmjs".into(),
+                format: silo_proto::v1::PackageFormat::Npm as i32,
+                base_url: mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec![],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add_upstream");
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    let response = get(&harness.state, &format!("/{repo}/stable/npm/flaky-package")).await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::BAD_GATEWAY,
+        "a transient upstream failure must be retryable (502), not a permanent 404"
+    );
+}
+
+/// The flip side of
+/// `a_transient_upstream_failure_surfaces_as_a_retryable_502_not_a_permanent_404`:
+/// when the upstream itself confirms the name doesn't exist (a real 404),
+/// that must still reach the client as an ordinary, permanent 404 — not a
+/// 502, which would make every client retry a package that will never
+/// exist.
+#[tokio::test]
+async fn an_upstream_confirmed_404_still_surfaces_as_an_ordinary_404() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npmconfirmed404");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "db_name": "registry" })),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/does-not-exist-upstream"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": "Not found"
+        })))
+        .mount(&mock)
+        .await;
+
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "npmjs".into(),
+                format: silo_proto::v1::PackageFormat::Npm as i32,
+                base_url: mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec![],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add_upstream");
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    let response = get(
+        &harness.state,
+        &format!("/{repo}/stable/npm/does-not-exist-upstream"),
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+}
