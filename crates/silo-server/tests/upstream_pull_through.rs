@@ -14,7 +14,7 @@ mod common;
 use common::{unique_repo, Harness};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use silo_pkg::testutil::build_test_apk;
+use silo_pkg::testutil::{build_test_apk, build_test_npm};
 use silo_pkg::{Format, PackageFormat};
 use silo_proto::v1::admin_service_server::AdminService;
 use silo_proto::v1::{
@@ -1430,4 +1430,100 @@ async fn an_upstream_confirmed_404_still_surfaces_as_an_ordinary_404() {
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+/// Regression: unlike the other four formats (whose whole index is synced
+/// eagerly — see `pull_through_miss`'s doc), npm's `upstream_packages`
+/// index is only ever populated lazily, by a request hitting the
+/// packument route. A client that already knows a package's exact
+/// name+version+integrity from its own lockfile is fully entitled, by the
+/// npm registry protocol, to skip the packument fetch entirely and go
+/// straight for the tarball URL it can construct itself — real clients
+/// (npm, bun, yarn, pnpm) do exactly this for already-resolved
+/// dependencies. Before this fix, that tarball request would 404 forever,
+/// because nothing had ever triggered the lazy sync that only the
+/// packument route knew how to do. The tarball route must fall back to
+/// that same lazy sync when it finds nothing indexed, exactly as if the
+/// client had fetched the packument first.
+#[tokio::test]
+async fn a_tarball_request_with_no_prior_packument_fetch_still_lazily_syncs() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npmtarballfirst");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "db_name": "registry" })),
+        )
+        .mount(&mock)
+        .await;
+    let tarball_bytes = build_test_npm("widget", "1.0.0");
+    let packument = serde_json::json!({
+        "name": "widget",
+        "versions": {
+            "1.0.0": {
+                "name": "widget",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!("{}/widget/-/widget-1.0.0.tgz", mock.uri()),
+                    "shasum": "abc123",
+                },
+            },
+        },
+    });
+    Mock::given(method("GET"))
+        .and(path("/widget"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/widget/-/widget-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball_bytes.clone()))
+        .mount(&mock)
+        .await;
+
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "npmjs".into(),
+                format: silo_proto::v1::PackageFormat::Npm as i32,
+                base_url: mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec![],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add_upstream");
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    // No packument request for "widget" has ever been made — going
+    // straight for the tarball, the way a client resolving from its own
+    // lockfile would.
+    let response = get(
+        &harness.state,
+        &format!("/{repo}/stable/npm/widget/-/widget-1.0.0.tgz"),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "a tarball request with no prior packument fetch must still lazily sync and succeed"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.to_vec(), tarball_bytes);
 }

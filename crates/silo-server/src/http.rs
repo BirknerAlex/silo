@@ -1256,7 +1256,25 @@ async fn get_npm(
                 "{}/-/{file}",
                 silo_pkg::npm::package_prefix(&repo, &channel, &name)
             );
-            serve_package(&state, &key, PackageFormat::Npm, &auth, &repo, &channel).await
+            let response =
+                serve_package(&state, &key, PackageFormat::Npm, &auth, &repo, &channel).await;
+            if response.status() != StatusCode::NOT_FOUND {
+                return response;
+            }
+            // Nothing indexed for this name yet — npm's structural gap
+            // (see `pull_through_npm_packument`'s doc): a client that
+            // already knows name+version+integrity from its own lockfile
+            // is entitled to go straight for the tarball without ever
+            // fetching the packument, so nothing has lazily synced
+            // `upstream_packages` for it in that case. Trigger that sync
+            // now and retry once before giving up.
+            match pull_through_npm_packument(&state, &repo, &channel, &name).await {
+                PackumentPullThrough::UpstreamError => npm_upstream_error(&state),
+                PackumentPullThrough::NotFound => response,
+                PackumentPullThrough::Found(_) => {
+                    serve_package(&state, &key, PackageFormat::Npm, &auth, &repo, &channel).await
+                }
+            }
         }
         None => npm_not_found(&state),
     }
