@@ -437,41 +437,58 @@ async fn pull_through_miss(
 ) -> Option<Response> {
     let filename = key.rsplit('/').next().unwrap_or(key);
 
-    let upstream = match silo_core::pull_through::select_upstream(&state.db, repo, channel, format)
-        .await
+    let upstreams = match silo_core::pull_through::select_upstreams(
+        &state.db, repo, channel, format,
+    )
+    .await
     {
-        Ok(Some(upstream)) => upstream,
-        // No upstream configured for this (repo, channel, format) — an
-        // ordinary 404, not an error.
-        Ok(None) => return None,
+        Ok(upstreams) => upstreams,
         Err(e) => {
-            tracing::error!(error = %e, repo, channel, "could not look up a pull-through upstream");
+            tracing::error!(error = %e, repo, channel, "could not look up pull-through upstreams");
             return Some((StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response());
         }
     };
-    // When the in-memory cache is enabled for this upstream, read through
-    // it — the same one the index merge uses, so the two lookup paths
-    // never disagree about what's fresh. Otherwise this is a single
-    // filename, so go straight to the indexed by-filename query rather
-    // than fetching (and scanning) the whole synced index for it.
-    let found = if upstream.cache_index_in_memory {
-        silo_core::repo::upstream_packages_for(&state.publish, &upstream)
-            .await
-            .map(|synced| synced.iter().find(|r| r.filename == filename).cloned())
-    } else {
-        state
-            .db
-            .find_upstream_package_by_filename(upstream.id, filename)
-            .await
-    };
-    let upstream_pkg = match found {
-        Ok(Some(pkg)) => pkg,
-        // Not in this upstream's synced index — an ordinary 404.
-        Ok(None) => return None,
-        Err(e) => {
-            tracing::error!(error = %e, upstream = %upstream.name, "could not look up an upstream package");
-            return Some((StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response());
+
+    // Try each configured upstream in order, falling through to the next
+    // on a confirmed miss — a name that only the second upstream has must
+    // still resolve, not silently lose to whichever upstream sorts first.
+    let mut upstream_pkg = None;
+    let mut matched_upstream = None;
+    for upstream in &upstreams {
+        // When the in-memory cache is enabled for this upstream, read
+        // through it — the same one the index merge uses, so the two
+        // lookup paths never disagree about what's fresh. Otherwise this
+        // is a single filename, so go straight to the indexed by-filename
+        // query rather than fetching (and scanning) the whole synced
+        // index for it.
+        let found = if upstream.cache_index_in_memory {
+            silo_core::repo::upstream_packages_for(&state.publish, upstream)
+                .await
+                .map(|synced| synced.iter().find(|r| r.filename == filename).cloned())
+        } else {
+            state
+                .db
+                .find_upstream_package_by_filename(upstream.id, filename)
+                .await
+        };
+        match found {
+            Ok(Some(pkg)) => {
+                upstream_pkg = Some(pkg);
+                matched_upstream = Some(upstream.clone());
+                break;
+            }
+            // Not in this upstream's synced index — try the next one.
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::error!(error = %e, upstream = %upstream.name, "could not look up an upstream package");
+                return Some((StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response());
+            }
         }
+    }
+    let (upstream, upstream_pkg) = match (matched_upstream, upstream_pkg) {
+        (Some(upstream), Some(pkg)) => (upstream, pkg),
+        // Not in any configured upstream's synced index — an ordinary 404.
+        _ => return None,
     };
     let cache_mode = silo_core::pull_through::CacheMode::parse(&upstream.cache_mode).ok()?;
     let requires_auth = silo_core::pull_through::requires_auth(&upstream);
@@ -646,39 +663,50 @@ async fn pull_through_npm_packument(
     channel: &str,
     name: &str,
 ) -> Option<Vec<u8>> {
-    let upstream =
-        silo_core::pull_through::select_upstream(&state.db, repo, channel, PackageFormat::Npm)
+    let upstreams =
+        silo_core::pull_through::select_upstreams(&state.db, repo, channel, PackageFormat::Npm)
             .await
-            .ok()
-            .flatten()?;
+            .ok()?;
 
-    let fetched = match silo_core::upstream_sync::sync_npm_package(
-        &state.db,
-        state.upstream_http.clone(),
-        state.upstream_secrets.as_ref(),
-        &upstream,
-        name,
-    )
-    .await
-    {
-        Ok(fetched) => fetched,
-        Err(e) => {
-            // Still surfaced as a 404 to the caller — npm's lazy path has
-            // no separate error channel back to the client — but logged
-            // and counted the same way the other four formats' upstream
-            // fetch failures are, so this doesn't look invisible in
-            // metrics/logs the way a plain miss would.
-            match e.downcast::<silo_pkg::UpstreamError>() {
-                Ok(upstream_err) => {
-                    record_upstream_fetch_error(state, PackageFormat::Npm, &upstream_err)
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, upstream = %upstream.name, "npm pull-through sync failed")
-                }
+    // Try each configured npm upstream in order, falling through to the
+    // next on a confirmed miss (or fetch failure) — see `pull_through_miss`
+    // for why stopping at the first candidate is wrong.
+    let mut fetched = Vec::new();
+    for upstream in &upstreams {
+        match silo_core::upstream_sync::sync_npm_package(
+            &state.db,
+            state.upstream_http.clone(),
+            state.upstream_secrets.as_ref(),
+            upstream,
+            name,
+        )
+        .await
+        {
+            Ok(f) if !f.is_empty() => {
+                fetched = f;
+                break;
             }
-            return None;
+            // Not on this upstream — try the next one.
+            Ok(_) => continue,
+            Err(e) => {
+                // Still surfaced as a 404 to the caller if every upstream
+                // misses — npm's lazy path has no separate error channel
+                // back to the client — but logged and counted the same way
+                // the other four formats' upstream fetch failures are, so
+                // this doesn't look invisible in metrics/logs the way a
+                // plain miss would.
+                match e.downcast::<silo_pkg::UpstreamError>() {
+                    Ok(upstream_err) => {
+                        record_upstream_fetch_error(state, PackageFormat::Npm, &upstream_err)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, upstream = %upstream.name, "npm pull-through sync failed")
+                    }
+                }
+                continue;
+            }
         }
-    };
+    }
     if fetched.is_empty() {
         return None;
     }

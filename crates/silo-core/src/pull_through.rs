@@ -140,20 +140,23 @@ fn fetch_action(cache_mode: CacheMode, upstream_requires_auth: bool) -> Action {
     }
 }
 
-/// Picks which configured upstream backs a `(repo, channel, format)`
-/// triple. Multiple upstreams of the same format may be configured (the
-/// user's "one or more" ask); the first by name is used, giving a
-/// deterministic, operator-controllable choice (rename to reorder)
-/// without a separate priority column to manage.
-pub async fn select_upstream(
+/// Lists which configured upstreams back a `(repo, channel, format)`
+/// triple, in the order they should be tried. Multiple upstreams of the
+/// same format may be configured (the user's "one or more" ask); they're
+/// tried in name order — a deterministic, operator-controllable order
+/// (rename to reorder) without a separate priority column to manage.
+/// Callers must fall through to the next candidate on a confirmed miss
+/// rather than stopping at the first one, or every upstream after the
+/// first is unreachable in practice.
+pub async fn select_upstreams(
     db: &Db,
     repo: &str,
     channel: &str,
     format: PackageFormat,
-) -> anyhow::Result<Option<UpstreamRow>> {
+) -> anyhow::Result<Vec<UpstreamRow>> {
     let mut upstreams = db.list_upstreams(repo, channel).await?;
     upstreams.retain(|u| u.format == format.as_str());
-    Ok(upstreams.into_iter().next())
+    Ok(upstreams)
 }
 
 /// Whether decrypting `upstream`'s stored credential (if any) would
