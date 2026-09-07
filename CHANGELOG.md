@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/BirknerAlex/silo/compare/v0.13.0...v0.13.1) (2026-09-07)
+
+
+### Bug fixes
+
+* **pull-through:** try every configured upstream, not just the first by name ([5229a76](https://github.com/BirknerAlex/silo/commit/5229a76058917437f8c7bfdf0b05d2ea7caabdbf))
+
 ## [0.13.0](https://github.com/BirknerAlex/silo/compare/v0.12.1...v0.13.0) (2026-09-07)
 
 
