@@ -25,7 +25,9 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 
+use alpm_types::{PackageRelease, PackageVersion};
 use serde_json::json;
 
 use crate::apk::{gzip, parse_pkginfo, tar_bytes};
@@ -167,8 +169,36 @@ impl Format for PacmanFormat {
     ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<IndexObject>>> + Send + 'a>>
     {
         Box::pin(async move {
+            // Unlike rpm/deb/npm — whose real-world tooling and wire
+            // formats are built to carry several versions of the same
+            // package name in one index (that's how `dnf downgrade` and
+            // `apt-get install pkg=version` work) — a pacman sync database
+            // may hold at most *one* entry per name. `ctx.records` can
+            // (and normally will, once more than one version has ever been
+            // published) contain every version still on record for this
+            // repo/channel/arch; libalpm's `sync_db_read` throws "database
+            // is inconsistent: version mismatch" the instant it meets a
+            // second entry for a name it already loaded with a different
+            // version, so only the newest one per name is kept here.
+            //
+            // Older versions stay untouched in storage and in Postgres —
+            // this only changes what a regenerated index *lists* — so
+            // deleting the current newest version and regenerating brings
+            // the next-newest back into the index for free.
+            let mut latest: HashMap<&str, &PackageRecord> = HashMap::new();
+            for record in ctx.records {
+                latest
+                    .entry(record.name.as_str())
+                    .and_modify(|cur| {
+                        if is_newer(record, cur) {
+                            *cur = record;
+                        }
+                    })
+                    .or_insert(record);
+            }
+
             let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-            let mut sorted: Vec<&PackageRecord> = ctx.records.iter().collect();
+            let mut sorted: Vec<&PackageRecord> = latest.into_values().collect();
             sorted.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
             for record in sorted {
                 let dir = format!("{}-{}", record.name, full_version(record));
@@ -206,6 +236,20 @@ impl Format for PacmanFormat {
 
 pub fn arch_prefix(repo: &str, channel: &str, arch: &str) -> String {
     format!("{repo}/{channel}/pacman/{arch}")
+}
+
+/// Whether `record` is a newer package identity than `current` — epoch
+/// first (an unconditional tie-breaker, same as real `vercmp`), then
+/// `version-release` compared with [`version_cmp`].
+fn is_newer(record: &PackageRecord, current: &PackageRecord) -> bool {
+    match record.epoch.cmp(&current.epoch) {
+        std::cmp::Ordering::Equal => {
+            let record_ver = format!("{}-{}", record.version, record.release);
+            let current_ver = format!("{}-{}", current.version, current.release);
+            version_cmp(&record_ver, &current_ver) == std::cmp::Ordering::Greater
+        }
+        other => other == std::cmp::Ordering::Greater,
+    }
 }
 
 /// The version string `repo-add` embeds in a database entry's directory
@@ -544,79 +588,179 @@ fn parse_desc_fields(text: &str) -> HashMap<String, Vec<String>> {
 /// Compares two pacman `pkgver-pkgrel` strings (already epoch-stripped by
 /// the caller, which compares epoch separately — pacman's own vercmp
 /// treats a higher epoch as unconditionally newer regardless of the rest).
-/// Segments alternate numeric/alphabetic the same way rpm's algorithm
-/// does, with `pkgrel` compared last as a plain integer tie-breaker.
 ///
-/// A pragmatic subset of `alpm`'s real `vercmp`, covering the common
-/// shapes real `PKGBUILD`s produce; not a byte-for-byte reimplementation
-/// of every corner (e.g. libalpm's specific handling of a lone trailing
-/// `.` or repeated separators).
+/// Tokenizes with the upstream [`alpm-types`](alpm_types) crate's
+/// [`PackageVersion::segments`], which implements libalpm's actual
+/// segment/sub-segment splitting (see alpm-pkgver(7)) — including corners a
+/// hand-rolled tokenizer missed, like a `.`-delimited trailing segment
+/// (`1.0` vs `1.0.a`) ranking opposite to a delimiter-free one (`1.0` vs
+/// `1.0alpha`), and distinguishing `1..0` (two leading delimiters) from
+/// `1.0`. The final comparison over those segments is our own rather than
+/// the crate's [`Ord`] impl: that impl parses each numeric segment as a
+/// fixed-width `usize` and unwraps the result, which panics instead of
+/// comparing on a segment longer than `usize::MAX` — reachable from an
+/// untrusted uploaded package's `pkgver`, so it can't be relied on here.
+/// [`compare_numeric_segments`] does the same magnitude comparison without
+/// ever parsing to a fixed-width integer.
 pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     let (a_ver, a_rel) = a.rsplit_once('-').unwrap_or((a, "0"));
     let (b_ver, b_rel) = b.rsplit_once('-').unwrap_or((b, "0"));
-    // `pkgrel` is conventionally an integer, but makepkg permits a
-    // decimal like `1.1` — `alpm`'s vercmp compares it with the same
-    // segment algorithm as `pkgver`, not as a parsed integer, so `1.1`
-    // and `1.2` don't collapse to equal the way a failed `u64` parse
-    // (falling back to `0` for both) would.
-    compare_alnum_segments(a_ver, b_ver).then_with(|| compare_alnum_segments(a_rel, b_rel))
+
+    match (
+        PackageVersion::new(a_ver.to_string()),
+        PackageVersion::new(b_ver.to_string()),
+    ) {
+        (Ok(a_ver), Ok(b_ver)) => {
+            compare_segments(&a_ver, &b_ver).then_with(|| compare_release(a_rel, b_rel))
+        }
+        // A `pkgver` real `makepkg` ever produces always parses — this
+        // only triggers on something already malformed (e.g. a stray `:`
+        // or `/`, which `PackageVersion`'s charset forbids), where falling
+        // back to a plain string order is as good as any other total order.
+        _ => a.cmp(b),
+    }
 }
 
-fn compare_alnum_segments(a: &str, b: &str) -> std::cmp::Ordering {
+/// Compares two [`PackageVersion`]s segment by segment, mirroring the
+/// [`alpm_types`] crate's own `Ord for PackageVersion` (segments carry
+/// their leading delimiter count, a longer side wins unless its extra
+/// segment is a delimiter-free alphabetic suffix, matching types beat
+/// mismatched ones), but comparing same-position numeric segments with
+/// [`compare_numeric_segments`] instead of the crate's panic-on-overflow
+/// `usize` parse. See [`version_cmp`] for why that substitution matters.
+fn compare_segments(a: &PackageVersion, b: &PackageVersion) -> std::cmp::Ordering {
+    use alpm_types::VersionSegment;
     use std::cmp::Ordering;
 
-    let a_parts = split_alnum(a);
-    let b_parts = split_alnum(b);
-    let mut a_iter = a_parts.iter();
-    let mut b_iter = b_parts.iter();
+    if a.inner() == b.inner() {
+        return Ordering::Equal;
+    }
+
+    let mut a_segments = a.segments();
+    let mut b_segments = b.segments();
 
     loop {
-        match (a_iter.next(), b_iter.next()) {
+        let (a_seg, b_seg) = match (a_segments.next(), b_segments.next()) {
+            (Some(a_seg), Some(b_seg)) => (a_seg, b_seg),
             (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => {
-                let cmp = match (x.parse::<u64>(), y.parse::<u64>()) {
-                    (Ok(x), Ok(y)) => x.cmp(&y),
-                    _ => x.cmp(y),
-                };
-                if cmp != Ordering::Equal {
-                    return cmp;
+            (Some(seg), None) => return trailing_segment_beats_end(&seg),
+            (None, Some(seg)) => return trailing_segment_beats_end(&seg).reverse(),
+        };
+
+        match (a_seg.is_empty(), b_seg.is_empty()) {
+            // Both ended in a run of trailing delimiters (`1.0.` vs
+            // `1.0...`) — the delimiter count itself doesn't matter here.
+            (true, true) => return Ordering::Equal,
+            (true, false) => return trailing_delimiter_vs_segment(&b_seg).reverse(),
+            (false, true) => return trailing_delimiter_vs_segment(&a_seg),
+            (false, false) => {}
+        }
+
+        let (a_text, b_text) = match (&a_seg, &b_seg) {
+            (
+                VersionSegment::Segment {
+                    delimiter_count: a_count,
+                    text: a_text,
+                },
+                VersionSegment::Segment {
+                    delimiter_count: b_count,
+                    text: b_text,
+                },
+            ) => {
+                if a_count != b_count {
+                    return a_count.cmp(b_count);
                 }
+                (*a_text, *b_text)
             }
+            (VersionSegment::Segment { .. }, VersionSegment::SubSegment { .. }) => {
+                return Ordering::Greater;
+            }
+            (VersionSegment::SubSegment { .. }, VersionSegment::Segment { .. }) => {
+                return Ordering::Less;
+            }
+            (
+                VersionSegment::SubSegment { text: a_text },
+                VersionSegment::SubSegment { text: b_text },
+            ) => (*a_text, *b_text),
+        };
+
+        let a_numeric = is_ascii_numeric(a_text);
+        let b_numeric = is_ascii_numeric(b_text);
+        let cmp = if a_numeric && !b_numeric {
+            Ordering::Greater
+        } else if !a_numeric && b_numeric {
+            Ordering::Less
+        } else if a_numeric {
+            compare_numeric_segments(a_text, b_text)
+        } else {
+            a_text.cmp(b_text)
+        };
+        if cmp != Ordering::Equal {
+            return cmp;
         }
     }
 }
 
-/// Splits a version string into alternating digit/non-digit runs, the
-/// same tokenization `alpm`'s vercmp uses to compare `1.2` against
-/// `1.10` numerically rather than lexically.
-fn split_alnum(v: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut current_is_digit: Option<bool> = None;
-    for c in v.chars() {
-        if !c.is_ascii_alphanumeric() {
-            if !current.is_empty() {
-                parts.push(std::mem::take(&mut current));
-            }
-            current_is_digit = None;
-            continue;
-        }
-        let is_digit = c.is_ascii_digit();
-        if current_is_digit == Some(is_digit) || current.is_empty() {
-            current.push(c);
-            current_is_digit = Some(is_digit);
-        } else {
-            parts.push(std::mem::take(&mut current));
-            current.push(c);
-            current_is_digit = Some(is_digit);
-        }
+/// One side ran out of segments while the other still has `seg` — the
+/// longer side wins, unless `seg` is a delimiter-free alphabetic suffix (a
+/// pre-release marker like `1.0alpha`'s `alpha`), in which case the shorter
+/// side wins instead. Returns the ordering of the *longer* side relative to
+/// the shorter one; callers on the shorter side `.reverse()` it.
+fn trailing_segment_beats_end(seg: &alpm_types::VersionSegment) -> std::cmp::Ordering {
+    use alpm_types::VersionSegment;
+    use std::cmp::Ordering;
+
+    let text = match seg {
+        VersionSegment::Segment { .. } => return Ordering::Greater,
+        VersionSegment::SubSegment { text } => text,
+    };
+    if !text.is_empty() && text.chars().all(char::is_alphabetic) {
+        Ordering::Less
+    } else {
+        Ordering::Greater
     }
-    if !current.is_empty() {
-        parts.push(current);
+}
+
+/// One side ended in a trailing delimiter (`seg` is the empty segment that
+/// encodes it, e.g. `1.0.`'s final segment) while the other still has a
+/// real `other` segment at the same position. A trailing delimiter beats an
+/// alphabetic pre-release suffix but loses to anything else. Returns the
+/// ordering of the trailing-delimiter side relative to `other`.
+fn trailing_delimiter_vs_segment(other: &alpm_types::VersionSegment) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    if other.chars().all(char::is_alphabetic) {
+        Ordering::Greater
+    } else {
+        Ordering::Less
     }
-    parts
+}
+
+fn is_ascii_numeric(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Compares two all-ASCII-digit strings by magnitude without ever parsing
+/// them to a fixed-width integer: strip leading zeros, then the longer
+/// remaining digit string is larger (arbitrary length, unlike a `u64`/
+/// `usize` parse), and equal-length digit strings compare lexically, which
+/// is magnitude order for same-length unsigned decimal digits.
+fn compare_numeric_segments(a: &str, b: &str) -> std::cmp::Ordering {
+    let a = a.trim_start_matches('0');
+    let b = b.trim_start_matches('0');
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// Compares two `pkgrel` strings — conventionally a bare integer, but
+/// `makepkg` also permits a `major.minor` form, which `PackageRelease`
+/// compares as two separate integers rather than as an opaque string, so
+/// `1.2` sorts below `1.10` (minor `2 < 10`) rather than the reverse a
+/// decimal or lexical reading would give.
+fn compare_release(a: &str, b: &str) -> std::cmp::Ordering {
+    match (PackageRelease::from_str(a), PackageRelease::from_str(b)) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        _ => a.cmp(b),
+    }
 }
 
 #[cfg(test)]
@@ -787,6 +931,52 @@ mod tests {
         assert_eq!(names, vec!["foo-1.0-1/desc"]);
     }
 
+    #[tokio::test]
+    async fn build_index_keeps_only_the_newest_version_of_each_name() {
+        // A sync database with two entries for the same name at different
+        // versions is exactly what makes libalpm reject the repo with
+        // "database is inconsistent: version mismatch" — old versions that
+        // are still on record (never deleted, just superseded by a newer
+        // publish) must not reach the rendered db.
+        let records = [
+            record("foo", "1.0"),
+            record("foo", "2.0"),
+            record("bar", "3.0"),
+        ];
+        let ctx = IndexContext {
+            repo: "r",
+            channel: "edge",
+            group: "x86_64",
+            records: &records,
+            public_base_url: None,
+            signer: None,
+        };
+        let objects = PacmanFormat.build_index(&ctx).await.unwrap();
+
+        let mut inflated = Vec::new();
+        flate2::bufread::GzDecoder::new(objects[0].bytes.as_slice())
+            .read_to_end(&mut inflated)
+            .unwrap();
+        let mut archive = tar::Archive::new(inflated.as_slice());
+        let mut names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["bar-3.0-1/desc", "foo-2.0-1/desc"]);
+    }
+
+    #[test]
+    fn is_newer_compares_epoch_before_version() {
+        let mut low_epoch = record("foo", "9.0");
+        low_epoch.epoch = 0;
+        let mut high_epoch = record("foo", "1.0");
+        high_epoch.epoch = 1;
+        assert!(is_newer(&high_epoch, &low_epoch));
+        assert!(!is_newer(&low_epoch, &high_epoch));
+    }
+
     struct FakeSigner;
     impl crate::IndexSigner for FakeSigner {
         fn key_name(&self) -> &str {
@@ -854,5 +1044,65 @@ mod tests {
         assert_eq!(version_cmp("1.0-1", "1.0-2"), Ordering::Less);
         assert_eq!(version_cmp("1.0-1", "1.0-1"), Ordering::Equal);
         assert_eq!(version_cmp("2.0-1", "1.9-9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn version_cmp_treats_a_trailing_alpha_suffix_as_older() {
+        use std::cmp::Ordering;
+        // A bare `1.0` beats a `1.0`-prefixed pre-release suffix...
+        assert_eq!(version_cmp("1.0-1", "1.0foo.2-1"), Ordering::Greater);
+        assert_eq!(version_cmp("1.0-1", "1.0alpha-1"), Ordering::Greater);
+        // ...but loses to an actual point release, since that trailing
+        // segment is numeric rather than alphabetic.
+        assert_eq!(version_cmp("1.0-1", "1.0.1-1"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_treats_a_delimited_trailing_alpha_segment_as_newer() {
+        use std::cmp::Ordering;
+        // Unlike the glued `1.0alpha` suffix above, a `.`-delimited
+        // trailing alphabetic segment is a genuine extra version
+        // component, not a pre-release marker, so it's newer — same as
+        // `1.0` losing to `1.0.1`.
+        assert_eq!(version_cmp("1.0-1", "1.0.a-1"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_treats_a_delimited_trailing_alpha_sub_segment_as_older() {
+        use std::cmp::Ordering;
+        // Unlike the previous case's `1.0` vs `1.0.a`, here the trailing
+        // alphabetic piece is a *sub*-segment of an existing segment
+        // (`alpha`'s `.0` continues `alpha1`'s numeric sub-segment, it
+        // doesn't start a new one) — real ALPM's segment/sub-segment
+        // distinction still ranks this as a pre-release, so `alpha1` (no
+        // trailing delimiter before its digit) loses to `alpha.0`.
+        assert_eq!(version_cmp("alpha1-1", "alpha.0-1"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_counts_consecutive_delimiters() {
+        use std::cmp::Ordering;
+        // ALPM's segment splitter records how many leading delimiter
+        // characters precede each segment, and more delimiters always
+        // outranks fewer at the same position, independent of what
+        // follows — `1...0` (three dots) beats `1.2` (one dot) even
+        // though `0 < 2`, because the delimiter count is compared first.
+        assert_eq!(version_cmp("1...0-1", "1.2-1"), Ordering::Greater);
+        // Matching delimiter counts fall through to the segment itself as
+        // usual.
+        assert_eq!(version_cmp("1...0-1", "1...2-1"), Ordering::Less);
+    }
+
+    #[test]
+    fn version_cmp_compares_numeric_segments_past_u64_range() {
+        use std::cmp::Ordering;
+        // A pkgver segment longer than `u64::MAX` (20 digits here, one
+        // past it) must still compare on magnitude rather than panicking
+        // or falling back to a lexical string compare, which would
+        // wrongly rank this below `1.9` (`'1' < '9'` as characters).
+        assert_eq!(
+            version_cmp("1.18446744073709551616-1", "1.9-1"),
+            Ordering::Greater
+        );
     }
 }
