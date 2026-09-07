@@ -654,24 +654,50 @@ async fn pull_through_miss(
 /// `merge_upstream_records` machinery every other format's index already
 /// goes through, just triggered per-request instead of per-sync.
 ///
-/// Returns `None` when there's nothing to do (no npm upstream configured,
-/// or the upstream doesn't have this name either), so the caller falls
-/// back to its ordinary 404.
+/// The three outcomes of a lazy packument pull-through: the packument was
+/// found, no configured upstream has this name (a real, cacheable-as-such
+/// 404), or every consulted upstream failed for a reason that says nothing
+/// about whether the name exists (network error, 5xx, 429, a timeout).
+/// Collapsing the last two into one plain 404 — as this used to do — is
+/// wrong: a client (npm, bun, ...) treats 404 as "this package doesn't
+/// exist" and never retries, so a transient upstream blip during a big,
+/// highly concurrent install permanently drops that one package instead of
+/// the client retrying it the way it already does for a 5xx.
+enum PackumentPullThrough {
+    Found(Vec<u8>),
+    NotFound,
+    UpstreamError,
+}
+
+/// Returns [`PackumentPullThrough::NotFound`] when there's nothing to do
+/// (no npm upstream configured, or every configured upstream confirmed it
+/// doesn't have this name), so the caller falls back to its ordinary 404.
 async fn pull_through_npm_packument(
     state: &AppState,
     repo: &str,
     channel: &str,
     name: &str,
-) -> Option<Vec<u8>> {
-    let upstreams =
-        silo_core::pull_through::select_upstreams(&state.db, repo, channel, PackageFormat::Npm)
-            .await
-            .ok()?;
+) -> PackumentPullThrough {
+    let upstreams = match silo_core::pull_through::select_upstreams(
+        &state.db,
+        repo,
+        channel,
+        PackageFormat::Npm,
+    )
+    .await
+    {
+        Ok(upstreams) => upstreams,
+        Err(e) => {
+            tracing::error!(error = %e, repo, channel, "could not look up pull-through upstreams");
+            return PackumentPullThrough::UpstreamError;
+        }
+    };
 
     // Try each configured npm upstream in order, falling through to the
     // next on a confirmed miss (or fetch failure) — see `pull_through_miss`
     // for why stopping at the first candidate is wrong.
     let mut fetched = Vec::new();
+    let mut saw_transient_error = false;
     for upstream in &upstreams {
         match silo_core::upstream_sync::sync_npm_package(
             &state.db,
@@ -689,18 +715,27 @@ async fn pull_through_npm_packument(
             // Not on this upstream — try the next one.
             Ok(_) => continue,
             Err(e) => {
-                // Still surfaced as a 404 to the caller if every upstream
-                // misses — npm's lazy path has no separate error channel
-                // back to the client — but logged and counted the same way
-                // the other four formats' upstream fetch failures are, so
-                // this doesn't look invisible in metrics/logs the way a
-                // plain miss would.
+                // Logged and counted the same way the other four formats'
+                // upstream fetch failures are, so this doesn't look
+                // invisible in metrics/logs the way a plain miss would.
                 match e.downcast::<silo_pkg::UpstreamError>() {
                     Ok(upstream_err) => {
-                        record_upstream_fetch_error(state, PackageFormat::Npm, &upstream_err)
+                        record_upstream_fetch_error(state, PackageFormat::Npm, &upstream_err);
+                        // A `404` from the upstream itself is the one
+                        // outcome that actually confirms absence; anything
+                        // else (a network error, a non-404 status, a
+                        // malformed response, ...) is transient noise that
+                        // must not be reported the same way.
+                        if !matches!(
+                            upstream_err,
+                            silo_pkg::UpstreamError::Status { status: 404, .. }
+                        ) {
+                            saw_transient_error = true;
+                        }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, upstream = %upstream.name, "npm pull-through sync failed")
+                        tracing::error!(error = %e, upstream = %upstream.name, "npm pull-through sync failed");
+                        saw_transient_error = true;
                     }
                 }
                 continue;
@@ -708,10 +743,14 @@ async fn pull_through_npm_packument(
         }
     }
     if fetched.is_empty() {
-        return None;
+        return if saw_transient_error {
+            PackumentPullThrough::UpstreamError
+        } else {
+            PackumentPullThrough::NotFound
+        };
     }
 
-    silo_core::repo::regenerate_index(
+    if let Err(e) = silo_core::repo::regenerate_index(
         &state.publish,
         repo,
         channel,
@@ -720,14 +759,24 @@ async fn pull_through_npm_packument(
         &audit::Actor::system(),
     )
     .await
-    .ok()?;
+    {
+        tracing::error!(error = %e, repo, channel, name, "failed to regenerate npm index after a pull-through sync");
+        return PackumentPullThrough::UpstreamError;
+    }
 
     let key = format!(
         "{}/{}",
         silo_pkg::npm::package_prefix(repo, channel, name),
         silo_pkg::npm::PACKUMENT_OBJECT
     );
-    state.storage.get(&key).await.ok().flatten()
+    match state.storage.get(&key).await {
+        Ok(Some(bytes)) => PackumentPullThrough::Found(bytes),
+        Ok(None) => PackumentPullThrough::UpstreamError,
+        Err(e) => {
+            tracing::error!(error = %e, key, "failed to read back a synced packument");
+            PackumentPullThrough::UpstreamError
+        }
+    }
 }
 
 fn record_upstream_fetch_error(
@@ -1177,7 +1226,7 @@ async fn get_npm(
                 }
                 Ok(None) => {
                     match pull_through_npm_packument(&state, &repo, &channel, &name).await {
-                        Some(bytes) => {
+                        PackumentPullThrough::Found(bytes) => {
                             let base = state.base_url_for(&headers);
                             let bytes = silo_pkg::npm::substitute_base_url(&bytes, &base);
                             state
@@ -1192,7 +1241,8 @@ async fn get_npm(
                             )
                                 .into_response()
                         }
-                        None => npm_not_found(&state),
+                        PackumentPullThrough::NotFound => npm_not_found(&state),
+                        PackumentPullThrough::UpstreamError => npm_upstream_error(&state),
                     }
                 }
                 Err(e) => {
@@ -1223,6 +1273,25 @@ fn npm_not_found(state: &AppState) -> Response {
         StatusCode::NOT_FOUND,
         [(header::CONTENT_TYPE, "application/json")],
         r#"{"error":"Not found"}"#,
+    )
+        .into_response()
+}
+
+/// A 502 for a packument pull-through where every configured upstream
+/// failed for a reason that says nothing about whether the name exists —
+/// see [`PackumentPullThrough`]. A retryable status, unlike
+/// [`npm_not_found`]'s 404, is the whole point: npm/bun/yarn all retry a
+/// 5xx and never retry a 404.
+fn npm_upstream_error(state: &AppState) -> Response {
+    state
+        .metrics
+        .http_requests
+        .with_label_values(&["npm-index", "502"])
+        .inc();
+    (
+        StatusCode::BAD_GATEWAY,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"Bad gateway"}"#,
     )
         .into_response()
 }
