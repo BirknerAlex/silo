@@ -67,6 +67,13 @@ spec:
                   name: {{ .Values.config.auth.tokenPepperExistingSecret }}
                   key: tokenPepper
             {{- end }}
+            {{- if .Values.config.upstreamSecret.existingSecret }}
+            - name: SILO_UPSTREAM_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.upstreamSecret.existingSecret }}
+                  key: key
+            {{- end }}
             {{- if .Values.config.storage.existingSecret }}
             - name: SILO_STORAGE_ACCESS_KEY_ID
               valueFrom:

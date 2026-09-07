@@ -65,6 +65,31 @@ Clone it once (`git clone git@github.com:BirknerAlex/silo.wiki.git`), edit
 the relevant `.md` file, commit, and push — there is no review step, a push
 to `master` publishes immediately.
 
+## A new config value is not done until the chart renders it
+
+`config.example.yaml` documents what silo-server's config loader accepts.
+The chart's `charts/silo/templates/_helpers.tpl` (the `silo.config`
+render) and `values.yaml` are a separate, hand-maintained mapping from
+structured Helm values onto that same file — nothing generates one from
+the other, so adding a field to the server's config does not make it
+reachable from the chart.
+
+A new config value needs, in the same change:
+
+- A `config.<field>` entry in `charts/silo/values.yaml`, following the
+  existing pattern for that kind of value (plain string, or
+  `key`/`existingSecret` for anything credential-shaped).
+- The matching branch in the `silo.config` define in `_helpers.tpl`.
+- If it is credential-shaped, the `existingSecret` env-var injection in
+  `templates/deployment.yaml` (see `SILO_TOKEN_PEPPER`,
+  `SILO_STORAGE_ACCESS_KEY_ID` for the pattern).
+- An entry in `ci/check-chart.py`'s `EVERYTHING` list, so
+  `every_optional_feature` and `rendered_config_is_valid` actually render
+  it at least once.
+
+Skipping this leaves a config feature that exists in silo-server but is
+unreachable from the chart — the only deployment path most operators use.
+
 ## The version lives in one number
 
 `[workspace.package] version` in the root `Cargo.toml` is silo's version.
