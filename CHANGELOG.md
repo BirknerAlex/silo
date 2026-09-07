@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/BirknerAlex/silo/compare/v0.12.1...v0.13.0) (2026-09-07)
+
+
+### Features
+
+* **chart:** support upstream_secret in config.yaml ([c3d9de5](https://github.com/BirknerAlex/silo/commit/c3d9de57ab3d4207f298976a86d85110717b3ada))
+
 ## [0.12.1](https://github.com/BirknerAlex/silo/compare/v0.12.0...v0.12.1) (2026-09-07)
 
 
