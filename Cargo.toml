@@ -62,7 +62,7 @@ hex = "0.4"
 semver = "1"
 cron = "0.17"
 aes-gcm = "0.10"
-quick-xml = "0.36"
+quick-xml = "0.37"
 
 [profile.release]
 lto = true
