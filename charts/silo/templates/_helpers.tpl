@@ -173,6 +173,16 @@ audit:
   log_downloads: {{ .Values.config.audit.logDownloads }}
   retention_days: {{ .Values.config.audit.retentionDays }}
 
+{{- if .Values.config.upstreamSecret.existingSecret }}
+
+upstream_secret:
+  key: "${SILO_UPSTREAM_SECRET_KEY}"
+{{- else if .Values.config.upstreamSecret.key }}
+
+upstream_secret:
+  key: {{ .Values.config.upstreamSecret.key | quote }}
+{{- end }}
+
 metrics:
   enabled: {{ .Values.config.metrics.enabled }}
   require_auth: {{ .Values.config.metrics.requireAuth }}

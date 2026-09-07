@@ -92,6 +92,7 @@ EVERYTHING = [
     "--set", "config.signing.apk.existingSecret=apkkey",
     "--set", "config.storage.existingSecret=s3creds",
     "--set", "config.auth.tokenPepperExistingSecret=pepper",
+    "--set", "config.upstreamSecret.existingSecret=upstreamkey",
     "--set", "podLabels.tier=backend",
     "--set", "extraEnv[0].name=RUST_LOG",
     "--set", "extraEnv[0].value=debug",

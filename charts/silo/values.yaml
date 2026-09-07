@@ -164,6 +164,15 @@ config:
     logDownloads: true
     retentionDays: 90
 
+  # Encrypts stored credentials for pull-through upstreams configured with
+  # `silo repo add-upstream --basic-auth`/`--bearer-token`. Only required
+  # once such an upstream exists. Generate with
+  # `silo generate-upstream-secret-key` (32 raw bytes, base64). Rotating it
+  # invalidates every stored upstream credential.
+  upstreamSecret:
+    key: ""
+    existingSecret: ""
+
   metrics:
     enabled: true
     # The inventory gauges are labelled by repo and channel, so an open
