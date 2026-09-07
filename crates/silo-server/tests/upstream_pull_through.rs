@@ -1050,6 +1050,227 @@ async fn fetch_primary_xml(state: &std::sync::Arc<silo_server::AppState>, repo: 
     String::from_utf8(inflated).unwrap()
 }
 
+/// Regression for a bug where a `(repo, channel, format)` triple with more
+/// than one configured upstream would only ever consult the alphabetically
+/// first one by name — a miss there was treated as a final 404 instead of
+/// falling through to the next candidate, so any upstream after the first
+/// was unreachable in practice regardless of its own cache mode. Here
+/// `alpha-only` (sorts before `zeta-only`) has an index with nothing in
+/// it; the requested package lives only on `zeta-only`.
+#[tokio::test]
+async fn a_second_upstream_is_still_reachable_when_an_earlier_one_by_name_does_not_have_the_package(
+) {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("multiup");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    // "alpha-only" (sorts first) has a real, but unrelated, index.
+    let alpha_mock = MockServer::start().await;
+    let unrelated_bytes = build_test_apk("unrelated", "1.0-r0", "x86_64");
+    Mock::given(method("GET"))
+        .and(path("/x86_64/APKINDEX.tar.gz"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(build_apkindex_tar_gz(
+                "unrelated",
+                "1.0-r0",
+                "x86_64",
+                unrelated_bytes.len(),
+            )),
+        )
+        .mount(&alpha_mock)
+        .await;
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "alpha-only".into(),
+                format: silo_proto::v1::PackageFormat::Apk as i32,
+                base_url: alpha_mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec!["x86_64".into()],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add alpha-only upstream");
+
+    // "zeta-only" (sorts second) actually has the requested package.
+    let zeta_mock = MockServer::start().await;
+    let hello_bytes = build_test_apk("hello", "1.0-r0", "x86_64");
+    Mock::given(method("GET"))
+        .and(path("/x86_64/APKINDEX.tar.gz"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(build_apkindex_tar_gz(
+                "hello",
+                "1.0-r0",
+                "x86_64",
+                hello_bytes.len(),
+            )),
+        )
+        .mount(&zeta_mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/x86_64/hello-1.0-r0.apk"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(hello_bytes.clone()))
+        .mount(&zeta_mock)
+        .await;
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "zeta-only".into(),
+                format: silo_proto::v1::PackageFormat::Apk as i32,
+                base_url: zeta_mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec!["x86_64".into()],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add zeta-only upstream");
+
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    let uri = format!("/{repo}/stable/apk/x86_64/hello-1.0-r0.apk");
+    let response = get(&harness.state, &uri).await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "a package on the second (by name) upstream must still be reachable"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.to_vec(), hello_bytes);
+}
+
+/// Same regression as
+/// `a_second_upstream_is_still_reachable_when_an_earlier_one_by_name_does_not_have_the_package`,
+/// but through npm's lazy per-name packument path (`pull_through_npm_packument`)
+/// rather than the eagerly-indexed one (`pull_through_miss`) — the two
+/// call sites had independent copies of the same first-upstream-only bug.
+#[tokio::test]
+async fn npm_packument_miss_falls_through_to_a_second_upstream_by_name() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npmmultiup");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    // "alpha-only" (sorts first) is reachable but never has "widget".
+    let alpha_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "db_name": "registry" })),
+        )
+        .mount(&alpha_mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/widget"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": "Not found"
+        })))
+        .mount(&alpha_mock)
+        .await;
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "alpha-only".into(),
+                format: silo_proto::v1::PackageFormat::Npm as i32,
+                base_url: alpha_mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec![],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add alpha-only upstream");
+
+    // "zeta-only" (sorts second) actually has "widget".
+    let zeta_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "db_name": "registry" })),
+        )
+        .mount(&zeta_mock)
+        .await;
+    let packument = serde_json::json!({
+        "name": "widget",
+        "versions": {
+            "1.0.0": {
+                "name": "widget",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!("{}/widget/-/widget-1.0.0.tgz", zeta_mock.uri()),
+                    "shasum": "abc123",
+                },
+            },
+        },
+    });
+    Mock::given(method("GET"))
+        .and(path("/widget"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+        .mount(&zeta_mock)
+        .await;
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "zeta-only".into(),
+                format: silo_proto::v1::PackageFormat::Npm as i32,
+                base_url: zeta_mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec![],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add zeta-only upstream");
+
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    let response = get(&harness.state, &format!("/{repo}/stable/npm/widget")).await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "a packument on the second (by name) npm upstream must still be reachable"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(doc["versions"]["1.0.0"].is_object(), "{doc}");
+}
+
 /// axum's `*path` wildcard on the main npm route never matches a
 /// zero-length remainder, so `/repo/channel/npm` and its trailing-slash
 /// twin need their own routes (see `get_npm_root`) or `add-upstream`'s
