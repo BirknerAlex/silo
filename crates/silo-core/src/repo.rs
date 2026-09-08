@@ -14,7 +14,11 @@
 //! 2. **The database as the source of truth for what's in a repo.** The
 //!    index is rendered from rows read inside the locked transaction, not
 //!    from a bucket listing. There is no window in which a package exists
-//!    but isn't visible to the renderer.
+//!    but isn't visible to the renderer. Every one of those reads runs on
+//!    that transaction's own connection: borrowing a second connection
+//!    from the pool while holding the first would cap concurrent
+//!    publishes at half the pool and deadlock past that, with each
+//!    publisher waiting on a connection only another publisher can free.
 //!
 //! Both halves live in the same transaction, so the lock covers exactly
 //! the interval in which the index could be computed from stale data.
@@ -309,7 +313,16 @@ async fn regenerate_index_locked(
     groups.extend(handler.shared_groups(index_group));
     let rows = packages::list_groups(locked.conn(), repo, channel, format, &groups).await?;
     let mut records: Vec<silo_pkg::PackageRecord> = rows.iter().map(|r| r.to_record()).collect();
-    merge_upstream_records(ctx, repo, channel, format, index_group, &mut records).await?;
+    merge_upstream_records(
+        ctx,
+        locked.conn(),
+        repo,
+        channel,
+        format,
+        index_group,
+        &mut records,
+    )
+    .await?;
 
     let prefix = handler.index_prefix(repo, channel, index_group);
 
@@ -397,13 +410,14 @@ pub async fn rebuild_index_for_upstream(
 /// bytes either way, so there's nothing to prefer).
 async fn merge_upstream_records(
     ctx: &PublishContext,
+    conn: &mut silo_db::PgConnection,
     repo: &str,
     channel: &str,
     format: PackageFormat,
     index_group: &str,
     records: &mut Vec<silo_pkg::PackageRecord>,
 ) -> anyhow::Result<()> {
-    let upstreams = ctx.db.list_upstreams(repo, channel).await?;
+    let upstreams = silo_db::upstreams::list_in_channel(&mut *conn, repo, channel).await?;
     if upstreams.iter().all(|u| u.format != format.as_str()) {
         return Ok(());
     }
@@ -433,7 +447,8 @@ async fn merge_upstream_records(
         if rpm_signing_would_invalidate_the_checksum && upstream.cache_mode == "cache" {
             continue;
         }
-        let synced = upstream_packages_for_group(ctx, upstream, format, index_group).await?;
+        let synced =
+            upstream_packages_for_group(ctx, &mut *conn, upstream, format, index_group).await?;
         for row in synced.iter() {
             if seen_filenames.contains(&row.filename) {
                 continue;
@@ -487,18 +502,26 @@ async fn merge_upstream_records(
 /// enabled.
 async fn upstream_packages_for_group(
     ctx: &PublishContext,
+    conn: &mut silo_db::PgConnection,
     upstream: &silo_db::upstreams::UpstreamRow,
     format: PackageFormat,
     index_group: &str,
 ) -> anyhow::Result<std::sync::Arc<Vec<silo_db::upstreams::UpstreamPackageRow>>> {
     if format == PackageFormat::Npm {
         return Ok(std::sync::Arc::new(
-            ctx.db
-                .list_upstream_package_versions(upstream.id, index_group)
-                .await?,
+            silo_db::upstreams::list_package_versions(conn, upstream.id, index_group).await?,
         ));
     }
-    upstream_packages_for(ctx, upstream).await
+    if upstream.cache_index_in_memory {
+        if let Some(cached) = ctx.upstream_index_cache.get(upstream.id) {
+            return Ok(cached);
+        }
+    }
+    let rows = std::sync::Arc::new(silo_db::upstreams::list_all_packages(conn, upstream.id).await?);
+    if upstream.cache_index_in_memory {
+        ctx.upstream_index_cache.put(upstream.id, rows.clone());
+    }
+    Ok(rows)
 }
 
 /// Every synced entry for one upstream, via the opt-in in-memory cache

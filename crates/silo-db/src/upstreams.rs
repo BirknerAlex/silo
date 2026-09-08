@@ -7,7 +7,7 @@
 //! means "the upstream claims to have this, unfetched".
 
 use serde_json::Value;
-use sqlx::FromRow;
+use sqlx::{FromRow, PgExecutor};
 use uuid::Uuid;
 
 use crate::{DateTime, Db};
@@ -139,13 +139,7 @@ impl Db {
         repo: &str,
         channel: &str,
     ) -> anyhow::Result<Vec<UpstreamRow>> {
-        Ok(sqlx::query_as(&format!(
-            "SELECT {COLUMNS} FROM upstreams WHERE repo = $1 AND channel = $2 ORDER BY name"
-        ))
-        .bind(repo)
-        .bind(channel)
-        .fetch_all(self.pool())
-        .await?)
+        list_in_channel(self.pool(), repo, channel).await
     }
 
     /// Every upstream across every repo — what the periodic sync job
@@ -435,13 +429,7 @@ impl Db {
         upstream_id: Uuid,
         name: &str,
     ) -> anyhow::Result<Vec<UpstreamPackageRow>> {
-        Ok(sqlx::query_as(&format!(
-            "SELECT {UP_COLUMNS} FROM upstream_packages WHERE upstream_id = $1 AND name = $2"
-        ))
-        .bind(upstream_id)
-        .bind(name)
-        .fetch_all(self.pool())
-        .await?)
+        list_package_versions(self.pool(), upstream_id, name).await
     }
 
     /// Every synced entry for one upstream, across every name — what index
@@ -452,12 +440,7 @@ impl Db {
         &self,
         upstream_id: Uuid,
     ) -> anyhow::Result<Vec<UpstreamPackageRow>> {
-        Ok(sqlx::query_as(&format!(
-            "SELECT {UP_COLUMNS} FROM upstream_packages WHERE upstream_id = $1"
-        ))
-        .bind(upstream_id)
-        .fetch_all(self.pool())
-        .await?)
+        list_all_packages(self.pool(), upstream_id).await
     }
 
     /// Looks up one upstream's synced entry by filename — what the
@@ -503,6 +486,60 @@ impl Db {
                 .await?,
         )
     }
+}
+
+/// Every upstream configured for one repo/channel, in the order they are
+/// tried.
+///
+/// This and the two below take an `Executor` rather than being `Db`
+/// methods over the pool, because index regeneration calls them from
+/// inside the publish transaction, which already holds a pooled
+/// connection and the index group's advisory lock. Reaching back to the
+/// pool from in there for a *second* connection turns a pool of N into a
+/// ceiling of N/2 concurrent publishes, and past that into a deadlock
+/// every waiter sits out until `acquire_timeout` fires. Reading on the
+/// caller's own connection also puts these rows in the same transactional
+/// snapshot as the rest of the index.
+pub async fn list_in_channel<'e, E: PgExecutor<'e>>(
+    executor: E,
+    repo: &str,
+    channel: &str,
+) -> anyhow::Result<Vec<UpstreamRow>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM upstreams WHERE repo = $1 AND channel = $2 ORDER BY name"
+    ))
+    .bind(repo)
+    .bind(channel)
+    .fetch_all(executor)
+    .await?)
+}
+
+/// Every synced version of one name for one upstream.
+pub async fn list_package_versions<'e, E: PgExecutor<'e>>(
+    executor: E,
+    upstream_id: Uuid,
+    name: &str,
+) -> anyhow::Result<Vec<UpstreamPackageRow>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {UP_COLUMNS} FROM upstream_packages WHERE upstream_id = $1 AND name = $2"
+    ))
+    .bind(upstream_id)
+    .bind(name)
+    .fetch_all(executor)
+    .await?)
+}
+
+/// Every synced entry for one upstream, across every name.
+pub async fn list_all_packages<'e, E: PgExecutor<'e>>(
+    executor: E,
+    upstream_id: Uuid,
+) -> anyhow::Result<Vec<UpstreamPackageRow>> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {UP_COLUMNS} FROM upstream_packages WHERE upstream_id = $1"
+    ))
+    .bind(upstream_id)
+    .fetch_all(executor)
+    .await?)
 }
 
 #[cfg(test)]

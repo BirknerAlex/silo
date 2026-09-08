@@ -27,6 +27,10 @@ use sqlx::PgPool;
 
 pub use sqlx::types::Uuid;
 pub use sqlx::Error as SqlxError;
+/// Re-exported so callers can pass the connection a `lock::LockedTx` is
+/// holding into the queries that must run on it, without taking a direct
+/// dependency on sqlx.
+pub use sqlx::PgConnection;
 
 pub type DateTime = chrono::DateTime<chrono::Utc>;
 
