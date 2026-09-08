@@ -7,7 +7,7 @@
 //! means "the upstream claims to have this, unfetched".
 
 use serde_json::Value;
-use sqlx::{FromRow, PgExecutor};
+use sqlx::{FromRow, PgConnection, PgExecutor};
 use uuid::Uuid;
 
 use crate::{DateTime, Db};
@@ -318,33 +318,7 @@ impl Db {
     ) -> anyhow::Result<()> {
         let mut tx = self.pool().begin().await?;
 
-        for pkg in fresh {
-            sqlx::query(
-                "INSERT INTO upstream_packages (upstream_id, name, epoch, version, release, \
-                     arch, filename, download_url, size_bytes, sha256, metadata) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
-                 ON CONFLICT (upstream_id, name, epoch, version, release, arch) DO UPDATE SET \
-                     filename = excluded.filename, \
-                     download_url = excluded.download_url, \
-                     size_bytes = excluded.size_bytes, \
-                     sha256 = excluded.sha256, \
-                     metadata = excluded.metadata, \
-                     synced_at = now()",
-            )
-            .bind(upstream_id)
-            .bind(&pkg.name)
-            .bind(pkg.epoch)
-            .bind(&pkg.version)
-            .bind(&pkg.release)
-            .bind(&pkg.arch)
-            .bind(&pkg.filename)
-            .bind(&pkg.download_url)
-            .bind(pkg.size_bytes)
-            .bind(&pkg.sha256)
-            .bind(&pkg.metadata)
-            .execute(&mut *tx)
-            .await?;
-        }
+        upsert_batches(&mut tx, upstream_id, fresh).await?;
 
         // Delete anything from a prior sync that `fresh` no longer lists —
         // built as a set of tuples rather than a per-row DELETE so a
@@ -379,8 +353,7 @@ impl Db {
     /// lazy-population path npm uses (see `upstreams` module docs):
     /// there's no wholesale upstream index to replace against, so each
     /// requested name's versions are synced on their own as the name is
-    /// looked up, all in one round trip to the pool rather than one per
-    /// version.
+    /// looked up, in batched statements rather than one per version.
     pub async fn upsert_upstream_packages(
         &self,
         upstream_id: Uuid,
@@ -390,33 +363,7 @@ impl Db {
             return Ok(());
         }
         let mut tx = self.pool().begin().await?;
-        for pkg in packages {
-            sqlx::query(
-                "INSERT INTO upstream_packages (upstream_id, name, epoch, version, release, \
-                     arch, filename, download_url, size_bytes, sha256, metadata) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
-                 ON CONFLICT (upstream_id, name, epoch, version, release, arch) DO UPDATE SET \
-                     filename = excluded.filename, \
-                     download_url = excluded.download_url, \
-                     size_bytes = excluded.size_bytes, \
-                     sha256 = excluded.sha256, \
-                     metadata = excluded.metadata, \
-                     synced_at = now()",
-            )
-            .bind(upstream_id)
-            .bind(&pkg.name)
-            .bind(pkg.epoch)
-            .bind(&pkg.version)
-            .bind(&pkg.release)
-            .bind(&pkg.arch)
-            .bind(&pkg.filename)
-            .bind(&pkg.download_url)
-            .bind(pkg.size_bytes)
-            .bind(&pkg.sha256)
-            .bind(&pkg.metadata)
-            .execute(&mut *tx)
-            .await?;
-        }
+        upsert_batches(&mut tx, upstream_id, packages).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -486,6 +433,83 @@ impl Db {
                 .await?,
         )
     }
+}
+
+/// How many rows one upsert statement carries. The whole batch could go
+/// in a single statement — the arrays are bound as ten parameters however
+/// long they are — but a full rpm/deb sync is six figures of rows with a
+/// metadata blob each, and chunking bounds how much of that is
+/// materialised at once on either side of the connection.
+const UPSERT_BATCH_ROWS: usize = 5_000;
+
+/// Upserts `packages` in chunked multi-row statements on `executor`.
+///
+/// One statement per chunk rather than one per row: a single npm
+/// packument is hundreds of versions (`vue` alone is ~600) and a full rpm
+/// or deb sync is tens of thousands of entries, so a row-at-a-time loop
+/// spends the whole sync on round trips while holding a pooled connection
+/// and an open transaction.
+///
+/// Entries are deduplicated on the conflict key first, keeping the last
+/// of each. Postgres refuses an `ON CONFLICT DO UPDATE` statement that
+/// would touch the same row twice, so one upstream repeating an entry in
+/// its own index would otherwise fail the entire sync.
+async fn upsert_batches(
+    conn: &mut PgConnection,
+    upstream_id: Uuid,
+    packages: &[SyncedPackage],
+) -> anyhow::Result<()> {
+    let mut unique: std::collections::HashMap<(&str, i32, &str, &str, &str), &SyncedPackage> =
+        std::collections::HashMap::with_capacity(packages.len());
+    let mut order: Vec<(&str, i32, &str, &str, &str)> = Vec::with_capacity(packages.len());
+    for pkg in packages {
+        let key = (
+            pkg.name.as_str(),
+            pkg.epoch,
+            pkg.version.as_str(),
+            pkg.release.as_str(),
+            pkg.arch.as_str(),
+        );
+        if unique.insert(key, pkg).is_none() {
+            order.push(key);
+        }
+    }
+
+    for chunk in order.chunks(UPSERT_BATCH_ROWS) {
+        let rows: Vec<&SyncedPackage> = chunk.iter().map(|key| unique[key]).collect();
+        sqlx::query(
+            "INSERT INTO upstream_packages (upstream_id, name, epoch, version, release, \
+                 arch, filename, download_url, size_bytes, sha256, metadata) \
+             SELECT $1, * FROM UNNEST( \
+                 $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::text[], \
+                 $8::text[], $9::bigint[], $10::text[], $11::jsonb[]) \
+             ON CONFLICT (upstream_id, name, epoch, version, release, arch) DO UPDATE SET \
+                 filename = excluded.filename, \
+                 download_url = excluded.download_url, \
+                 size_bytes = excluded.size_bytes, \
+                 sha256 = excluded.sha256, \
+                 metadata = excluded.metadata, \
+                 synced_at = now()",
+        )
+        .bind(upstream_id)
+        .bind(rows.iter().map(|p| p.name.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|p| p.epoch).collect::<Vec<_>>())
+        .bind(rows.iter().map(|p| p.version.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|p| p.release.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|p| p.arch.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|p| p.filename.as_str()).collect::<Vec<_>>())
+        .bind(
+            rows.iter()
+                .map(|p| p.download_url.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(rows.iter().map(|p| p.size_bytes).collect::<Vec<_>>())
+        .bind(rows.iter().map(|p| p.sha256.as_deref()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|p| p.metadata.clone()).collect::<Vec<_>>())
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Every upstream configured for one repo/channel, in the order they are
@@ -800,6 +824,108 @@ mod tests {
 
         // An empty batch is a no-op, not an error.
         db.upsert_upstream_packages(upstream.id, &[]).await.unwrap();
+    }
+
+    /// A packument's worth of versions is upserted in a bounded number of
+    /// statements, not one per version.
+    ///
+    /// npm syncs one name at a time, on the request path, holding a
+    /// pooled connection and an open transaction for the whole sync —
+    /// and popular packages have hundreds of versions (`vue` is ~600).
+    /// A row-at-a-time loop spends that entire request on round trips,
+    /// which is what starves the pool during a bulk install.
+    #[tokio::test]
+    async fn a_packument_of_versions_is_upserted_in_a_bounded_number_of_statements() {
+        let Some(url) = std::env::var("SILO_TEST_DATABASE_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+        else {
+            eprintln!("skipping: set SILO_TEST_DATABASE_URL");
+            return;
+        };
+        let counter = crate::testutil::QueryCounter::spawn(&url)
+            .await
+            .expect("start the query counter");
+        let db = Db::connect(&crate::DbConfig {
+            url: counter.url().to_string(),
+            max_connections: 1,
+            connect_timeout: std::time::Duration::from_secs(30),
+            token_pepper: None,
+        })
+        .await
+        .expect("connect through the query counter");
+
+        let repo = unique("batchupsert");
+        let upstream = db
+            .create_upstream(&new_upstream(&repo, "stable", "npmjs"))
+            .await
+            .unwrap();
+
+        let versions: Vec<SyncedPackage> = (0..300)
+            .map(|i| SyncedPackage {
+                name: "widget".into(),
+                epoch: 0,
+                version: format!("1.0.{i}"),
+                release: String::new(),
+                arch: String::new(),
+                filename: format!("widget-1.0.{i}.tgz"),
+                download_url: format!("https://registry.example/widget/-/widget-1.0.{i}.tgz"),
+                size_bytes: Some(i),
+                sha256: None,
+                metadata: serde_json::json!({ "version": format!("1.0.{i}") }),
+            })
+            .collect();
+
+        // Everything before this — connecting, migrating, creating the
+        // upstream — is setup, not what is being measured.
+        counter.take();
+        db.upsert_upstream_packages(upstream.id, &versions)
+            .await
+            .unwrap();
+        let queries = counter.take();
+        assert!(
+            queries <= 8,
+            "300 versions cost {queries} queries; it should be a transaction and a handful of \
+             batched statements, not one per version"
+        );
+
+        let stored = db
+            .list_upstream_package_versions(upstream.id, "widget")
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 300);
+    }
+
+    /// An upstream that lists the same entry twice in its own index must
+    /// not fail the sync: Postgres refuses an `ON CONFLICT DO UPDATE`
+    /// statement that would touch one row twice.
+    #[tokio::test]
+    async fn a_repeated_entry_in_one_batch_is_collapsed_rather_than_rejected() {
+        let Some(db) = db().await else {
+            eprintln!("skipping: set SILO_TEST_DATABASE_URL");
+            return;
+        };
+        let repo = unique("dupbatch");
+        let upstream = db
+            .create_upstream(&new_upstream(&repo, "stable", "npmjs"))
+            .await
+            .unwrap();
+
+        let mut first = synced("widget", "1.0");
+        first.download_url = "https://registry.example/first".into();
+        let mut second = synced("widget", "1.0");
+        second.download_url = "https://registry.example/second".into();
+
+        db.upsert_upstream_packages(upstream.id, &[first, second])
+            .await
+            .expect("a duplicated entry must not fail the sync");
+
+        let stored = db
+            .list_upstream_package_versions(upstream.id, "widget")
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].download_url, "https://registry.example/second");
     }
 
     #[tokio::test]
