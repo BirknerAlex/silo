@@ -732,6 +732,15 @@ async fn lazy_sync_npm_upstream_packages(
         .await
         {
             Ok(f) if !f.is_empty() => {
+                // This sync just added rows to `upstream_packages`, and
+                // the in-memory index cache is rebuilt wholesale rather
+                // than patched (see `upstream_index_cache`'s module doc),
+                // so a cached copy of this upstream is now missing the
+                // very name the request is about. Without this, an
+                // upstream with `cache_index_in_memory` set can never
+                // serve a name it didn't already have cached: the retry
+                // reads the same stale copy the first attempt did.
+                state.publish.upstream_index_cache.invalidate(upstream.id);
                 fetched = f;
                 break;
             }
