@@ -390,10 +390,38 @@ impl Db {
         list_all_packages(self.pool(), upstream_id).await
     }
 
-    /// Looks up one upstream's synced entry by filename — what the
+    /// Looks up one upstream's synced entry by package name *and*
+    /// filename — what the storage-miss path in `serve_package` resolves
+    /// a requested object key against for a format whose filenames are
+    /// only unique within a package.
+    ///
+    /// npm is that format: a tarball is named after the unscoped half of
+    /// the package name, so `@eslint/core`, `@humanfs/core` and
+    /// `@sentry/core` all ship a `core-0.15.0.tgz`. Resolving one of
+    /// those by filename alone picks an arbitrary one of the three, and
+    /// the client gets a tarball for a package it did not ask for.
+    pub async fn find_upstream_package_by_name_and_filename(
+        &self,
+        upstream_id: Uuid,
+        name: &str,
+        filename: &str,
+    ) -> anyhow::Result<Option<UpstreamPackageRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {UP_COLUMNS} FROM upstream_packages \
+             WHERE upstream_id = $1 AND name = $2 AND filename = $3"
+        ))
+        .bind(upstream_id)
+        .bind(name)
+        .bind(filename)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+
+    /// Looks up one upstream's synced entry by filename alone — what the
     /// storage-miss path in `serve_package` resolves a requested object
     /// key's filename against to find a download URL and cache/no-cache
-    /// disposition.
+    /// disposition, for the formats (rpm, deb, apk, pacman) whose
+    /// filenames carry the package name and so are unique on their own.
     pub async fn find_upstream_package_by_filename(
         &self,
         upstream_id: Uuid,
@@ -951,6 +979,63 @@ mod tests {
         assert_eq!(found.name, "curl");
         assert!(db
             .find_upstream_package_by_filename(upstream.id, "does-not-exist.rpm")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// npm tarballs are named after the unscoped half of the package
+    /// name, so several packages in one upstream legitimately share a
+    /// filename. A lookup that names the package must return that
+    /// package's row and no other's.
+    #[tokio::test]
+    async fn a_filename_shared_by_several_names_resolves_to_the_one_asked_for() {
+        let Some(db) = db().await else {
+            eprintln!("skipping: set SILO_TEST_DATABASE_URL");
+            return;
+        };
+        let repo = unique("bynamefile");
+        let upstream = db
+            .create_upstream(&new_upstream(&repo, "stable", "npmjs"))
+            .await
+            .unwrap();
+        let shared = |name: &str| SyncedPackage {
+            name: name.to_string(),
+            epoch: 0,
+            version: "0.15.0".into(),
+            release: String::new(),
+            arch: String::new(),
+            filename: "core-0.15.0.tgz".into(),
+            download_url: format!("https://registry.example/{name}/-/core-0.15.0.tgz"),
+            size_bytes: None,
+            sha256: None,
+            metadata: serde_json::json!({}),
+        };
+        db.upsert_upstream_packages(
+            upstream.id,
+            &[shared("@eslint/core"), shared("@humanfs/core")],
+        )
+        .await
+        .unwrap();
+
+        for name in ["@eslint/core", "@humanfs/core"] {
+            let found = db
+                .find_upstream_package_by_name_and_filename(upstream.id, name, "core-0.15.0.tgz")
+                .await
+                .unwrap()
+                .expect("the named package's row");
+            assert_eq!(found.name, name);
+            assert_eq!(
+                found.download_url,
+                format!("https://registry.example/{name}/-/core-0.15.0.tgz")
+            );
+        }
+        assert!(db
+            .find_upstream_package_by_name_and_filename(
+                upstream.id,
+                "@sentry/core",
+                "core-0.15.0.tgz"
+            )
             .await
             .unwrap()
             .is_none());
