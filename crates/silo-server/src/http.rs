@@ -669,15 +669,35 @@ enum PackumentPullThrough {
     UpstreamError,
 }
 
-/// Returns [`PackumentPullThrough::NotFound`] when there's nothing to do
-/// (no npm upstream configured, or every configured upstream confirmed it
-/// doesn't have this name), so the caller falls back to its ordinary 404.
-async fn pull_through_npm_packument(
+/// The outcome of syncing `upstream_packages` for one name from whichever
+/// configured upstream actually has it — the shared first half of both
+/// [`pull_through_npm_packument`] and the tarball route's lazy-sync
+/// fallback (see `get_npm`'s `NpmRequest::Tarball` handling). Kept
+/// separate from any index-regeneration/readback so a caller that's only
+/// about to re-check the *tarball* index right after (the tarball
+/// fallback) doesn't pay for rendering and persisting a packument JSON it
+/// never reads — that used to mean two full advisory-lock index
+/// regenerations (packument, then the tarball's own) for one request,
+/// exactly the kind of avoidable DB round-trip that starves the
+/// connection pool under a big, highly concurrent install.
+enum NpmLazySync {
+    Synced,
+    NotFound,
+    UpstreamError,
+}
+
+/// Tries each configured npm upstream in order for `name`, upserting
+/// whichever one has it into `upstream_packages` — falling through to the
+/// next on a confirmed miss (or fetch failure), same reasoning as
+/// `pull_through_miss`'s multi-upstream loop. Does not touch the
+/// rendered/stored packument at all; callers that need it call
+/// `regenerate_index` themselves afterward.
+async fn lazy_sync_npm_upstream_packages(
     state: &AppState,
     repo: &str,
     channel: &str,
     name: &str,
-) -> PackumentPullThrough {
+) -> NpmLazySync {
     let upstreams = match silo_core::pull_through::select_upstreams(
         &state.db,
         repo,
@@ -689,7 +709,7 @@ async fn pull_through_npm_packument(
         Ok(upstreams) => upstreams,
         Err(e) => {
             tracing::error!(error = %e, repo, channel, "could not look up pull-through upstreams");
-            return PackumentPullThrough::UpstreamError;
+            return NpmLazySync::UpstreamError;
         }
     };
 
@@ -743,11 +763,29 @@ async fn pull_through_npm_packument(
         }
     }
     if fetched.is_empty() {
-        return if saw_transient_error {
-            PackumentPullThrough::UpstreamError
+        if saw_transient_error {
+            NpmLazySync::UpstreamError
         } else {
-            PackumentPullThrough::NotFound
-        };
+            NpmLazySync::NotFound
+        }
+    } else {
+        NpmLazySync::Synced
+    }
+}
+
+/// Returns [`PackumentPullThrough::NotFound`] when there's nothing to do
+/// (no npm upstream configured, or every configured upstream confirmed it
+/// doesn't have this name), so the caller falls back to its ordinary 404.
+async fn pull_through_npm_packument(
+    state: &AppState,
+    repo: &str,
+    channel: &str,
+    name: &str,
+) -> PackumentPullThrough {
+    match lazy_sync_npm_upstream_packages(state, repo, channel, name).await {
+        NpmLazySync::NotFound => return PackumentPullThrough::NotFound,
+        NpmLazySync::UpstreamError => return PackumentPullThrough::UpstreamError,
+        NpmLazySync::Synced => {}
     }
 
     if let Err(e) = silo_core::repo::regenerate_index(
@@ -1268,10 +1306,10 @@ async fn get_npm(
             // fetching the packument, so nothing has lazily synced
             // `upstream_packages` for it in that case. Trigger that sync
             // now and retry once before giving up.
-            match pull_through_npm_packument(&state, &repo, &channel, &name).await {
-                PackumentPullThrough::UpstreamError => npm_upstream_error(&state),
-                PackumentPullThrough::NotFound => response,
-                PackumentPullThrough::Found(_) => {
+            match lazy_sync_npm_upstream_packages(&state, &repo, &channel, &name).await {
+                NpmLazySync::UpstreamError => npm_upstream_error(&state),
+                NpmLazySync::NotFound => response,
+                NpmLazySync::Synced => {
                     serve_package(&state, &key, PackageFormat::Npm, &auth, &repo, &channel).await
                 }
             }
