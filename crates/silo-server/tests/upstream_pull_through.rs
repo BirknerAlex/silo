@@ -1872,3 +1872,92 @@ async fn a_tarball_first_request_resolves_in_one_pass() {
         "a tarball that was served must not also be counted as a 404"
     );
 }
+
+/// npm's lazy per-name sync invalidates the upstream's in-memory index
+/// copy, so the request that triggered the sync can see what it wrote.
+///
+/// The cache is rebuilt wholesale rather than patched entry by entry (see
+/// `upstream_index_cache`'s module doc), which makes every writer
+/// responsible for dropping it. npm's sync writes rows on the request
+/// path itself: without the drop, a tarball request reads a cached copy,
+/// syncs the name it is missing, and then re-reads the same stale copy —
+/// so an upstream with `cache_index_in_memory` set can never serve a name
+/// that wasn't already in the cache.
+#[tokio::test]
+async fn an_npm_lazy_sync_drops_the_upstreams_cached_index() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npmcachedindex");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "db_name": "registry" })),
+        )
+        .mount(&mock)
+        .await;
+    let tarball_bytes = build_test_npm("widget", "1.0.0");
+    Mock::given(method("GET"))
+        .and(path("/widget"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "widget",
+            "versions": {
+                "1.0.0": {
+                    "name": "widget",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/widget/-/widget-1.0.0.tgz", mock.uri()),
+                        "shasum": "abc123",
+                    },
+                },
+            },
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/widget/-/widget-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball_bytes.clone()))
+        .mount(&mock)
+        .await;
+
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "npmjs".into(),
+                format: silo_proto::v1::PackageFormat::Npm as i32,
+                base_url: mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: true,
+                auth: None,
+                arches: vec![],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add_upstream");
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    let response = get(
+        &harness.state,
+        &format!("/{repo}/stable/npm/widget/-/widget-1.0.0.tgz"),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "a name synced on the request path must be visible to the retry that follows it"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.to_vec(), tarball_bytes);
+}
