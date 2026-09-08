@@ -28,7 +28,7 @@ use silo_core::config::{
 };
 use silo_core::{PublishContext, Signers, Storage};
 use silo_db::tokens::{IssuedToken, NewToken, Permission, Scope, TokenKind};
-use silo_db::{Db, DbConfig};
+use silo_db::Db;
 use silo_server::metrics::Metrics;
 use silo_server::AppState;
 
@@ -75,15 +75,6 @@ impl Harness {
     }
 
     pub async fn with_config(url: &str, tweak: impl FnOnce(&mut Config)) -> Self {
-        let db = Db::connect(&DbConfig {
-            url: url.to_string(),
-            max_connections: 8,
-            connect_timeout: std::time::Duration::from_secs(30),
-            token_pepper: None,
-        })
-        .await
-        .expect("connect to the test database");
-
         let mut config = Config {
             addr: "127.0.0.1:0".into(),
             public_base_url: Some("https://silo.test".into()),
@@ -110,6 +101,14 @@ impl Harness {
             upstream_secret: None,
         };
         tweak(&mut config);
+
+        // Connected from the (possibly tweaked) config rather than from
+        // separate constants, so a test that cares about pool size — how
+        // many connections one request path holds at once, say — can set
+        // it the same way an operator would.
+        let db = Db::connect(&config.database.to_db_config(None))
+            .await
+            .expect("connect to the test database");
 
         // In-memory object storage: these tests are about the database and
         // the index contents, and a real bucket would make them slow and
