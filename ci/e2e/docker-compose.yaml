@@ -56,9 +56,13 @@ services:
     networks: [silo]
 
   silo:
-    build:
+    build: &silo-build
       context: ../..
       dockerfile: Dockerfile
+    # Named explicitly and shared with silo-upstream below: both services
+    # build the identical image, and without a common tag Compose keeps
+    # them as two separately-tagged images instead of one.
+    image: silo-e2e:local
     depends_on:
       postgres:
         condition: service_healthy
@@ -108,9 +112,8 @@ services:
     networks: [silo]
 
   silo-upstream:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    build: *silo-build
+    image: silo-e2e:local
     depends_on:
       postgres-upstream:
         condition: service_healthy
