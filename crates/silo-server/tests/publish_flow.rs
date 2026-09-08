@@ -1086,3 +1086,63 @@ async fn a_wrong_pepper_invalidates_every_token() {
         "changing the pepper must invalidate tokens hashed without it"
     );
 }
+
+/// A package's own bytes are uploaded before the index lock is taken.
+///
+/// Only the index is contended: the bytes go to a key derived from the
+/// package's own identity, so two publishes of the same version write
+/// the same bytes to the same key and a different version writes
+/// somewhere else. Uploading inside the lock makes every concurrent
+/// publisher of one package queue behind an upload none of them needs
+/// serialised, holding a pooled connection the whole time.
+#[tokio::test]
+async fn a_package_is_uploaded_before_the_index_lock_is_taken() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("uploadoutsidelock");
+    let key = format!("{repo}/stable/npm/widget/-/widget-1.0.0.tgz");
+
+    // Hold the group's index lock, so a publish into it can only get as
+    // far as whatever it does before asking for the lock.
+    let held = harness
+        .db
+        .lock(silo_db::lock::index_scope(&repo, "stable", "npm", "widget"))
+        .await
+        .expect("take the index lock");
+
+    let publish = tokio::spawn({
+        let ctx = harness.state.publish.clone();
+        let repo = repo.clone();
+        async move {
+            silo_core::repo::publish(
+                &ctx,
+                &repo,
+                "stable",
+                PackageFormat::Npm,
+                build_test_npm("widget", "1.0.0"),
+                &actor(),
+            )
+            .await
+        }
+    });
+
+    let uploaded = async {
+        loop {
+            if harness.state.storage.head(&key).await.unwrap() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let uploaded = tokio::time::timeout(std::time::Duration::from_secs(5), uploaded)
+        .await
+        .unwrap_or(false);
+
+    held.commit().await.expect("release the index lock");
+    publish.await.unwrap().expect("publish");
+
+    assert!(
+        uploaded,
+        "the package bytes were still not in storage while the index lock was held elsewhere"
+    );
+}

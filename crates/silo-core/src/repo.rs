@@ -21,13 +21,14 @@
 //!
 //! ## Ordering, and the one failure mode left
 //!
-//! Bytes are written to object storage before the row is committed, so a
-//! reader following a freshly published index never 404s. The cost is that
-//! a crash between the upload and the commit leaves orphaned bytes in the
-//! bucket that no row references. They're invisible (nothing links to
-//! them) and the next publish of the same file overwrites them. The
-//! opposite ordering would trade that for a committed row pointing at
-//! bytes that aren't there yet — a 404 for real clients — which is worse.
+//! Bytes are written to object storage before the index lock is taken,
+//! and so before the row is committed: a reader following a freshly
+//! published index never 404s. The cost is that a crash between the
+//! upload and the commit leaves orphaned bytes in the bucket that no row
+//! references. They're invisible (nothing links to them) and the next
+//! publish of the same file overwrites them. The opposite ordering would
+//! trade that for a committed row pointing at bytes that aren't there
+//! yet — a 404 for real clients — which is worse.
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -173,10 +174,19 @@ pub async fn publish_with_origin(
     let sha256 = hex_sha256(&payload);
     let size_bytes = payload.len() as i64;
 
+    // Before the lock, not inside it. The bytes go to a key derived from
+    // the package's own identity, so this races nothing: two publishes of
+    // the same version write the same bytes to the same key, and a
+    // publish of a different version writes somewhere else entirely. Only
+    // the *index* is contended, and the ordering the module doc describes
+    // -- bytes in the bucket before the row is committed -- holds either
+    // way. Doing it under the lock instead makes every concurrent
+    // publisher of the same package wait out an upload none of them needs
+    // serialised, while holding a pooled connection.
+    ctx.storage.put(&storage_key, payload).await?;
+
     let scope = lock::index_scope(repo, channel, format.as_str(), &index_group);
     let mut locked = ctx.db.lock(scope).await?;
-
-    ctx.storage.put(&storage_key, payload).await?;
 
     let new_package = NewPackage {
         repo: repo.to_string(),
