@@ -138,6 +138,16 @@ externalPostgres:
 config:
   publicBaseUrl: ""
 
+  database:
+    # Pooled connections per replica. Every request that reaches Postgres
+    # holds one for its duration, and a publish holds one for the whole of
+    # its index regeneration, so this is the ceiling on concurrent work —
+    # past it, requests queue and then fail with `pool timed out while
+    # waiting for an open connection`. Raise it for a busy registry, and
+    # keep Postgres's own max_connections above `replicaCount × this` plus
+    # room for administrative connections.
+    maxConnections: 25
+
   storage:
     bucket: silo
     region: us-east-1

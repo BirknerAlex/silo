@@ -64,6 +64,15 @@ pub struct Config {
 pub struct DatabaseConfig {
     /// `postgres://user:password@host:5432/silo`.
     pub url: String,
+    /// Pooled connections per replica. Every request that reaches
+    /// Postgres holds one for its duration, and a publish holds one for
+    /// the whole of its index regeneration, so this is the ceiling on
+    /// concurrent work — past it, requests queue and then fail with
+    /// `pool timed out while waiting for an open connection`. A bulk npm
+    /// install turns every cache miss into a publish and reaches that
+    /// ceiling quickly. Size it against Postgres, whose own
+    /// `max_connections` has to cover `replicas × this` plus room for
+    /// administrative connections.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
     /// How long to keep retrying an unreachable database on startup.
@@ -74,7 +83,7 @@ pub struct DatabaseConfig {
 }
 
 fn default_max_connections() -> u32 {
-    10
+    25
 }
 
 fn default_connect_timeout_seconds() -> u64 {
@@ -590,7 +599,7 @@ storage:
         let cfg: Config = serde_yaml::from_str(MINIMAL).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.storage.bucket, "silo");
-        assert_eq!(cfg.database.max_connections, 10);
+        assert_eq!(cfg.database.max_connections, 25);
         assert!(cfg.auth.bootstrap);
         assert!(cfg.metrics.enabled);
         assert!(cfg.audit.log_downloads);
