@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.3](https://github.com/BirknerAlex/silo/compare/v0.13.2...v0.13.3) (2026-09-08)
+
+
+### Bug fixes
+
+* **pull-through:** lazily sync npm's index from the tarball route too, not just the packument route ([4cdd0df](https://github.com/BirknerAlex/silo/commit/4cdd0df5c78bd021d4b1776221ad17dc07af39f1))
+
 ## [0.13.2](https://github.com/BirknerAlex/silo/compare/v0.13.1...v0.13.2) (2026-09-07)
 
 
