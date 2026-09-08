@@ -1526,4 +1526,27 @@ async fn a_tarball_request_with_no_prior_packument_fetch_still_lazily_syncs() {
         .await
         .unwrap();
     assert_eq!(body.to_vec(), tarball_bytes);
+
+    // Regression: the lazy-sync fallback used to render and persist a full
+    // packument JSON (a locked `index.regenerate`) that the tarball path
+    // never reads, on top of the index regeneration the tarball's own
+    // `FetchAndCache` already does via `publish_with_origin` — two
+    // advisory-lock-scoped regenerations for one request. The fallback
+    // must only sync `upstream_packages`, leaving the one real index
+    // regeneration to the tarball fetch itself, so no separate
+    // `index.regenerate` audit entry should exist for this repo at all.
+    let regenerate_entries = harness
+        .db
+        .query_audit(&silo_db::audit::AuditQuery {
+            action: Some("index.regenerate".into()),
+            repo: Some(repo.clone()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        regenerate_entries.is_empty(),
+        "a tarball-first request must not trigger a separate packument index regeneration: {regenerate_entries:?}"
+    );
 }
