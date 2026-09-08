@@ -16,6 +16,8 @@ pub mod lock;
 pub mod packages;
 pub mod prune;
 pub mod repos;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testutil;
 pub mod tokens;
 pub mod upstreams;
 pub mod users;
