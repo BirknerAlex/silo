@@ -1550,3 +1550,103 @@ async fn a_tarball_request_with_no_prior_packument_fetch_still_lazily_syncs() {
         "a tarball-first request must not trigger a separate packument index regeneration: {regenerate_entries:?}"
     );
 }
+
+/// Regression: `merge_upstream_records` used to load *every* synced row of
+/// an npm upstream (one per version of every name ever pulled through it —
+/// tens of thousands of rows, each with a full metadata blob) and filter
+/// down to the one package name in memory, on every publish/regeneration
+/// of a single package, while holding that group's advisory lock and a
+/// pool connection. npm groups are per-name, so only that name's versions
+/// may be consulted. The observable contract this pins down: rendering
+/// one name's packument must include exactly that name's upstream
+/// versions and none of a sibling's, no matter how many other names the
+/// same upstream has synced.
+#[tokio::test]
+async fn an_npm_packument_only_merges_its_own_names_upstream_versions() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npmscopedmerge");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "db_name": "registry" })),
+        )
+        .mount(&mock)
+        .await;
+    for (name, versions) in [
+        ("widget", vec!["1.0.0", "1.1.0"]),
+        ("gadget", vec!["2.0.0"]),
+    ] {
+        let mut entries = serde_json::Map::new();
+        for v in &versions {
+            entries.insert(
+                v.to_string(),
+                serde_json::json!({
+                    "name": name,
+                    "version": v,
+                    "dist": {
+                        "tarball": format!("{}/{name}/-/{name}-{v}.tgz", mock.uri()),
+                        "shasum": "abc123",
+                    },
+                }),
+            );
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "versions": entries,
+            })))
+            .mount(&mock)
+            .await;
+    }
+
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "npmjs".into(),
+                format: silo_proto::v1::PackageFormat::Npm as i32,
+                base_url: mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec![],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add_upstream");
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    // Sync both names so the upstream has rows for more than one group.
+    for name in ["gadget", "widget"] {
+        let resp = get(&harness.state, &format!("/{repo}/stable/npm/{name}")).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "GET {name}");
+    }
+
+    let resp = get(&harness.state, &format!("/{repo}/stable/npm/widget")).await;
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let versions = doc["versions"].as_object().expect("versions object");
+    let mut keys: Vec<&str> = versions.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["1.0.0", "1.1.0"], "{doc}");
+    for entry in versions.values() {
+        assert_eq!(
+            entry["name"], "widget",
+            "a sibling name leaked into this packument: {doc}"
+        );
+    }
+}

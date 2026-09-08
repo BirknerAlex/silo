@@ -433,7 +433,7 @@ async fn merge_upstream_records(
         if rpm_signing_would_invalidate_the_checksum && upstream.cache_mode == "cache" {
             continue;
         }
-        let synced = upstream_packages_for(ctx, upstream).await?;
+        let synced = upstream_packages_for_group(ctx, upstream, format, index_group).await?;
         for row in synced.iter() {
             if seen_filenames.contains(&row.filename) {
                 continue;
@@ -469,6 +469,36 @@ async fn merge_upstream_records(
         }
     }
     Ok(())
+}
+
+/// The synced entries of one upstream that can possibly belong to
+/// `index_group`, fetched as narrowly as the format allows.
+///
+/// npm partitions its index by package name, so an npm group only ever
+/// needs that one name's versions — and an npm upstream that mirrors a
+/// public registry accumulates one row per version of every name anyone
+/// has ever pulled through it (tens of thousands of rows, each carrying
+/// the full version `metadata` blob). Loading all of that on every
+/// publish/regeneration of a single package — while holding the group's
+/// advisory lock and a pool connection — is what turned a big concurrent
+/// install into `pool timed out while waiting for an open connection`.
+/// Every other format's index is a whole architecture (or the whole
+/// repo), so those still take the full set, via the in-memory cache when
+/// enabled.
+async fn upstream_packages_for_group(
+    ctx: &PublishContext,
+    upstream: &silo_db::upstreams::UpstreamRow,
+    format: PackageFormat,
+    index_group: &str,
+) -> anyhow::Result<std::sync::Arc<Vec<silo_db::upstreams::UpstreamPackageRow>>> {
+    if format == PackageFormat::Npm {
+        return Ok(std::sync::Arc::new(
+            ctx.db
+                .list_upstream_package_versions(upstream.id, index_group)
+                .await?,
+        ));
+    }
+    upstream_packages_for(ctx, upstream).await
 }
 
 /// Every synced entry for one upstream, via the opt-in in-memory cache
