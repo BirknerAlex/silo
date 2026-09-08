@@ -352,10 +352,16 @@ async fn serve_package(
     // client to a URL that will itself 404.
     let result = match state.storage.head(key).await {
         Ok(true) => serve_existing_package(state, key, format, auth, repo, channel).await,
-        Ok(false) => match pull_through_miss(state, key, format, repo, channel, package_name).await
-        {
-            Some(response) => response,
-            None => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Ok(false) => match upstreams_for(state, repo, channel, format).await {
+            Ok(upstreams) => {
+                match pull_through_miss(state, key, format, repo, channel, package_name, &upstreams)
+                    .await
+                {
+                    Some(response) => response,
+                    None => (StatusCode::NOT_FOUND, "not found").into_response(),
+                }
+            }
+            Err(response) => response,
         },
         Err(e) => {
             tracing::error!(error = %e, key, "failed to check package existence");
@@ -446,27 +452,16 @@ async fn pull_through_miss(
     repo: &str,
     channel: &str,
     package_name: Option<&str>,
+    upstreams: &[silo_db::upstreams::UpstreamRow],
 ) -> Option<Response> {
     let filename = key.rsplit('/').next().unwrap_or(key);
-
-    let upstreams = match silo_core::pull_through::select_upstreams(
-        &state.db, repo, channel, format,
-    )
-    .await
-    {
-        Ok(upstreams) => upstreams,
-        Err(e) => {
-            tracing::error!(error = %e, repo, channel, "could not look up pull-through upstreams");
-            return Some((StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response());
-        }
-    };
 
     // Try each configured upstream in order, falling through to the next
     // on a confirmed miss — a name that only the second upstream has must
     // still resolve, not silently lose to whichever upstream sorts first.
     let mut upstream_pkg = None;
     let mut matched_upstream = None;
-    for upstream in &upstreams {
+    for upstream in upstreams {
         // When the in-memory cache is enabled for this upstream, read
         // through it — the same one the index merge uses, so the two
         // lookup paths never disagree about what's fresh. Otherwise this
@@ -718,31 +713,15 @@ enum NpmLazySync {
 /// `regenerate_index` themselves afterward.
 async fn lazy_sync_npm_upstream_packages(
     state: &AppState,
-    repo: &str,
-    channel: &str,
     name: &str,
+    upstreams: &[silo_db::upstreams::UpstreamRow],
 ) -> NpmLazySync {
-    let upstreams = match silo_core::pull_through::select_upstreams(
-        &state.db,
-        repo,
-        channel,
-        PackageFormat::Npm,
-    )
-    .await
-    {
-        Ok(upstreams) => upstreams,
-        Err(e) => {
-            tracing::error!(error = %e, repo, channel, "could not look up pull-through upstreams");
-            return NpmLazySync::UpstreamError;
-        }
-    };
-
     // Try each configured npm upstream in order, falling through to the
     // next on a confirmed miss (or fetch failure) — see `pull_through_miss`
     // for why stopping at the first candidate is wrong.
     let mut fetched = Vec::new();
     let mut saw_transient_error = false;
-    for upstream in &upstreams {
+    for upstream in upstreams {
         match silo_core::upstream_sync::sync_npm_package(
             &state.db,
             state.upstream_http.clone(),
@@ -806,7 +785,21 @@ async fn pull_through_npm_packument(
     channel: &str,
     name: &str,
 ) -> PackumentPullThrough {
-    match lazy_sync_npm_upstream_packages(state, repo, channel, name).await {
+    let upstreams = match silo_core::pull_through::select_upstreams(
+        &state.db,
+        repo,
+        channel,
+        PackageFormat::Npm,
+    )
+    .await
+    {
+        Ok(upstreams) => upstreams,
+        Err(e) => {
+            tracing::error!(error = %e, repo, channel, "could not look up pull-through upstreams");
+            return PackumentPullThrough::UpstreamError;
+        }
+    };
+    match lazy_sync_npm_upstream_packages(state, name, &upstreams).await {
         NpmLazySync::NotFound => return PackumentPullThrough::NotFound,
         NpmLazySync::UpstreamError => return PackumentPullThrough::UpstreamError,
         NpmLazySync::Synced => {}
@@ -1354,45 +1347,113 @@ async fn get_npm(
                 "{}/-/{file}",
                 silo_pkg::npm::package_prefix(&repo, &channel, &name)
             );
-            let response = serve_package(
-                &state,
-                &key,
-                PackageFormat::Npm,
-                &auth,
-                &repo,
-                &channel,
-                Some(&name),
-            )
-            .await;
-            if response.status() != StatusCode::NOT_FOUND {
-                return response;
-            }
-            // Nothing indexed for this name yet — npm's structural gap
-            // (see `pull_through_npm_packument`'s doc): a client that
-            // already knows name+version+integrity from its own lockfile
-            // is entitled to go straight for the tarball without ever
-            // fetching the packument, so nothing has lazily synced
-            // `upstream_packages` for it in that case. Trigger that sync
-            // now and retry once before giving up.
-            match lazy_sync_npm_upstream_packages(&state, &repo, &channel, &name).await {
-                NpmLazySync::UpstreamError => npm_upstream_error(&state),
-                NpmLazySync::NotFound => response,
-                NpmLazySync::Synced => {
-                    serve_package(
-                        &state,
-                        &key,
-                        PackageFormat::Npm,
-                        &auth,
-                        &repo,
-                        &channel,
-                        Some(&name),
-                    )
-                    .await
-                }
-            }
+            serve_npm_tarball(&state, &key, &auth, &repo, &channel, &name).await
         }
         None => npm_not_found(&state),
     }
+}
+
+/// Serves an npm tarball.
+///
+/// This is the other formats' package route plus one step. A client that
+/// already knows name+version+integrity from its own lockfile is entitled
+/// to go straight for the tarball without ever fetching the packument
+/// (npm, bun, yarn and pnpm all do), so on the first such request nothing
+/// has lazily synced this name's versions and there is no row to resolve
+/// the filename against — npm's structural gap, see
+/// [`pull_through_npm_packument`]'s doc. That is not a 404: it is exactly
+/// where the sync belongs. The miss is retried once against the rows the
+/// sync just wrote, reusing the upstream list and the storage check the
+/// first attempt already made.
+///
+/// The response is built once and counted once, so the "nothing indexed
+/// yet" step in the middle is never reported as a 404 that was served.
+async fn serve_npm_tarball(
+    state: &AppState,
+    key: &str,
+    auth: &Authenticated,
+    repo: &str,
+    channel: &str,
+    name: &str,
+) -> Response {
+    let result = npm_tarball_response(state, key, auth, repo, channel, name).await;
+    state
+        .metrics
+        .http_requests
+        .with_label_values(&["npm-package", result.status().as_str()])
+        .inc();
+    result
+}
+
+async fn npm_tarball_response(
+    state: &AppState,
+    key: &str,
+    auth: &Authenticated,
+    repo: &str,
+    channel: &str,
+    name: &str,
+) -> Response {
+    match state.storage.head(key).await {
+        Ok(true) => {
+            return serve_existing_package(state, key, PackageFormat::Npm, auth, repo, channel)
+                .await
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(error = %e, key, "failed to check package existence");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response();
+        }
+    }
+
+    let upstreams = match upstreams_for(state, repo, channel, PackageFormat::Npm).await {
+        Ok(upstreams) => upstreams,
+        Err(response) => return response,
+    };
+    if let Some(response) = pull_through_miss(
+        state,
+        key,
+        PackageFormat::Npm,
+        repo,
+        channel,
+        Some(name),
+        &upstreams,
+    )
+    .await
+    {
+        return response;
+    }
+
+    match lazy_sync_npm_upstream_packages(state, name, &upstreams).await {
+        NpmLazySync::UpstreamError => npm_upstream_error_body(),
+        NpmLazySync::NotFound => npm_not_found_body(),
+        NpmLazySync::Synced => pull_through_miss(
+            state,
+            key,
+            PackageFormat::Npm,
+            repo,
+            channel,
+            Some(name),
+            &upstreams,
+        )
+        .await
+        .unwrap_or_else(npm_not_found_body),
+    }
+}
+
+/// The configured upstreams for one `(repo, channel, format)`, or the
+/// response to send if they can't be read.
+async fn upstreams_for(
+    state: &AppState,
+    repo: &str,
+    channel: &str,
+    format: PackageFormat,
+) -> Result<Vec<silo_db::upstreams::UpstreamRow>, Response> {
+    silo_core::pull_through::select_upstreams(&state.db, repo, channel, format)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, repo, channel, "could not look up pull-through upstreams");
+            (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response()
+        })
 }
 
 /// npm expects a JSON body on 404s and prints the `error` field verbatim.
@@ -1402,6 +1463,10 @@ fn npm_not_found(state: &AppState) -> Response {
         .http_requests
         .with_label_values(&["npm-index", "404"])
         .inc();
+    npm_not_found_body()
+}
+
+fn npm_not_found_body() -> Response {
     (
         StatusCode::NOT_FOUND,
         [(header::CONTENT_TYPE, "application/json")],
@@ -1421,6 +1486,10 @@ fn npm_upstream_error(state: &AppState) -> Response {
         .http_requests
         .with_label_values(&["npm-index", "502"])
         .inc();
+    npm_upstream_error_body()
+}
+
+fn npm_upstream_error_body() -> Response {
     (
         StatusCode::BAD_GATEWAY,
         [(header::CONTENT_TYPE, "application/json")],
