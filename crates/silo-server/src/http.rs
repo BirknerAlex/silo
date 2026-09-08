@@ -341,6 +341,7 @@ async fn serve_package(
     auth: &Authenticated,
     repo: &str,
     channel: &str,
+    package_name: Option<&str>,
 ) -> Response {
     let surface = format!("{}-package", format.as_str());
 
@@ -351,7 +352,8 @@ async fn serve_package(
     // client to a URL that will itself 404.
     let result = match state.storage.head(key).await {
         Ok(true) => serve_existing_package(state, key, format, auth, repo, channel).await,
-        Ok(false) => match pull_through_miss(state, key, format, repo, channel).await {
+        Ok(false) => match pull_through_miss(state, key, format, repo, channel, package_name).await
+        {
             Some(response) => response,
             None => (StatusCode::NOT_FOUND, "not found").into_response(),
         },
@@ -428,12 +430,22 @@ async fn serve_existing_package(
 /// credential reach the response in any form (redirect Location, body, or
 /// error message) — the hard credential-isolation invariant pull-through
 /// is built around.
+///
+/// `package_name` is the package the requested artifact belongs to, for
+/// the formats whose filenames are only unique within one package — npm,
+/// whose tarballs are named after the unscoped half of the name, so
+/// `@eslint/core`, `@humanfs/core` and `@sentry/core` all publish a
+/// `core-0.15.0.tgz`. Resolving the request by filename alone would pick
+/// an arbitrary one of them, cache it under *its* name, and hand the
+/// client the wrong package's bytes. rpm/deb/apk/pacman filenames carry
+/// the package name already and pass `None`.
 async fn pull_through_miss(
     state: &AppState,
     key: &str,
     format: PackageFormat,
     repo: &str,
     channel: &str,
+    package_name: Option<&str>,
 ) -> Option<Response> {
     let filename = key.rsplit('/').next().unwrap_or(key);
 
@@ -464,7 +476,19 @@ async fn pull_through_miss(
         let found = if upstream.cache_index_in_memory {
             silo_core::repo::upstream_packages_for(&state.publish, upstream)
                 .await
-                .map(|synced| synced.iter().find(|r| r.filename == filename).cloned())
+                .map(|synced| {
+                    synced
+                        .iter()
+                        .find(|r| {
+                            r.filename == filename && package_name.is_none_or(|name| r.name == name)
+                        })
+                        .cloned()
+                })
+        } else if let Some(name) = package_name {
+            state
+                .db
+                .find_upstream_package_by_name_and_filename(upstream.id, name, filename)
+                .await
         } else {
             state
                 .db
@@ -960,7 +984,16 @@ async fn get_rpm_package(
         "{}/{file}",
         silo_core::repo::packages_prefix(&repo, &channel)
     );
-    serve_package(&state, &key, PackageFormat::Rpm, &auth, &repo, &channel).await
+    serve_package(
+        &state,
+        &key,
+        PackageFormat::Rpm,
+        &auth,
+        &repo,
+        &channel,
+        None,
+    )
+    .await
 }
 
 // -------------------------------------------------------------------- apk
@@ -989,7 +1022,16 @@ async fn get_apk_file(
     if file == "APKINDEX.tar.gz" {
         return serve_index(&state, &key, "application/gzip", "apk-index").await;
     }
-    serve_package(&state, &key, PackageFormat::Apk, &auth, &repo, &channel).await
+    serve_package(
+        &state,
+        &key,
+        PackageFormat::Apk,
+        &auth,
+        &repo,
+        &channel,
+        None,
+    )
+    .await
 }
 
 /// Resolves an apk request to a storage key, falling back to `noarch`.
@@ -1063,7 +1105,16 @@ async fn get_pacman_file(
     }
 
     let key = pacman_key(&state, &repo, &channel, &arch, &file).await;
-    serve_package(&state, &key, PackageFormat::Pacman, &auth, &repo, &channel).await
+    serve_package(
+        &state,
+        &key,
+        PackageFormat::Pacman,
+        &auth,
+        &repo,
+        &channel,
+        None,
+    )
+    .await
 }
 
 /// Maps a requested filename to the fixed database (or signature) object
@@ -1169,7 +1220,16 @@ async fn get_deb_package(
     }
 
     let key = format!("{}/{file}", silo_pkg::deb::pool_prefix(&repo, &channel));
-    serve_package(&state, &key, PackageFormat::Deb, &auth, &repo, &channel).await
+    serve_package(
+        &state,
+        &key,
+        PackageFormat::Deb,
+        &auth,
+        &repo,
+        &channel,
+        None,
+    )
+    .await
 }
 
 // -------------------------------------------------------------------- npm
@@ -1294,8 +1354,16 @@ async fn get_npm(
                 "{}/-/{file}",
                 silo_pkg::npm::package_prefix(&repo, &channel, &name)
             );
-            let response =
-                serve_package(&state, &key, PackageFormat::Npm, &auth, &repo, &channel).await;
+            let response = serve_package(
+                &state,
+                &key,
+                PackageFormat::Npm,
+                &auth,
+                &repo,
+                &channel,
+                Some(&name),
+            )
+            .await;
             if response.status() != StatusCode::NOT_FOUND {
                 return response;
             }
@@ -1310,7 +1378,16 @@ async fn get_npm(
                 NpmLazySync::UpstreamError => npm_upstream_error(&state),
                 NpmLazySync::NotFound => response,
                 NpmLazySync::Synced => {
-                    serve_package(&state, &key, PackageFormat::Npm, &auth, &repo, &channel).await
+                    serve_package(
+                        &state,
+                        &key,
+                        PackageFormat::Npm,
+                        &auth,
+                        &repo,
+                        &channel,
+                        Some(&name),
+                    )
+                    .await
                 }
             }
         }
