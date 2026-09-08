@@ -19,7 +19,12 @@ addr: "0.0.0.0:8080"
 
 database:
   url: "${SILO_DATABASE_URL:-postgres://silo:silo@localhost:5432/silo}"
-  max_connections: 10
+  # Pooled connections per replica. Every request that reaches Postgres
+  # holds one for its duration, and a publish holds one for the whole of
+  # its index regeneration, so this is the ceiling on concurrent work.
+  # Postgres's own max_connections has to cover `replicas × this` plus
+  # room for administrative connections.
+  max_connections: 25
   # How long to keep retrying an unreachable database on startup. Generous
   # because silo and its Postgres are routinely started together.
   connect_timeout_seconds: 120

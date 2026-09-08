@@ -144,6 +144,7 @@ database:
   # can come from a Secret without ever being templated into this file or
   # into Helm release history.
   url: "${SILO_DATABASE_URL}"
+  max_connections: {{ .Values.config.database.maxConnections }}
 
 storage:
   bucket: {{ .Values.config.storage.bucket | quote }}
