@@ -1550,3 +1550,111 @@ async fn a_tarball_request_with_no_prior_packument_fetch_still_lazily_syncs() {
         "a tarball-first request must not trigger a separate packument index regeneration: {regenerate_entries:?}"
     );
 }
+
+/// npm names a tarball after the *unscoped* half of the package name, so
+/// one registry legitimately serves a `core-0.15.0.tgz` for `@eslint/core`,
+/// another for `@humanfs/core` and a third for `@sentry/core`. A
+/// storage-miss for one of them must resolve against that package's own
+/// synced row: matching on the filename alone picks an arbitrary one of
+/// the three, caches its bytes under its own name, and hands the client a
+/// tarball for a package it never asked for — which the client rejects as
+/// an integrity failure, permanently, since the key it asked for is never
+/// written.
+#[tokio::test]
+async fn a_tarball_filename_shared_by_two_scoped_packages_resolves_to_the_right_one() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npmsharedfilename");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "db_name": "registry" })),
+        )
+        .mount(&mock)
+        .await;
+
+    // Two different packages, same version, and therefore the same
+    // tarball filename — `core-0.15.0.tgz` — with different contents.
+    let mut tarballs = std::collections::HashMap::new();
+    for scope in ["eslint", "humanfs"] {
+        let name = format!("@{scope}/core");
+        let bytes = build_test_npm(&name, "0.15.0");
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "versions": {
+                    "0.15.0": {
+                        "name": name,
+                        "version": "0.15.0",
+                        "dist": {
+                            "tarball": format!("{}/{name}/-/core-0.15.0.tgz", mock.uri()),
+                            "shasum": "abc123",
+                        },
+                    },
+                },
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/-/core-0.15.0.tgz")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&mock)
+            .await;
+        tarballs.insert(name, bytes);
+    }
+
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "npmjs".into(),
+                format: silo_proto::v1::PackageFormat::Npm as i32,
+                base_url: mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec![],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add_upstream");
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    // Sync both names, so the upstream index holds two rows whose
+    // filenames are identical.
+    for name in tarballs.keys() {
+        let resp = get(&harness.state, &format!("/{repo}/stable/npm/{name}")).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "GET {name}");
+    }
+
+    for (name, expected) in &tarballs {
+        let response = get(
+            &harness.state,
+            &format!("/{repo}/stable/npm/{name}/-/core-0.15.0.tgz"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "GET {name} tarball"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.as_ref() == expected.as_slice(),
+            "{name} was served another package's tarball"
+        );
+    }
+}
