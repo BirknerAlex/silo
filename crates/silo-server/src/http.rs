@@ -224,6 +224,49 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// A credential silo could not *check*, as opposed to one it checked and
+/// rejected.
+///
+/// The distinction is the whole point: 401 tells a client its token is
+/// wrong, so npm, bun, dnf and apk all stop and ask the user to
+/// re-authenticate instead of retrying — and it buries a database outage
+/// under a wall of "unauthorized" for whoever is on call. 503 says
+/// temporary and retryable, which is what it is.
+fn service_unavailable(message: &'static str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "5")],
+        message,
+    )
+        .into_response()
+}
+
+/// Counts an authentication failure by reason, and reports whether the
+/// credential was rejected or simply couldn't be checked.
+fn record_auth_failure(state: &AppState, error: &silo_db::tokens::AuthError) -> AuthFailure {
+    let (reason, outcome) = match error {
+        silo_db::tokens::AuthError::Expired(_) => ("expired", AuthFailure::BadCredential),
+        silo_db::tokens::AuthError::Revoked => ("revoked", AuthFailure::BadCredential),
+        silo_db::tokens::AuthError::UserDisabled => ("user_disabled", AuthFailure::BadCredential),
+        silo_db::tokens::AuthError::Db(e) => {
+            tracing::error!(error = %e, "token verification failed against the database");
+            ("database", AuthFailure::Unavailable)
+        }
+        _ => ("unknown", AuthFailure::BadCredential),
+    };
+    state
+        .metrics
+        .auth_failures
+        .with_label_values(&[reason])
+        .inc();
+    outcome
+}
+
+enum AuthFailure {
+    BadCredential,
+    Unavailable,
+}
+
 /// Authenticates a read against one repo, or returns the response to send.
 async fn authorize_read(
     state: &AppState,
@@ -233,26 +276,17 @@ async fn authorize_read(
 ) -> Result<Authenticated, Response> {
     let authenticated = auth::authenticate_http(state, headers, remote_addr)
         .await
-        .map_err(|e| {
-            let reason = match &e {
-                silo_db::tokens::AuthError::Expired(_) => "expired",
-                silo_db::tokens::AuthError::Revoked => "revoked",
-                silo_db::tokens::AuthError::UserDisabled => "user_disabled",
-                silo_db::tokens::AuthError::Db(_) => "database",
-                _ => "unknown",
-            };
-            state
-                .metrics
-                .auth_failures
-                .with_label_values(&[reason])
-                .inc();
-            unauthorized()
+        .map_err(|e| match record_auth_failure(state, &e) {
+            AuthFailure::BadCredential => unauthorized(),
+            AuthFailure::Unavailable => {
+                service_unavailable("authentication is temporarily unavailable")
+            }
         })?;
 
     if !authenticated.allows(repo, Permission::Read) {
         let public = state.db.is_repo_public(repo).await.map_err(|e| {
             tracing::error!(error = %e, repo, "failed to look up repo visibility");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            service_unavailable("repository lookup is temporarily unavailable")
         })?;
         if !public {
             // 404 rather than 403: a token scoped to other repos shouldn't
@@ -279,20 +313,14 @@ async fn authorize_write(
 ) -> Result<Authenticated, Response> {
     let authenticated = auth::authenticate_http(state, headers, remote_addr)
         .await
-        .map_err(|e| {
-            let reason = match &e {
-                silo_db::tokens::AuthError::Expired(_) => "expired",
-                silo_db::tokens::AuthError::Revoked => "revoked",
-                silo_db::tokens::AuthError::UserDisabled => "user_disabled",
-                silo_db::tokens::AuthError::Db(_) => "database",
-                _ => "unknown",
-            };
-            state
-                .metrics
-                .auth_failures
-                .with_label_values(&[reason])
-                .inc();
-            npm_error(StatusCode::UNAUTHORIZED, "authentication required")
+        .map_err(|e| match record_auth_failure(state, &e) {
+            AuthFailure::BadCredential => {
+                npm_error(StatusCode::UNAUTHORIZED, "authentication required")
+            }
+            AuthFailure::Unavailable => npm_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication is temporarily unavailable",
+            ),
         })?;
 
     if !authenticated.allows(repo, Permission::Write) {
@@ -2243,6 +2271,68 @@ pub(crate) mod tests {
             metrics.auth_failures.with_label_values(&["unknown"]).get(),
             1
         );
+    }
+
+    /// A token silo could not check is not a token silo rejected.
+    ///
+    /// 401 tells npm, bun, dnf and apk that the credential is wrong, so
+    /// they stop and ask the user to authenticate again instead of
+    /// retrying — a database blip during a big install would otherwise
+    /// permanently fail the packages it happened to land on, and hide the
+    /// outage behind a wall of "unauthorized" in the logs.
+    #[tokio::test]
+    async fn a_database_outage_during_authentication_is_unavailable_not_unauthorized() {
+        // `test_state_with`'s pool points at a port nothing listens on, so
+        // the token lookup fails with a real connection error.
+        let state = Arc::new(test_state_with(|cfg| cfg.audit.log_downloads = false));
+        let metrics = state.metrics.clone();
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/myrepo/stable/repodata/repomd.xml")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer silo_000000000000_not-a-real-secret",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "5");
+        assert!(!resp.headers().contains_key(header::WWW_AUTHENTICATE));
+        assert_eq!(
+            metrics.auth_failures.with_label_values(&["database"]).get(),
+            1
+        );
+    }
+
+    /// The publish path answers the same way, in npm's error envelope —
+    /// `npm publish` prints `error` verbatim, so "authentication
+    /// required" during an outage would send a publisher off to re-mint a
+    /// token that was fine all along.
+    #[tokio::test]
+    async fn a_database_outage_during_a_publish_is_unavailable_not_unauthorized() {
+        let state = Arc::new(test_state_with(|_| {}));
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/myrepo/stable/npm/widget")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer silo_000000000000_not-a-real-secret",
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["error"], "authentication is temporarily unavailable");
     }
 
     #[tokio::test]
