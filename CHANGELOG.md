@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.4](https://github.com/BirknerAlex/silo/compare/v0.13.3...v0.13.4) (2026-09-08)
+
+
+### Bug fixes
+
+* **ci:** share one image tag between the two e2e silo services ([92dfa5f](https://github.com/BirknerAlex/silo/commit/92dfa5f42bc7f68a083b26a2dcb9d730eb909b9d))
+* **pull-through:** avoid a redundant index regeneration in npm's tarball-first lazy sync ([470e995](https://github.com/BirknerAlex/silo/commit/470e9954f1d64b832b1781faba90374c7bd409ba))
+
 ## [0.13.3](https://github.com/BirknerAlex/silo/compare/v0.13.2...v0.13.3) (2026-09-08)
 
 
