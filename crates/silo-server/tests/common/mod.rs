@@ -67,11 +67,34 @@ pub fn unique_repo(prefix: &str) -> String {
 pub struct Harness {
     pub state: Arc<AppState>,
     pub db: Db,
+    queries: Option<silo_db::testutil::QueryCounter>,
 }
 
 impl Harness {
     pub async fn new(url: &str) -> Self {
         Self::with_config(url, |_| {}).await
+    }
+
+    /// A harness whose database traffic is counted, for the tests that
+    /// pin down what a request path costs in queries. Everything reaches
+    /// the same database, through a relay that counts what crosses it.
+    pub async fn counting(url: &str) -> Self {
+        let counter = silo_db::testutil::QueryCounter::spawn(url)
+            .await
+            .expect("start the query counter");
+        let mut harness = Self::with_config(counter.url(), |_| {}).await;
+        harness.queries = Some(counter);
+        harness
+    }
+
+    /// Queries this harness has run since the last call, resetting the
+    /// count. Call once after setup to discard it, then again around the
+    /// request under test.
+    pub fn queries_since_last_call(&self) -> u64 {
+        self.queries
+            .as_ref()
+            .expect("build the harness with Harness::counting")
+            .take()
     }
 
     pub async fn with_config(url: &str, tweak: impl FnOnce(&mut Config)) -> Self {
@@ -142,7 +165,11 @@ impl Harness {
             upstream_http: reqwest::Client::new(),
         });
 
-        Self { state, db }
+        Self {
+            state,
+            db,
+            queries: None,
+        }
     }
 
     /// Mints a token with the given reach.

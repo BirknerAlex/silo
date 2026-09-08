@@ -1758,3 +1758,117 @@ async fn a_tarball_filename_shared_by_two_scoped_packages_resolves_to_the_right_
         );
     }
 }
+
+/// A tarball-first request resolves in one pass over its lookups, and is
+/// reported as the one response it actually sent.
+///
+/// The route asks storage once, reads the channel's upstream list once,
+/// and resolves the filename against it — then, if nothing is indexed for
+/// that name yet, syncs and resolves again against the rows the sync just
+/// wrote. Running the whole route twice instead repeats every one of
+/// those on the request shape a lockfile-driven install sends in bulk,
+/// and records the intermediate "nothing indexed yet" step as a 404 that
+/// was never sent, so the metric shows a 404 for every tarball a cold
+/// cache serves.
+#[tokio::test]
+async fn a_tarball_first_request_resolves_in_one_pass() {
+    let url = require_db!();
+    let harness = Harness::counting(&url).await;
+    let repo = unique_repo("npmonepass");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "db_name": "registry" })),
+        )
+        .mount(&mock)
+        .await;
+    let tarball_bytes = build_test_npm("widget", "1.0.0");
+    Mock::given(method("GET"))
+        .and(path("/widget"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "widget",
+            "versions": {
+                "1.0.0": {
+                    "name": "widget",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/widget/-/widget-1.0.0.tgz", mock.uri()),
+                        "shasum": "abc123",
+                    },
+                },
+            },
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/widget/-/widget-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball_bytes.clone()))
+        .mount(&mock)
+        .await;
+
+    service
+        .add_upstream(request(
+            AddUpstreamRequest {
+                repo: repo.clone(),
+                channel: "stable".into(),
+                name: "npmjs".into(),
+                format: silo_proto::v1::PackageFormat::Npm as i32,
+                base_url: mock.uri(),
+                cache_mode: UpstreamCacheMode::Cache as i32,
+                cache_index_in_memory: false,
+                auth: None,
+                arches: vec![],
+                suite: String::new(),
+                components: vec![],
+            },
+            &admin.secret,
+        ))
+        .await
+        .expect("add_upstream");
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    // Everything above is setup, not what is being measured.
+    harness.queries_since_last_call();
+
+    let response = get(
+        &harness.state,
+        &format!("/{repo}/stable/npm/widget/-/widget-1.0.0.tgz"),
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let queries = harness.queries_since_last_call();
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.to_vec(), tarball_bytes);
+
+    // A budget rather than an exact figure, set just under what a second
+    // pass over the same lookups costs (19 queries, against 17 for one
+    // pass) so that repeating them fails here.
+    assert!(
+        queries <= 18,
+        "a cold tarball-first request cost {queries} database queries"
+    );
+
+    let counted = |status: &str| {
+        harness
+            .state
+            .metrics
+            .http_requests
+            .with_label_values(&["npm-package", status])
+            .get()
+    };
+    assert_eq!(counted("200"), 1, "the response that was actually sent");
+    assert_eq!(
+        counted("404"),
+        0,
+        "a tarball that was served must not also be counted as a 404"
+    );
+}

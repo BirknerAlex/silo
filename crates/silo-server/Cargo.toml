@@ -36,6 +36,7 @@ reqwest.workspace = true
 [dev-dependencies]
 tower = "0.5"
 silo-core = { path = "../silo-core", features = ["test-util"] }
+silo-db = { path = "../silo-db", features = ["test-util"] }
 silo-pkg = { path = "../silo-pkg", features = ["test-util"] }
 # The integration tests inflate APKINDEX/pacman-db payloads to assert their
 # contents.
