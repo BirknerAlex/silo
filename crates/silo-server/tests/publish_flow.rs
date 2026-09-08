@@ -1086,3 +1086,54 @@ async fn a_wrong_pepper_invalidates_every_token() {
         "changing the pepper must invalidate tokens hashed without it"
     );
 }
+
+/// A publish renders its index from the connection its transaction is
+/// already holding, and never reaches back to the pool for a second one
+/// while holding the first.
+///
+/// Nested acquisition caps concurrent publishes at half the pool, and
+/// past that every publisher holds one connection while waiting for a
+/// connection only another publisher can release — a deadlock that only
+/// breaks when sqlx's acquire timeout fires and the request fails. A pool
+/// of exactly one connection is the smallest configuration where the
+/// difference is a hard yes or no rather than a matter of timing.
+#[tokio::test]
+async fn a_publish_holds_only_one_pooled_connection_at_a_time() {
+    let url = require_db!();
+    let harness = Harness::with_config(&url, |config| {
+        config.database.max_connections = 1;
+    })
+    .await;
+    let repo = unique_repo("onepoolconn");
+
+    // An upstream of the same format, so the index merge has a synced
+    // index to consult as well as the repo's own rows.
+    harness
+        .db
+        .create_upstream(&silo_db::upstreams::NewUpstream {
+            repo: repo.clone(),
+            channel: "stable".into(),
+            name: "npmjs".into(),
+            format: "npm".into(),
+            base_url: "https://registry.example".into(),
+            cache_mode: "cache".into(),
+            cache_index_in_memory: false,
+            arches: vec![],
+            suite: None,
+            components: vec![],
+            auth: None,
+        })
+        .await
+        .expect("create an upstream");
+
+    silo_core::repo::publish(
+        &harness.state.publish,
+        &repo,
+        "stable",
+        PackageFormat::Npm,
+        build_test_npm("widget", "1.0.0"),
+        &actor(),
+    )
+    .await
+    .expect("a publish must not need a second pooled connection");
+}
