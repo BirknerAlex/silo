@@ -507,6 +507,13 @@ async fn merge_upstream_records(
             // own group is regenerated; a synthetic upstream row needs
             // the same check applied explicitly, since it never goes
             // through that regeneration path itself.
+            // An upstream restricted to a set of package names must not
+            // advertise anything else, or a client would ask for a name
+            // this upstream is not supposed to serve and the miss path
+            // would have to turn it away after the fact.
+            if !crate::pull_through::upstream_serves(upstream, &row.name) {
+                continue;
+            }
             let belongs = match format {
                 PackageFormat::Apk | PackageFormat::Pacman => {
                     row.arch == index_group

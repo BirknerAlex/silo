@@ -1265,6 +1265,8 @@ impl AdminServiceImpl {
             ));
         }
 
+        validate_package_patterns(&req.package_patterns)?;
+
         let opts = silo_pkg::UpstreamFetchOptions {
             arches: req.arches.clone(),
             suite: non_empty_str(&req.suite).map(str::to_string),
@@ -1306,6 +1308,8 @@ impl AdminServiceImpl {
                 base_url: req.base_url.clone(),
                 cache_mode: cache_mode.to_string(),
                 cache_index_in_memory: req.cache_index_in_memory,
+                priority: req.priority,
+                package_patterns: req.package_patterns.clone(),
                 arches: req.arches.clone(),
                 suite: opts.suite.clone(),
                 components: req.components.clone(),
@@ -1421,6 +1425,25 @@ impl AdminServiceImpl {
         } else {
             req.components.clone()
         };
+        let priority = req.priority.unwrap_or(existing.priority);
+        let package_patterns = if req.clear_package_patterns {
+            Vec::new()
+        } else if req.package_patterns.is_empty() {
+            existing.package_patterns.clone()
+        } else {
+            req.package_patterns.clone()
+        };
+        validate_package_patterns(&package_patterns)?;
+        let settings = silo_db::upstreams::UpstreamSettings {
+            base_url: &base_url,
+            cache_mode: &cache_mode,
+            cache_index_in_memory,
+            priority,
+            package_patterns: &package_patterns,
+            arches: &arches,
+            suite: suite.as_deref(),
+            components: &components,
+        };
 
         let sealed = match &req.auth {
             None => None,
@@ -1446,16 +1469,7 @@ impl AdminServiceImpl {
             None => {
                 self.state
                     .db
-                    .update_upstream(
-                        existing.id,
-                        &base_url,
-                        &cache_mode,
-                        cache_index_in_memory,
-                        &arches,
-                        suite.as_deref(),
-                        &components,
-                        None,
-                    )
+                    .update_upstream(existing.id, &settings, None)
                     .await
             }
             Some(None) => {
@@ -1470,31 +1484,13 @@ impl AdminServiceImpl {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 self.state
                     .db
-                    .update_upstream(
-                        existing.id,
-                        &base_url,
-                        &cache_mode,
-                        cache_index_in_memory,
-                        &arches,
-                        suite.as_deref(),
-                        &components,
-                        None,
-                    )
+                    .update_upstream(existing.id, &settings, None)
                     .await
             }
             Some(Some(sealed)) => {
                 self.state
                     .db
-                    .update_upstream(
-                        existing.id,
-                        &base_url,
-                        &cache_mode,
-                        cache_index_in_memory,
-                        &arches,
-                        suite.as_deref(),
-                        &components,
-                        Some(&sealed),
-                    )
+                    .update_upstream(existing.id, &settings, Some(&sealed))
                     .await
             }
         }
@@ -1736,6 +1732,26 @@ fn non_empty_str(s: &str) -> Option<&str> {
 /// would round-trip in plain text through `download_url` and, on a
 /// `no_cache` upstream, straight into a client-visible redirect
 /// `Location` header.
+/// A pattern that can never match anything is always a mistake, and one
+/// that silently routes every package to the wrong upstream — so it is
+/// rejected at the point it is set rather than discovered later from the
+/// `origin` column.
+fn validate_package_patterns(patterns: &[String]) -> Result<(), Status> {
+    for pattern in patterns {
+        if pattern.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "a package pattern must not be empty",
+            ));
+        }
+        if pattern.trim() != pattern {
+            return Err(Status::invalid_argument(format!(
+                "package pattern `{pattern}` has leading or trailing whitespace",
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_base_url(url: &str) -> Result<(), Status> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(Status::invalid_argument(
@@ -1794,6 +1810,8 @@ fn to_proto_upstream(row: &silo_db::upstreams::UpstreamRow) -> UpstreamInfo {
         base_url: row.base_url.clone(),
         cache_mode: cache_mode as i32,
         cache_index_in_memory: row.cache_index_in_memory,
+        priority: row.priority,
+        package_patterns: row.package_patterns.clone(),
         arches: row.arches.clone(),
         suite: row.suite.clone().unwrap_or_default(),
         components: row.components.clone(),
