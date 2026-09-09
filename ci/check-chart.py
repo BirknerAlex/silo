@@ -183,6 +183,7 @@ def rendered_config_is_valid() -> None:
         "--set", "config.publicBaseUrl=https://silo.example.com",
         "--set", "config.storage.existingSecret=s3creds",
         "--set", "config.database.maxConnections=40",
+        "--set", "config.audit.logPullThrough=false",
     )
     secret = next(
         d for d in docs
@@ -197,6 +198,9 @@ def rendered_config_is_valid() -> None:
     # an operator sizing it against their Postgres has to be able to reach
     # it from values rather than having to hand-write configOverride.
     assert cfg["database"]["max_connections"] == 40, cfg["database"]
+    # An operator drowning in pull-through entries has to be able to turn
+    # them off from values rather than hand-writing configOverride.
+    assert cfg["audit"]["log_pull_through"] is False, cfg["audit"]
     assert cfg["storage"]["access_key_id"] == "${SILO_STORAGE_ACCESS_KEY_ID}", cfg["storage"]
     assert cfg["public_base_url"] == "https://silo.example.com", cfg
     assert cfg["storage"]["bucket"], cfg["storage"]

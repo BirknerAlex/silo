@@ -84,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
             signers: signers.clone(),
             public_base_url: config.public_base_url.clone(),
             upstream_index_cache: Default::default(),
+            audit_pull_through: config.audit.log_pull_through,
         },
         config,
         storage,

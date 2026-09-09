@@ -89,6 +89,11 @@ pub struct PublishContext {
     /// upstream actually opts in) so every `PublishContext` constructor
     /// doesn't need its own decision about whether to build one.
     pub upstream_index_cache: std::sync::Arc<crate::upstream_index_cache::UpstreamIndexCache>,
+    /// Whether the work a pull-through does on a client's behalf is
+    /// written to the audit log (`audit.log_pull_through`). Lives here
+    /// rather than being passed in per call because it is a property of
+    /// the deployment, not of one publish.
+    pub audit_pull_through: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -219,21 +224,25 @@ pub async fn publish_with_origin(
     // and the alternative risks wedging the repo rather than lagging it.
     index_objects.extend(regenerate_sharing_groups(ctx, repo, channel, format, &index_group).await);
 
-    ctx.db
-        .record_audit(
-            AuditEntry::new(audit::action::PACKAGE_PUBLISH, actor)
-                .repo(repo)
-                .channel(channel)
-                .target(parsed.nevra())
-                .detail(json!({
-                    "format": format.as_str(),
-                    "storage_key": storage_key,
-                    "size_bytes": size_bytes,
-                    "sha256": sha256,
-                    "signed": signed,
-                })),
-        )
-        .await;
+    // `origin_upstream_id` is exactly what distinguishes a capture from a
+    // publish somebody made: it is set only by the pull-through path.
+    if origin_upstream_id.is_none() || ctx.audit_pull_through {
+        ctx.db
+            .record_audit(
+                AuditEntry::new(audit::action::PACKAGE_PUBLISH, actor)
+                    .repo(repo)
+                    .channel(channel)
+                    .target(parsed.nevra())
+                    .detail(json!({
+                        "format": format.as_str(),
+                        "storage_key": storage_key,
+                        "size_bytes": size_bytes,
+                        "sha256": sha256,
+                        "signed": signed,
+                    })),
+            )
+            .await;
+    }
 
     tracing::info!(
         repo, channel, format = %format, package = %parsed.nevra(),
@@ -290,6 +299,36 @@ pub async fn regenerate_index(
         )
         .await;
 
+    Ok(objects)
+}
+
+/// Rebuilds one index group to advertise what a pull-through just synced,
+/// audited only when the deployment asks for pull-through work to be
+/// audited (`audit.log_pull_through`).
+///
+/// Split from [`regenerate_index`] rather than given a flag because the
+/// two have different callers with different answers: `silo index
+/// rebuild`, `add-upstream` and `sync-upstream` are things a principal
+/// asked for by name and are always audited; this one happens on a
+/// client's behalf, once per package name a bulk install touches.
+pub async fn regenerate_index_for_pull_through(
+    ctx: &PublishContext,
+    repo: &str,
+    channel: &str,
+    format: PackageFormat,
+    index_group: &str,
+) -> anyhow::Result<Vec<String>> {
+    if ctx.audit_pull_through {
+        return regenerate_index(ctx, repo, channel, format, index_group, &Actor::system()).await;
+    }
+    validate_repo_name("repo", repo)?;
+    validate_repo_name("channel", channel)?;
+
+    let scope = lock::index_scope(repo, channel, format.as_str(), index_group);
+    let mut locked = ctx.db.lock(scope).await?;
+    let objects =
+        regenerate_index_locked(ctx, &mut locked, repo, channel, format, index_group).await?;
+    locked.commit().await?;
     Ok(objects)
 }
 

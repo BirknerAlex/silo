@@ -842,13 +842,12 @@ async fn pull_through_npm_packument(
         NpmLazySync::Synced => {}
     }
 
-    if let Err(e) = silo_core::repo::regenerate_index(
+    if let Err(e) = silo_core::repo::regenerate_index_for_pull_through(
         &state.publish,
         repo,
         channel,
         PackageFormat::Npm,
         name,
-        &audit::Actor::system(),
     )
     .await
     {
@@ -1890,6 +1889,7 @@ pub(crate) mod tests {
                 signers: Default::default(),
                 public_base_url: config.public_base_url.clone(),
                 upstream_index_cache: Default::default(),
+                audit_pull_through: config.audit.log_pull_through,
             },
             config,
             storage,
