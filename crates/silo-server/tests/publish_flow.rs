@@ -1118,6 +1118,8 @@ async fn a_publish_holds_only_one_pooled_connection_at_a_time() {
             base_url: "https://registry.example".into(),
             cache_mode: "cache".into(),
             cache_index_in_memory: false,
+            priority: 0,
+            package_patterns: vec![],
             arches: vec![],
             suite: None,
             components: vec![],

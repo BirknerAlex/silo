@@ -490,6 +490,13 @@ async fn pull_through_miss(
     let mut upstream_pkg = None;
     let mut matched_upstream = None;
     for upstream in upstreams {
+        // An upstream restricted to a set of package names is not asked
+        // about anything else, however eagerly it would answer.
+        if let Some(name) = package_name {
+            if !silo_core::pull_through::upstream_serves(upstream, name) {
+                continue;
+            }
+        }
         // When the in-memory cache is enabled for this upstream, read
         // through it — the same one the index merge uses, so the two
         // lookup paths never disagree about what's fresh. Otherwise this
@@ -750,6 +757,9 @@ async fn lazy_sync_npm_upstream_packages(
     let mut fetched = Vec::new();
     let mut saw_transient_error = false;
     for upstream in upstreams {
+        if !silo_core::pull_through::upstream_serves(upstream, name) {
+            continue;
+        }
         match silo_core::upstream_sync::sync_npm_package(
             &state.db,
             state.upstream_http.clone(),

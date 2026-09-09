@@ -286,6 +286,17 @@ enum RepoCommand {
         basic_auth: Option<String>,
         #[arg(long, conflicts_with = "basic_auth")]
         bearer_token: Option<String>,
+        /// Tried highest first; ties fall back to the upstream name.
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        /// Only consult this upstream for package names matching this
+        /// glob (`*`, `?`). Repeat for several — a name matching any one
+        /// of them is served. Without any, the upstream answers for every
+        /// name. Use it when two upstreams of one format are not
+        /// interchangeable mirrors, e.g. `--package-pattern '@acme/*'`
+        /// for a vendor registry sitting next to a public one.
+        #[arg(long = "package-pattern")]
+        package_patterns: Vec<String>,
         /// apk/pacman/deb: which architectures to sync. Repeat for several.
         #[arg(long = "arch")]
         arches: Vec<String>,
@@ -335,6 +346,17 @@ enum RepoCommand {
         /// Same as `--clear-arches`, for the component list.
         #[arg(long, conflicts_with = "components")]
         clear_components: bool,
+        /// Tried highest first; ties fall back to the upstream name.
+        #[arg(long)]
+        priority: Option<i32>,
+        /// Replaces the package-name globs this upstream answers for.
+        /// Repeat for several. See `add-upstream`.
+        #[arg(long = "package-pattern")]
+        package_patterns: Vec<String>,
+        /// Same as `--clear-arches`, for the package patterns — leaves
+        /// the upstream answering for every name again.
+        #[arg(long, conflicts_with = "package_patterns")]
+        clear_package_patterns: bool,
     },
     /// Removes an upstream. Cached packages it produced keep serving,
     /// relabeled as local, unless `--prune` is given. Admin only.
@@ -1344,6 +1366,8 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
             arches,
             suite,
             components,
+            priority,
+            package_patterns,
         } => {
             if !cache && !no_cache {
                 anyhow::bail!("one of --cache or --no-cache is required");
@@ -1359,6 +1383,8 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
             let response = client
                 .add_upstream(with_auth(
                     AddUpstreamRequest {
+                        priority,
+                        package_patterns,
                         repo,
                         channel,
                         name,
@@ -1394,6 +1420,9 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
             components,
             clear_arches,
             clear_components,
+            priority,
+            package_patterns,
+            clear_package_patterns,
         } => {
             let cache_mode = match (cache, no_cache) {
                 (true, false) => Some(UpstreamCacheMode::Cache as i32),
@@ -1418,6 +1447,9 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
             let response = client
                 .update_upstream(with_auth(
                     UpdateUpstreamRequest {
+                        priority,
+                        package_patterns,
+                        clear_package_patterns,
                         repo,
                         channel,
                         name,
@@ -1484,6 +1516,8 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
                             "base_url": u.base_url,
                             "cache_mode": upstream_cache_mode_name(u.cache_mode),
                             "cache_index_in_memory": u.cache_index_in_memory,
+                            "priority": u.priority,
+                            "package_patterns": u.package_patterns,
                             "auth_configured": u.auth_configured,
                             "status": u.status,
                             "last_sync_at": u.last_sync_at,
@@ -1493,11 +1527,16 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
                     .collect();
                 return print_json(&json!(upstreams));
             }
+            // Listed in the order they are actually tried, with the two
+            // things that decide it — a repo whose upstreams are not
+            // interchangeable mirrors is unreadable without them.
             let mut table = Table::new(&[
                 "NAME",
                 "FORMAT",
                 "BASE_URL",
                 "CACHE",
+                "PRIO",
+                "PACKAGES",
                 "AUTH",
                 "STATUS",
                 "LAST_SYNC",
@@ -1508,6 +1547,12 @@ async fn cmd_repo(config_path: &str, server: Option<&str>, cmd: RepoCommand) -> 
                     format_name(u.format),
                     u.base_url.clone(),
                     upstream_cache_mode_name(u.cache_mode).to_string(),
+                    u.priority.to_string(),
+                    if u.package_patterns.is_empty() {
+                        "*".to_string()
+                    } else {
+                        u.package_patterns.join(",")
+                    },
                     u.auth_configured.to_string(),
                     u.status.clone(),
                     timestamp(u.last_sync_at),
@@ -1582,6 +1627,15 @@ fn print_upstream(upstream: Option<&UpstreamInfo>) {
     println!("  base_url:    {}", u.base_url);
     println!("  cache_mode:  {}", upstream_cache_mode_name(u.cache_mode));
     println!("  index cache: {}", u.cache_index_in_memory);
+    println!("  priority:    {}", u.priority);
+    println!(
+        "  packages:    {}",
+        if u.package_patterns.is_empty() {
+            "* (every name)".to_string()
+        } else {
+            u.package_patterns.join(", ")
+        }
+    );
     println!(
         "  auth:        {}",
         if u.auth_configured { "configured" } else { "-" }

@@ -141,13 +141,16 @@ fn fetch_action(cache_mode: CacheMode, upstream_requires_auth: bool) -> Action {
 }
 
 /// Lists which configured upstreams back a `(repo, channel, format)`
-/// triple, in the order they should be tried. Multiple upstreams of the
-/// same format may be configured (the user's "one or more" ask); they're
-/// tried in name order — a deterministic, operator-controllable order
-/// (rename to reorder) without a separate priority column to manage.
-/// Callers must fall through to the next candidate on a confirmed miss
-/// rather than stopping at the first one, or every upstream after the
-/// first is unreachable in practice.
+/// triple, in the order they should be tried: highest `priority` first,
+/// ties broken by name so the order is always total and stable. Callers
+/// must fall through to the next candidate on a confirmed miss rather
+/// than stopping at the first one, or every upstream after the first is
+/// unreachable in practice.
+///
+/// This does not apply [`upstream_serves`] — the package name isn't
+/// always known this early (an rpm request carries a filename, not a
+/// name). Callers that do know it filter with `upstream_serves` as they
+/// go.
 pub async fn select_upstreams(
     db: &Db,
     repo: &str,
@@ -157,6 +160,64 @@ pub async fn select_upstreams(
     let mut upstreams = db.list_upstreams(repo, channel).await?;
     upstreams.retain(|u| u.format == format.as_str());
     Ok(upstreams)
+}
+
+/// Whether `upstream` is allowed to answer for `package_name`.
+///
+/// An upstream with no patterns answers for everything, which is what
+/// every upstream does until someone says otherwise. Patterns exist for
+/// the case where two upstreams of one format are *not* interchangeable
+/// mirrors: a vendor registry that holds one scope, next to a public one
+/// that holds the rest. Without them the only thing deciding which
+/// upstream serves a name is which one answers first — and an upstream
+/// that proxies or redirects unknown names to the public registry
+/// answers for everything, so it wins everything, and every package in
+/// the repo ends up attributed to it.
+pub fn upstream_serves(upstream: &UpstreamRow, package_name: &str) -> bool {
+    upstream.package_patterns.is_empty()
+        || upstream
+            .package_patterns
+            .iter()
+            .any(|pattern| glob_matches(pattern, package_name))
+}
+
+/// Matches `name` against a glob: `*` stands for any run of characters
+/// (including none, and including `/`), `?` for exactly one, and
+/// everything else is literal. The whole name must match, not a prefix —
+/// `@acme/*` is a scope, not "anything starting with `@acme/`" that
+/// could also match `@acme/x/../y`.
+///
+/// `*` deliberately spans `/` so `@acme/*` covers the whole scope. npm
+/// names have at most one separator and the other formats have none, so
+/// there is no nesting for a stricter `*` to protect.
+///
+/// Hand-rolled rather than pulled in: this is the entire feature, the
+/// two metacharacters are the two an operator expects from a shell glob,
+/// and backtracking on inputs this short is free.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    // `star` remembers the last `*` and how much of `name` it had eaten,
+    // so a failed match resumes by letting that `*` swallow one more
+    // character instead of giving up.
+    let (mut p, mut n) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, n));
+            p += 1;
+        } else if let Some((star_p, star_n)) = star {
+            p = star_p + 1;
+            n = star_n + 1;
+            star = Some((star_p, star_n + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|c| *c == '*')
 }
 
 /// Whether decrypting `upstream`'s stored credential (if any) would
@@ -278,6 +339,100 @@ mod tests {
             decide(PackageFormat::Npm, None, proxy),
             Action::ProxyUpstream
         );
+    }
+
+    #[test]
+    fn a_glob_matches_the_whole_name_not_a_prefix() {
+        assert!(glob_matches("lodash", "lodash"));
+        assert!(!glob_matches("lodash", "lodash-es"));
+        assert!(!glob_matches("odash", "lodash"));
+    }
+
+    #[test]
+    fn a_scope_glob_covers_the_scope_and_nothing_else() {
+        assert!(glob_matches(
+            "@fortawesome/*",
+            "@fortawesome/fontawesome-pro"
+        ));
+        assert!(glob_matches(
+            "@fortawesome/*",
+            "@fortawesome/vue-fontawesome"
+        ));
+        // The one this feature exists for: a public package must not fall
+        // inside a vendor registry's scope.
+        assert!(!glob_matches("@fortawesome/*", "@babel/core"));
+        assert!(!glob_matches("@fortawesome/*", "lodash"));
+        // `*` spans `/`, so a scope glob covers the whole scope, but the
+        // scope prefix itself still has to match exactly.
+        assert!(!glob_matches("@fortawesome/*", "@fortawesomeX/thing"));
+    }
+
+    #[test]
+    fn a_star_matches_an_empty_run_and_a_question_mark_matches_exactly_one() {
+        assert!(glob_matches("*", ""));
+        assert!(glob_matches("*", "anything/at-all"));
+        assert!(glob_matches("@acme/*", "@acme/"));
+        assert!(glob_matches("nod?", "node"));
+        assert!(!glob_matches("nod?", "nod"));
+        assert!(!glob_matches("nod?", "nodejs"));
+    }
+
+    #[test]
+    fn several_stars_and_trailing_literals_still_match() {
+        assert!(glob_matches("*-plugin-*", "eslint-plugin-vue"));
+        assert!(glob_matches("@*/core", "@babel/core"));
+        assert!(!glob_matches("@*/core", "@babel/parser"));
+        assert!(glob_matches("**", "anything"));
+    }
+
+    #[test]
+    fn an_upstream_without_patterns_answers_for_everything() {
+        let mut upstream = test_upstream(vec![]);
+        assert!(upstream_serves(&upstream, "anything"));
+        upstream.package_patterns = vec!["@acme/*".into()];
+        assert!(upstream_serves(&upstream, "@acme/widget"));
+        assert!(!upstream_serves(&upstream, "lodash"));
+    }
+
+    #[test]
+    fn patterns_are_alternatives_so_one_upstream_can_hold_several_scopes() {
+        let upstream = test_upstream(vec![
+            "@acme/*".into(),
+            "@vendor/*".into(),
+            "legacy-tool".into(),
+        ]);
+        assert!(upstream_serves(&upstream, "@acme/widget"));
+        assert!(upstream_serves(&upstream, "@vendor/thing"));
+        assert!(upstream_serves(&upstream, "legacy-tool"));
+        assert!(!upstream_serves(&upstream, "@other/thing"));
+    }
+
+    fn test_upstream(package_patterns: Vec<String>) -> UpstreamRow {
+        UpstreamRow {
+            id: silo_db::Uuid::nil(),
+            repo: "r".into(),
+            channel: "c".into(),
+            name: "n".into(),
+            format: "npm".into(),
+            base_url: "https://example.com".into(),
+            cache_mode: "cache".into(),
+            cache_index_in_memory: false,
+            priority: 0,
+            package_patterns,
+            arches: vec![],
+            suite: None,
+            components: vec![],
+            auth_kind: None,
+            auth_username: None,
+            auth_secret_ciphertext: None,
+            auth_secret_nonce: None,
+            status: "ok".into(),
+            last_sync_at: None,
+            last_sync_error: None,
+            last_success_at: None,
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        }
     }
 
     #[test]

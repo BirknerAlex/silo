@@ -98,6 +98,8 @@ async fn add_upstream_validates_and_syncs_before_creating_the_row() {
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec!["x86_64".into()],
                 suite: String::new(),
@@ -144,6 +146,8 @@ async fn add_upstream_against_an_unreachable_url_creates_no_row() {
                 base_url: "http://127.0.0.1:1".into(), // nothing listens here
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec!["x86_64".into()],
                 suite: String::new(),
@@ -206,6 +210,8 @@ async fn setup_cache_upstream(
                 base_url: mock.uri(),
                 cache_mode: cache_mode as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth,
                 arches: vec!["x86_64".into()],
                 suite: String::new(),
@@ -624,6 +630,8 @@ async fn a_noarch_upstream_package_is_merged_into_every_concrete_architecture() 
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec!["aarch64".into()],
                 suite: String::new(),
@@ -709,6 +717,8 @@ async fn cache_index_in_memory_does_not_change_pull_through_behavior() {
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: true,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec!["x86_64".into()],
                 suite: String::new(),
@@ -840,6 +850,8 @@ async fn npm_packument_miss_lazily_syncs_and_renders_from_the_upstream() {
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -973,6 +985,8 @@ async fn a_cache_mode_signed_rpm_upstream_is_not_advertised_until_actually_fetch
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -1093,6 +1107,8 @@ async fn a_second_upstream_is_still_reachable_when_an_earlier_one_by_name_does_n
                 base_url: alpha_mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec!["x86_64".into()],
                 suite: String::new(),
@@ -1133,6 +1149,8 @@ async fn a_second_upstream_is_still_reachable_when_an_earlier_one_by_name_does_n
                 base_url: zeta_mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec!["x86_64".into()],
                 suite: String::new(),
@@ -1199,6 +1217,8 @@ async fn npm_packument_miss_falls_through_to_a_second_upstream_by_name() {
                 base_url: alpha_mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -1246,6 +1266,8 @@ async fn npm_packument_miss_falls_through_to_a_second_upstream_by_name() {
                 base_url: zeta_mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -1352,6 +1374,8 @@ async fn a_transient_upstream_failure_surfaces_as_a_retryable_502_not_a_permanen
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -1413,6 +1437,8 @@ async fn an_upstream_confirmed_404_still_surfaces_as_an_ordinary_404() {
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -1498,6 +1524,8 @@ async fn a_tarball_request_with_no_prior_packument_fetch_still_lazily_syncs() {
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -1617,6 +1645,8 @@ async fn an_npm_packument_only_merges_its_own_names_upstream_versions() {
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -1720,6 +1750,8 @@ async fn a_tarball_filename_shared_by_two_scoped_packages_resolves_to_the_right_
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -1822,6 +1854,8 @@ async fn a_tarball_first_request_resolves_in_one_pass() {
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: false,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -1935,6 +1969,8 @@ async fn an_npm_lazy_sync_drops_the_upstreams_cached_index() {
                 base_url: mock.uri(),
                 cache_mode: UpstreamCacheMode::Cache as i32,
                 cache_index_in_memory: true,
+                priority: 0,
+                package_patterns: vec![],
                 auth: None,
                 arches: vec![],
                 suite: String::new(),
@@ -2029,6 +2065,8 @@ async fn pull_through_audit_entries_can_be_switched_off_without_silencing_real_p
                     base_url: mock.uri(),
                     cache_mode: UpstreamCacheMode::Cache as i32,
                     cache_index_in_memory: false,
+                    priority: 0,
+                    package_patterns: vec![],
                     auth: None,
                     arches: vec![],
                     suite: String::new(),
@@ -2086,4 +2124,150 @@ async fn pull_through_audit_entries_can_be_switched_off_without_silencing_real_p
             "a real publish must be audited whatever log_pull_through says"
         );
     }
+}
+
+/// An upstream restricted to a set of package-name globs is not consulted
+/// for anything else, even when it would happily answer.
+///
+/// This is the shape a vendor registry makes: it holds one scope, sits
+/// next to a public registry that holds the rest, and — like a real one —
+/// answers for public names too by proxying or redirecting to the public
+/// registry. Nothing but a pattern stops it winning every name it is
+/// asked about, and every package in the repo then gets attributed to it.
+#[tokio::test]
+async fn an_upstream_scoped_to_a_pattern_is_not_consulted_for_other_names() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let repo = unique_repo("npmscoped");
+    let admin = harness.admin_token().await;
+    let service = AdminServiceImpl {
+        state: harness.state.clone(),
+    };
+
+    // The vendor registry: it has its own scope, and answers for
+    // everything else as well.
+    let vendor = MockServer::start().await;
+    // The public registry.
+    let public = MockServer::start().await;
+    for mock in [&vendor, &public] {
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "db_name": "registry" })),
+            )
+            .mount(mock)
+            .await;
+    }
+
+    let packument = |host: &str, name: &str| {
+        serde_json::json!({
+            "name": name,
+            "versions": {
+                "1.0.0": {
+                    "name": name,
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{host}/{name}/-/{}-1.0.0.tgz",
+                            name.rsplit('/').next().unwrap()),
+                        "shasum": "abc123",
+                    },
+                },
+            },
+        })
+    };
+    for name in ["@vendor/widget", "lodash"] {
+        let file = format!("{}-1.0.0.tgz", name.rsplit('/').next().unwrap());
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(packument(&vendor.uri(), name)))
+            .mount(&vendor)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/-/{file}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(build_test_npm(name, "1.0.0")))
+            .mount(&vendor)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/lodash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(packument(&public.uri(), "lodash")))
+        .mount(&public)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lodash/-/lodash-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(build_test_npm("lodash", "1.0.0")))
+        .mount(&public)
+        .await;
+
+    // `vendor` sorts first by name *and* is given the higher priority, so
+    // nothing but the pattern keeps it away from `lodash`.
+    for (name, base_url, patterns, priority) in [
+        ("vendor", vendor.uri(), vec!["@vendor/*".to_string()], 10),
+        ("public", public.uri(), vec![], 0),
+    ] {
+        service
+            .add_upstream(request(
+                AddUpstreamRequest {
+                    repo: repo.clone(),
+                    channel: "stable".into(),
+                    name: name.into(),
+                    format: silo_proto::v1::PackageFormat::Npm as i32,
+                    base_url,
+                    cache_mode: UpstreamCacheMode::Cache as i32,
+                    cache_index_in_memory: false,
+                    priority,
+                    package_patterns: patterns,
+                    auth: None,
+                    arches: vec![],
+                    suite: String::new(),
+                    components: vec![],
+                },
+                &admin.secret,
+            ))
+            .await
+            .expect("add_upstream");
+    }
+    harness.db.set_repo_public(&repo, true).await.unwrap();
+
+    for (package, expected_upstream) in [("@vendor/widget", "vendor"), ("lodash", "public")] {
+        let file = format!("{}-1.0.0.tgz", package.rsplit('/').next().unwrap());
+        let response = get(
+            &harness.state,
+            &format!("/{repo}/stable/npm/{package}/-/{file}"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "GET {package}"
+        );
+
+        let origin = harness
+            .db
+            .list_packages(&repo, "stable", Some(silo_pkg::PackageFormat::Npm))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == package)
+            .and_then(|p| p.origin_upstream_id)
+            .expect("the package was cached with an origin");
+        let origin = harness.db.find_upstream(origin).await.unwrap().unwrap();
+        assert_eq!(
+            origin.name, expected_upstream,
+            "{package} was served by the wrong upstream"
+        );
+    }
+
+    // The vendor registry was never even asked about the public name.
+    let asked_vendor_for_lodash = vendor
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|r| r.url.path() == "/lodash");
+    assert!(
+        !asked_vendor_for_lodash,
+        "a pattern-scoped upstream must not be asked about a name outside its patterns"
+    );
 }

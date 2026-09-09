@@ -22,6 +22,12 @@ pub struct UpstreamRow {
     pub base_url: String,
     pub cache_mode: String,
     pub cache_index_in_memory: bool,
+    /// Tried highest first. See `silo_core::pull_through::select_upstreams`.
+    pub priority: i32,
+    /// Globs the package name must match for this upstream to be
+    /// consulted. Empty means no restriction. See
+    /// `silo_core::pull_through::upstream_serves`.
+    pub package_patterns: Vec<String>,
     pub arches: Vec<String>,
     pub suite: Option<String>,
     pub components: Vec<String>,
@@ -57,16 +63,34 @@ pub struct NewUpstream {
     pub base_url: String,
     pub cache_mode: String,
     pub cache_index_in_memory: bool,
+    pub priority: i32,
+    pub package_patterns: Vec<String>,
     pub arches: Vec<String>,
     pub suite: Option<String>,
     pub components: Vec<String>,
     pub auth: Option<SealedAuth>,
 }
 
+/// The mutable half of an upstream: everything `update-upstream` can
+/// change, as one value rather than a positional argument list nobody can
+/// read at the call site.
+#[derive(Debug, Clone)]
+pub struct UpstreamSettings<'a> {
+    pub base_url: &'a str,
+    pub cache_mode: &'a str,
+    pub cache_index_in_memory: bool,
+    pub priority: i32,
+    pub package_patterns: &'a [String],
+    pub arches: &'a [String],
+    pub suite: Option<&'a str>,
+    pub components: &'a [String],
+}
+
 const COLUMNS: &str = "id, repo, channel, name, format, base_url, cache_mode, \
-                       cache_index_in_memory, arches, suite, components, auth_kind, \
-                       auth_username, auth_secret_ciphertext, auth_secret_nonce, status, \
-                       last_sync_at, last_sync_error, last_success_at, created_at, updated_at";
+                       cache_index_in_memory, priority, package_patterns, arches, suite, \
+                       components, auth_kind, auth_username, auth_secret_ciphertext, \
+                       auth_secret_nonce, status, last_sync_at, last_sync_error, \
+                       last_success_at, created_at, updated_at";
 
 impl Db {
     /// Inserts a new upstream row. Fails on a `(repo, channel, name)`
@@ -85,10 +109,10 @@ impl Db {
         };
         Ok(sqlx::query_as(&format!(
             "INSERT INTO upstreams (repo, channel, name, format, base_url, cache_mode, \
-                                    cache_index_in_memory, arches, suite, components, \
-                                    auth_kind, auth_username, auth_secret_ciphertext, \
-                                    auth_secret_nonce, status) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'ok') \
+                                    cache_index_in_memory, priority, package_patterns, \
+                                    arches, suite, components, auth_kind, auth_username, \
+                                    auth_secret_ciphertext, auth_secret_nonce, status) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'ok') \
              RETURNING {COLUMNS}"
         ))
         .bind(&new.repo)
@@ -98,6 +122,8 @@ impl Db {
         .bind(&new.base_url)
         .bind(&new.cache_mode)
         .bind(new.cache_index_in_memory)
+        .bind(new.priority)
+        .bind(&new.package_patterns)
         .bind(&new.arches)
         .bind(&new.suite)
         .bind(&new.components)
@@ -171,33 +197,30 @@ impl Db {
     /// stored credential untouched; clearing it is a distinct explicit
     /// action (`clear_upstream_auth`) so a caller can't accidentally wipe
     /// a working credential by omitting `auth` from an unrelated update.
-    #[allow(clippy::too_many_arguments)]
     pub async fn update_upstream(
         &self,
         id: Uuid,
-        base_url: &str,
-        cache_mode: &str,
-        cache_index_in_memory: bool,
-        arches: &[String],
-        suite: Option<&str>,
-        components: &[String],
+        settings: &UpstreamSettings<'_>,
         auth: Option<&SealedAuth>,
     ) -> anyhow::Result<Option<UpstreamRow>> {
         if let Some(auth) = auth {
             return Ok(sqlx::query_as(&format!(
                 "UPDATE upstreams SET base_url = $2, cache_mode = $3, \
-                     cache_index_in_memory = $4, arches = $5, suite = $6, components = $7, \
-                     auth_kind = $8, auth_username = $9, auth_secret_ciphertext = $10, \
-                     auth_secret_nonce = $11, updated_at = now() \
+                     cache_index_in_memory = $4, priority = $5, package_patterns = $6, \
+                     arches = $7, suite = $8, components = $9, \
+                     auth_kind = $10, auth_username = $11, auth_secret_ciphertext = $12, \
+                     auth_secret_nonce = $13, updated_at = now() \
                  WHERE id = $1 RETURNING {COLUMNS}"
             ))
             .bind(id)
-            .bind(base_url)
-            .bind(cache_mode)
-            .bind(cache_index_in_memory)
-            .bind(arches)
-            .bind(suite)
-            .bind(components)
+            .bind(settings.base_url)
+            .bind(settings.cache_mode)
+            .bind(settings.cache_index_in_memory)
+            .bind(settings.priority)
+            .bind(settings.package_patterns)
+            .bind(settings.arches)
+            .bind(settings.suite)
+            .bind(settings.components)
             .bind(&auth.kind)
             .bind(&auth.username)
             .bind(&auth.ciphertext)
@@ -207,25 +230,23 @@ impl Db {
         }
         Ok(sqlx::query_as(&format!(
             "UPDATE upstreams SET base_url = $2, cache_mode = $3, \
-                 cache_index_in_memory = $4, arches = $5, suite = $6, components = $7, \
-                 updated_at = now() \
+                 cache_index_in_memory = $4, priority = $5, package_patterns = $6, \
+                 arches = $7, suite = $8, components = $9, updated_at = now() \
              WHERE id = $1 RETURNING {COLUMNS}"
         ))
         .bind(id)
-        .bind(base_url)
-        .bind(cache_mode)
-        .bind(cache_index_in_memory)
-        .bind(arches)
-        .bind(suite)
-        .bind(components)
+        .bind(settings.base_url)
+        .bind(settings.cache_mode)
+        .bind(settings.cache_index_in_memory)
+        .bind(settings.priority)
+        .bind(settings.package_patterns)
+        .bind(settings.arches)
+        .bind(settings.suite)
+        .bind(settings.components)
         .fetch_optional(self.pool())
         .await?)
     }
 
-    /// Clears a stored credential without touching anything else —
-    /// `update_upstream` only ever *sets* one, so a caller that wants to
-    /// remove a credential entirely (rather than replace it) uses this
-    /// instead.
     pub async fn clear_upstream_auth(&self, id: Uuid) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE upstreams SET auth_kind = NULL, auth_username = NULL, \
@@ -558,7 +579,8 @@ pub async fn list_in_channel<'e, E: PgExecutor<'e>>(
     channel: &str,
 ) -> anyhow::Result<Vec<UpstreamRow>> {
     Ok(sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM upstreams WHERE repo = $1 AND channel = $2 ORDER BY name"
+        "SELECT {COLUMNS} FROM upstreams WHERE repo = $1 AND channel = $2 \
+         ORDER BY priority DESC, name"
     ))
     .bind(repo)
     .bind(channel)
@@ -633,6 +655,8 @@ mod tests {
             base_url: "https://example.com/repo".to_string(),
             cache_mode: "cache".to_string(),
             cache_index_in_memory: false,
+            priority: 0,
+            package_patterns: vec![],
             arches: vec![],
             suite: None,
             components: vec![],
@@ -679,6 +703,73 @@ mod tests {
         let listed = db.list_upstreams(&repo, "stable").await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "epel");
+    }
+
+    /// Upstreams come back in the order they should be tried: highest
+    /// priority first, and the name only as a tie-break. Ordering by name
+    /// alone means the only way to reorder is to rename, and which
+    /// upstream serves a package is then an accident of the alphabet.
+    #[tokio::test]
+    async fn upstreams_are_listed_highest_priority_first_then_by_name() {
+        let Some(db) = db().await else {
+            eprintln!("skipping: set SILO_TEST_DATABASE_URL");
+            return;
+        };
+        let repo = unique("prio");
+        for (name, priority) in [("aaa", 0), ("mmm", 10), ("zzz", 10), ("bbb", -5)] {
+            let mut new = new_upstream(&repo, "stable", name);
+            new.priority = priority;
+            db.create_upstream(&new).await.unwrap();
+        }
+
+        let listed = db.list_upstreams(&repo, "stable").await.unwrap();
+        let order: Vec<&str> = listed.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(order, vec!["mmm", "zzz", "aaa", "bbb"]);
+    }
+
+    /// Both routing columns round-trip, and an upstream that has never
+    /// been given either behaves exactly as it did before they existed.
+    #[tokio::test]
+    async fn routing_settings_round_trip_and_default_to_unrestricted() {
+        let Some(db) = db().await else {
+            eprintln!("skipping: set SILO_TEST_DATABASE_URL");
+            return;
+        };
+        let repo = unique("routing");
+        let plain = db
+            .create_upstream(&new_upstream(&repo, "stable", "plain"))
+            .await
+            .unwrap();
+        assert_eq!(plain.priority, 0);
+        assert!(plain.package_patterns.is_empty());
+
+        let mut scoped = new_upstream(&repo, "stable", "scoped");
+        scoped.priority = 7;
+        scoped.package_patterns = vec!["@acme/*".into(), "legacy-tool".into()];
+        let scoped = db.create_upstream(&scoped).await.unwrap();
+        assert_eq!(scoped.priority, 7);
+        assert_eq!(scoped.package_patterns, vec!["@acme/*", "legacy-tool"]);
+
+        let updated = db
+            .update_upstream(
+                scoped.id,
+                &UpstreamSettings {
+                    base_url: &scoped.base_url,
+                    cache_mode: &scoped.cache_mode,
+                    cache_index_in_memory: scoped.cache_index_in_memory,
+                    priority: -3,
+                    package_patterns: &[],
+                    arches: &scoped.arches,
+                    suite: scoped.suite.as_deref(),
+                    components: &scoped.components,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.priority, -3);
+        assert!(updated.package_patterns.is_empty());
     }
 
     #[tokio::test]

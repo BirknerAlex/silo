@@ -56,7 +56,8 @@ service AdminService {
   // and creates nothing.
   rpc AddUpstream(AddUpstreamRequest) returns (AddUpstreamResponse);
   // Changes an existing upstream's settings in place (cache mode, index
-  // cache toggle, auth, arches/suite/components). Identity
+  // cache toggle, auth, priority, package patterns, arches/suite/
+  // components). Identity
   // (repo/channel/name/format) can't be changed this way — add a new one
   // instead.
   rpc UpdateUpstream(UpdateUpstreamRequest) returns (UpdateUpstreamResponse);
@@ -409,6 +410,11 @@ message UpstreamInfo {
   int64 last_sync_at = 14;
   string last_sync_error = 15;
   int64 last_success_at = 16;
+  // Tried highest first; ties broken by name.
+  int32 priority = 17;
+  // Globs the package name must match for this upstream to be consulted.
+  // Empty means no restriction.
+  repeated string package_patterns = 18;
 }
 
 message AddUpstreamRequest {
@@ -427,6 +433,14 @@ message AddUpstreamRequest {
   string suite = 10;
   // deb only.
   repeated string components = 11;
+  // Tried highest first; ties broken by name. Defaults to 0, which keeps
+  // the plain by-name order for a channel where nobody sets one.
+  int32 priority = 12;
+  // Globs (`*`, `?`) the package name must match for this upstream to be
+  // consulted at all — `@acme/*` for a vendor registry that holds one
+  // scope next to a public registry that holds the rest. Empty means no
+  // restriction, which is every upstream until someone says otherwise.
+  repeated string package_patterns = 13;
 }
 
 message AddUpstreamResponse {
@@ -454,6 +468,11 @@ message UpdateUpstreamRequest {
   repeated string components = 10;
   bool clear_arches = 11;
   bool clear_components = 12;
+  optional int32 priority = 13;
+  // Same "unset means unchanged" convention as arches/components, with
+  // `clear_package_patterns` to empty the list explicitly.
+  repeated string package_patterns = 14;
+  bool clear_package_patterns = 15;
 }
 
 message UpdateUpstreamResponse {
