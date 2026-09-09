@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.14.0](https://github.com/BirknerAlex/silo/compare/v0.13.4...v0.14.0) (2026-09-09)
+
+
+### Features
+
+* **audit:** let a deployment stop auditing what a pull-through captures ([df9d16b](https://github.com/BirknerAlex/silo/commit/df9d16baa3f35ba56919b9b41d612bd1705697c2))
+* **upstreams:** route by priority and package-name globs, not by alphabet ([7090b26](https://github.com/BirknerAlex/silo/commit/7090b2606af6a4bd2d269875179f6f661f300228))
+
+
+### Bug fixes
+
+* **http:** report a database outage during authentication as 503, not 401 ([5efe726](https://github.com/BirknerAlex/silo/commit/5efe726cdb7e94e5b53280bf98e6435832473128))
+* **npm:** drop an upstream's cached index after a lazy per-name sync ([7874fdd](https://github.com/BirknerAlex/silo/commit/7874fdd088efcda2f9428aedddecf6b1044658d9))
+* **npm:** resolve a tarball-first miss in one pass over its lookups ([c70674b](https://github.com/BirknerAlex/silo/commit/c70674ba5785f3a68ecd24ddf200a81cdd5d99d3))
+* **publish:** render an index on the transaction's own connection, not a second pooled one ([7288647](https://github.com/BirknerAlex/silo/commit/7288647132b002bb6565cba1e62ded0c155ef480))
+* **pull-through:** only load one package name's upstream rows when regenerating an npm index ([6cff5ab](https://github.com/BirknerAlex/silo/commit/6cff5ab2e63955b69636930e4cac5e5293cd63a1))
+* **pull-through:** resolve an npm tarball miss by package name, not by filename alone ([909ee39](https://github.com/BirknerAlex/silo/commit/909ee39b232e09eb82147b8486065e972edcf133))
+
+
+### Performance
+
+* **upstreams:** upsert synced upstream packages in batched statements ([d8ff9d9](https://github.com/BirknerAlex/silo/commit/d8ff9d97a62160b77e950ba1edfd9236db2cd907))
+
 ## [0.13.4](https://github.com/BirknerAlex/silo/compare/v0.13.3...v0.13.4) (2026-09-08)
 
 
