@@ -1961,3 +1961,129 @@ async fn an_npm_lazy_sync_drops_the_upstreams_cached_index() {
         .unwrap();
     assert_eq!(body.to_vec(), tarball_bytes);
 }
+
+/// `audit.log_pull_through` decides whether the work a pull-through does
+/// on a client's behalf reaches the audit log.
+///
+/// A bulk install captures one artifact per package, and each capture
+/// goes through the same `publish_with_origin` a real publish does — so
+/// with it on, a 1200-package install writes 1200 `package.publish`
+/// entries attributed to `system`, none of which anyone did. What they
+/// record is already in `packages`, via `origin_upstream_id`. A real
+/// publish is audited either way: the switch keys off the origin
+/// upstream, which only a pull-through ever sets.
+#[tokio::test]
+async fn pull_through_audit_entries_can_be_switched_off_without_silencing_real_publishes() {
+    let url = require_db!();
+    for log_pull_through in [true, false] {
+        let harness = Harness::with_config(&url, |config| {
+            config.audit.log_pull_through = log_pull_through;
+        })
+        .await;
+        let repo = unique_repo("npmauditpt");
+        let admin = harness.admin_token().await;
+        let service = AdminServiceImpl {
+            state: harness.state.clone(),
+        };
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "db_name": "registry" })),
+            )
+            .mount(&mock)
+            .await;
+        let tarball_bytes = build_test_npm("widget", "1.0.0");
+        Mock::given(method("GET"))
+            .and(path("/widget"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "widget",
+                "versions": {
+                    "1.0.0": {
+                        "name": "widget",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{}/widget/-/widget-1.0.0.tgz", mock.uri()),
+                            "shasum": "abc123",
+                        },
+                    },
+                },
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/widget/-/widget-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball_bytes.clone()))
+            .mount(&mock)
+            .await;
+
+        service
+            .add_upstream(request(
+                AddUpstreamRequest {
+                    repo: repo.clone(),
+                    channel: "stable".into(),
+                    name: "npmjs".into(),
+                    format: silo_proto::v1::PackageFormat::Npm as i32,
+                    base_url: mock.uri(),
+                    cache_mode: UpstreamCacheMode::Cache as i32,
+                    cache_index_in_memory: false,
+                    auth: None,
+                    arches: vec![],
+                    suite: String::new(),
+                    components: vec![],
+                },
+                &admin.secret,
+            ))
+            .await
+            .expect("add_upstream");
+        harness.db.set_repo_public(&repo, true).await.unwrap();
+
+        // A capture: the tarball is fetched from the upstream and stored.
+        let response = get(
+            &harness.state,
+            &format!("/{repo}/stable/npm/widget/-/widget-1.0.0.tgz"),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let published = |repo: String| async {
+            harness
+                .db
+                .query_audit(&silo_db::audit::AuditQuery {
+                    action: Some("package.publish".into()),
+                    repo: Some(repo),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+        };
+
+        let captured = published(repo.clone()).await;
+        assert_eq!(
+            captured.len(),
+            usize::from(log_pull_through),
+            "log_pull_through = {log_pull_through}, but the capture wrote {} entries",
+            captured.len()
+        );
+
+        // A publish somebody actually made is audited either way.
+        silo_core::repo::publish(
+            &harness.state.publish,
+            &repo,
+            "stable",
+            silo_pkg::PackageFormat::Npm,
+            build_test_npm("gadget", "2.0.0"),
+            &silo_db::audit::Actor::system(),
+        )
+        .await
+        .expect("publish");
+        assert_eq!(
+            published(repo.clone()).await.len(),
+            usize::from(log_pull_through) + 1,
+            "a real publish must be audited whatever log_pull_through says"
+        );
+    }
+}

@@ -268,6 +268,19 @@ pub struct AuditConfig {
     /// are never audited — `dnf makecache` alone would bury the log.
     #[serde(default = "default_true")]
     pub log_downloads: bool,
+    /// Record what a pull-through does on a client's behalf: the
+    /// `package.publish` for each artifact captured from an upstream, and
+    /// the `index.regenerate` for each index rendered to advertise it.
+    ///
+    /// A bulk install writes one of these per package — around 1200
+    /// entries for a 1200-package `bun install`, none of them anyone's
+    /// action, all of them attributed to `system`. What they record is
+    /// already in `packages`, which carries the upstream each cached
+    /// artifact came from and when it arrived. Turn this off to keep the
+    /// audit log to things a principal actually did; real publishes,
+    /// deletes and index rebuilds are unaffected either way.
+    #[serde(default = "default_true")]
+    pub log_pull_through: bool,
     /// Entries older than this are pruned daily. 0 disables pruning.
     #[serde(default = "default_audit_retention_days")]
     pub retention_days: i64,
@@ -281,6 +294,7 @@ impl Default for AuditConfig {
     fn default() -> Self {
         Self {
             log_downloads: true,
+            log_pull_through: true,
             retention_days: default_audit_retention_days(),
         }
     }
@@ -603,6 +617,7 @@ storage:
         assert!(cfg.auth.bootstrap);
         assert!(cfg.metrics.enabled);
         assert!(cfg.audit.log_downloads);
+        assert!(cfg.audit.log_pull_through);
         assert_eq!(cfg.audit.retention_days, 90);
         assert!(cfg.signing.gpg.is_none());
         assert!(cfg.oidc.is_none());

@@ -172,6 +172,13 @@ config:
 
   audit:
     logDownloads: true
+    # Record what a pull-through does on a client's behalf — the publish
+    # of each artifact captured from an upstream, and the index rendered
+    # to advertise it. A bulk npm/bun install writes one of each per
+    # package, none of them anyone's action, and `packages` already
+    # records which upstream a cached artifact came from. Turn off to keep
+    # the log to what a principal actually did.
+    logPullThrough: true
     retentionDays: 90
 
   # Encrypts stored credentials for pull-through upstreams configured with

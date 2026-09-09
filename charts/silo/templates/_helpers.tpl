@@ -172,6 +172,7 @@ auth:
 
 audit:
   log_downloads: {{ .Values.config.audit.logDownloads }}
+  log_pull_through: {{ .Values.config.audit.logPullThrough }}
   retention_days: {{ .Values.config.audit.retentionDays }}
 
 {{- if .Values.config.upstreamSecret.existingSecret }}
