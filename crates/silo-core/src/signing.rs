@@ -20,6 +20,11 @@
 //!   (`Release`'s body and its signature folded into one document) are
 //!   produced, since real `apt` deployments still carry both.
 //!
+//! - **A Flatpak remote** signs its `summary` and every commit with the
+//!   RPM key, as detached *binary* signatures — the form libostree reads
+//!   out of `summary.sig` and `.commitmeta`. The public key ships to
+//!   clients inside the `.flatpakrepo` file, as binary rather than armor.
+//!
 //! npm has no signing story here: npm clients verify `integrity` hashes
 //! from the packument, which the registry serves over TLS, and there is no
 //! widely-deployed equivalent to `/etc/apk/keys`.
@@ -50,6 +55,9 @@ pub struct Signers {
     /// and pacman repos may reasonably want distinct keys, and reusing
     /// `gpg` would take that choice away.
     pub pacman: Option<Arc<PacmanSigner>>,
+    /// Derived from `gpg`, like apt's: libostree trusts an ordinary
+    /// OpenPGP key, so a Flatpak remote has no key slot of its own.
+    pub ostree: Option<Arc<OstreeSigner>>,
 }
 
 impl Signers {
@@ -72,7 +80,13 @@ impl Signers {
             .map(PacmanSigner::from_config)
             .transpose()?
             .map(Arc::new);
-        Ok(Self { gpg, apk, pacman })
+        let ostree = gpg.clone().map(|gpg| Arc::new(OstreeSigner(gpg)));
+        Ok(Self {
+            gpg,
+            apk,
+            pacman,
+            ostree,
+        })
     }
 
     /// The index signer for a format, if one is configured. RPM's repomd
@@ -90,6 +104,9 @@ impl Signers {
             // Reuses the RPM key rather than a fourth key slot — see the
             // module doc for why apt doesn't need one of its own.
             silo_pkg::PackageFormat::Deb => self.gpg.as_deref().map(|s| s as &dyn IndexSigner),
+            silo_pkg::PackageFormat::Flatpak => {
+                self.ostree.as_deref().map(|s| s as &dyn IndexSigner)
+            }
         }
     }
 }
@@ -113,6 +130,8 @@ pub struct GpgSigner {
     /// and the public half of it can never then disagree with the half
     /// that actually signs.
     armored_public_key: String,
+    /// The same key unarmored, which is what a `.flatpakrepo` carries.
+    binary_public_key: Vec<u8>,
     passphrase: Option<String>,
 }
 
@@ -137,9 +156,14 @@ impl GpgSigner {
             .to_public_key()
             .to_armored_string(ArmorOptions::default())
             .map_err(|e| anyhow::anyhow!("failed to armor the gpg public key: {e}"))?;
+        let binary_public_key = key
+            .to_public_key()
+            .to_bytes()
+            .map_err(|e| anyhow::anyhow!("failed to serialize the gpg public key: {e}"))?;
         Ok(Self {
             armored_key,
             armored_public_key,
+            binary_public_key,
             passphrase: cfg.passphrase.clone(),
         })
     }
@@ -148,6 +172,11 @@ impl GpgSigner {
     /// before they will trust anything this key signed.
     pub fn armored_public_key(&self) -> &str {
         &self.armored_public_key
+    }
+
+    /// The **public** key as raw OpenPGP packets.
+    pub fn binary_public_key(&self) -> &[u8] {
+        &self.binary_public_key
     }
 
     /// Signs RPM bytes in place, returning the re-serialized package.
@@ -266,6 +295,33 @@ impl PacmanSigner {
 impl IndexSigner for PacmanSigner {
     fn key_name(&self) -> &str {
         "pacman"
+    }
+
+    fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.0.detached_binary_signature(data)
+    }
+}
+
+/// Signs an OSTree remote's `summary` and commits with the RPM key, as
+/// the raw detached signatures libostree verifies.
+pub struct OstreeSigner(Arc<GpgSigner>);
+
+impl std::fmt::Debug for OstreeSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OstreeSigner").finish_non_exhaustive()
+    }
+}
+
+impl OstreeSigner {
+    /// The public half of the signing key, as raw OpenPGP packets.
+    pub fn binary_public_key(&self) -> &[u8] {
+        self.0.binary_public_key()
+    }
+}
+
+impl IndexSigner for OstreeSigner {
+    fn key_name(&self) -> &str {
+        "ostree"
     }
 
     fn sign(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -557,6 +613,62 @@ mod tests {
             signature.verify(&public, &b"tampered"[..]).is_err(),
             "verification must actually be checking the data"
         );
+    }
+
+    #[test]
+    fn the_flatpak_signer_is_derived_from_signing_gpg_and_signs_binary() {
+        let none = Signers::from_config(&SigningConfig::default()).unwrap();
+        assert!(none.for_format(PackageFormat::Flatpak).is_none());
+
+        let signers = Signers::from_config(&SigningConfig {
+            gpg: Some(GpgConfig {
+                key: Some(TEST_GPG_SECRET_KEY.to_string()),
+                key_path: None,
+                passphrase: None,
+            }),
+            apk: None,
+            pacman: None,
+        })
+        .unwrap();
+        let signer = signers
+            .for_format(PackageFormat::Flatpak)
+            .expect("a Flatpak remote is signed with signing.gpg");
+        let sig = signer.sign(b"summary bytes").unwrap();
+        // libostree reads raw OpenPGP packets out of `summary.sig`.
+        assert!(!sig.starts_with(b"-----BEGIN"));
+        assert!(!sig.is_empty());
+    }
+
+    #[test]
+    fn the_key_a_flatpakrepo_carries_verifies_what_the_remote_signs() {
+        let signers = Signers::from_config(&SigningConfig {
+            gpg: Some(GpgConfig {
+                key: Some(TEST_GPG_SECRET_KEY.to_string()),
+                key_path: None,
+                passphrase: None,
+            }),
+            apk: None,
+            pacman: None,
+        })
+        .unwrap();
+        let ostree = signers.ostree.as_ref().expect("derived from gpg");
+
+        // The public key is raw packets, not armor, and not the secret key.
+        let key_bytes = ostree.binary_public_key();
+        assert!(!key_bytes.starts_with(b"-----BEGIN"));
+        let public = SignedPublicKey::from_bytes(std::io::Cursor::new(key_bytes))
+            .expect("the key a .flatpakrepo carries parses as raw OpenPGP");
+        let (secret, _) = SignedSecretKey::from_string(TEST_GPG_SECRET_KEY).unwrap();
+        assert_eq!(public.fingerprint(), secret.fingerprint());
+        public.verify_bindings().expect("the exported key verifies");
+
+        let signature_bytes = ostree.sign(b"summary bytes").unwrap();
+        let signature = DetachedSignature::from_bytes(std::io::Cursor::new(&signature_bytes))
+            .expect("the signature is a raw OpenPGP packet");
+        signature
+            .verify(&public, &b"summary bytes"[..])
+            .expect("the published key verifies the remote's signature");
+        assert!(signature.verify(&public, &b"tampered"[..]).is_err());
     }
 
     #[test]

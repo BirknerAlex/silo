@@ -1,0 +1,4 @@
+[Runtime]
+name=org.silo.Platform
+runtime=org.silo.Platform/@ARCH@/1
+sdk=org.silo.Platform/@ARCH@/1

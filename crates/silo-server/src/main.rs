@@ -151,7 +151,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         version = %silo_core::BuildInfo::current().short(),
         addr = %addr,
-        formats = "rpm,apk,npm",
+        formats = %silo_pkg::PackageFormat::ALL
+            .iter()
+            .map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
         "silo-server starting"
     );
 

@@ -1,0 +1,4 @@
+[Application]
+name=org.silo.Hello
+runtime=org.silo.Platform/@ARCH@/1
+sdk=org.silo.Platform/@ARCH@/1

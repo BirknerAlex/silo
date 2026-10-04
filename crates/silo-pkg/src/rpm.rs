@@ -54,6 +54,7 @@ impl Format for RpmFormat {
             filename,
             metadata,
             payload: bytes.to_vec(),
+            extra_objects: Vec::new(),
         })
     }
 
@@ -630,6 +631,7 @@ mod tests {
             filename: "foo-1.0-1.noarch.rpm".into(),
             metadata: serde_json::Value::Null,
             payload: vec![],
+            extra_objects: Vec::new(),
         };
         assert_eq!(parsed.nevra(), "foo-1.0-1.noarch");
         parsed.epoch = 2;
@@ -648,6 +650,7 @@ mod tests {
             filename: "foo-1.0-1.x86_64.rpm".into(),
             metadata: serde_json::Value::Null,
             payload: vec![],
+            extra_objects: Vec::new(),
         };
         assert_eq!(
             RpmFormat.storage_key("myrepo", "stable", &pkg),

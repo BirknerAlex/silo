@@ -162,9 +162,15 @@ pub async fn publish_with_origin(
         .parse(&bytes)
         .map_err(|e| anyhow::anyhow!("invalid {format} package: {e}"))?;
 
-    // RPM is signed per-package; apk and npm are not (see `signing`).
+    // RPM is signed per-package; apk and npm are not (see `signing`). A
+    // Flatpak publish signs its commit, which is what `signed` reports for
+    // it — the same answer a pushed ref gives.
     let (payload, signed) = match format {
         PackageFormat::Rpm => maybe_sign_rpm(parsed.payload.clone(), &ctx.signers)?,
+        PackageFormat::Flatpak => (
+            parsed.payload.clone(),
+            ctx.signers.for_format(format).is_some(),
+        ),
         _ => (parsed.payload.clone(), false),
     };
 
@@ -177,10 +183,53 @@ pub async fn publish_with_origin(
         .map_err(|e| anyhow::anyhow!("could not index {format} package: {e}"))?
         .unwrap_or_else(|| parsed.metadata.clone());
 
+    store_parsed(
+        ctx,
+        repo,
+        channel,
+        format,
+        parsed,
+        payload,
+        metadata,
+        signed,
+        actor,
+        origin_upstream_id,
+    )
+    .await
+}
+
+/// The second half of a publish: everything after the bytes have been
+/// validated and, where the format wants it, signed.
+///
+/// Split out so a Flatpak ref update — whose objects arrived separately
+/// and were checked where they landed — goes through the same lock, row
+/// upsert, index regeneration and audit entry as every other publish.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_parsed(
+    ctx: &PublishContext,
+    repo: &str,
+    channel: &str,
+    format: PackageFormat,
+    parsed: silo_pkg::ParsedPackage,
+    payload: Vec<u8>,
+    metadata: serde_json::Value,
+    signed: bool,
+    actor: &Actor,
+    origin_upstream_id: Option<silo_db::Uuid>,
+) -> anyhow::Result<PublishOutcome> {
+    let handler = format.handler();
     let storage_key = handler.storage_key(repo, channel, &parsed);
     let index_group = handler.index_group(&parsed);
     let sha256 = hex_sha256(&payload);
     let size_bytes = payload.len() as i64;
+
+    // Objects a package is made of beyond its own file. They are named by
+    // their content, so writing one is idempotent and independent of every
+    // other publish — which is why this happens before the lock rather than
+    // holding every publisher to the channel waiting on an upload.
+    let mut companions = handler.companion_objects(&parsed, ctx.signers.for_format(format))?;
+    companions.extend(parsed.extra_objects.iter().cloned());
+    store_objects(ctx, repo, channel, companions).await?;
 
     let scope = lock::index_scope(repo, channel, format.as_str(), &index_group);
     let mut locked = ctx.db.lock(scope).await?;
@@ -263,6 +312,46 @@ pub async fn publish_with_origin(
         index_group,
         index_objects,
     })
+}
+
+/// How many objects are in flight to storage at once when a publish
+/// writes a package's worth of them. A Flatpak app is thousands of small
+/// objects; one at a time is a round trip each.
+const OBJECT_UPLOAD_CONCURRENCY: usize = 32;
+
+/// Writes objects under `{repo}/{channel}/`, skipping any already there
+/// unless the object asks to be replaced.
+///
+/// A content-addressed key that exists holds the same bytes by
+/// construction — the key *is* the checksum — so the check saves the
+/// upload, not just a write.
+async fn store_objects(
+    ctx: &PublishContext,
+    repo: &str,
+    channel: &str,
+    objects: Vec<silo_pkg::ExtraObject>,
+) -> anyhow::Result<()> {
+    use futures::{StreamExt, TryStreamExt};
+
+    let storage = ctx.storage.clone();
+    let keyed: Vec<(String, silo_pkg::ExtraObject)> = objects
+        .into_iter()
+        .map(|object| (format!("{repo}/{channel}/{}", object.key), object))
+        .collect();
+    futures::stream::iter(keyed)
+        .map(|(key, object)| {
+            let storage = storage.clone();
+            async move {
+                if !object.replace && storage.head(&key).await? {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                storage.put(&key, object.bytes).await
+            }
+        })
+        .buffer_unordered(OBJECT_UPLOAD_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(())
 }
 
 /// Rebuilds one index group from the database, without publishing
@@ -428,7 +517,7 @@ pub async fn rebuild_index_for_upstream(
     let groups: Vec<String> = match format {
         PackageFormat::Rpm | PackageFormat::Deb => vec![String::new()],
         PackageFormat::Apk | PackageFormat::Pacman => arches.to_vec(),
-        PackageFormat::Npm => Vec::new(),
+        PackageFormat::Npm | PackageFormat::Flatpak => Vec::new(),
     };
     for group in groups {
         regenerate_index(ctx, repo, channel, format, &group, actor).await?;
@@ -521,6 +610,8 @@ async fn merge_upstream_records(
                 }
                 PackageFormat::Npm => row.name == index_group,
                 PackageFormat::Rpm | PackageFormat::Deb => true,
+                // A Flatpak channel has no upstream rows to fold in.
+                PackageFormat::Flatpak => false,
             };
             if !belongs {
                 continue;
@@ -611,6 +702,7 @@ fn synthetic_record(
         filename: row.filename.clone(),
         metadata: serde_json::Value::Null,
         payload: Vec::new(),
+        extra_objects: Vec::new(),
     };
     let storage_key = format.handler().storage_key(repo, channel, &pseudo);
 

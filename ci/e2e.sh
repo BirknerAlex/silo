@@ -68,6 +68,7 @@ cleanup() {
         $COMPOSE logs --no-color --tail 80 silo || true
     fi
     $COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true
+    docker volume rm -f "${PROJECT}-flatpak-home-bundle" "${PROJECT}-flatpak-home-push" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -225,6 +226,38 @@ DEB_FILE=$(ls "$WORK"/packages/*.deb)
 DEB_ARCH=$(basename "$DEB_FILE" .deb)
 DEB_ARCH=${DEB_ARCH##*_}
 ok "deb  $(basename "$DEB_FILE")  (arch: $DEB_ARCH)"
+
+# Flatpak, via the real flatpak tooling in Fedora. The runtime is a
+# static busybox built here rather than a Freedesktop one, so installing and
+# running the app needs nothing from Flathub. Two things come out: a local
+# OSTree repository, which `silo publish-ostree` pushes, and bundles, which
+# `silo publish` takes — silo supports both, and they are different upload
+# paths into the same remote.
+FLATPAK_DIR=$WORK/flatpak
+mkdir -p "$FLATPAK_DIR"
+docker run --rm -v "$FLATPAK_DIR:/out" alpine:3.20 sh -c '
+    apk add --no-cache busybox-static >/dev/null
+    cp /bin/busybox.static /out/busybox
+' >/dev/null 2>&1 || fail "could not get a static busybox for the flatpak runtime"
+docker run --rm -v "$ROOT/examples/flatpak:/src:ro" -v "$ROOT/ci/e2e:/scripts:ro" \
+    -v "$FLATPAK_DIR:/out" fedora:41 sh /scripts/build-flatpak.sh >/dev/null 2>&1 \
+    || fail "building the flatpak example failed (rerun with bash -x ci/e2e.sh to see why)"
+FLATPAK_ARCH=$(docker run --rm fedora:41 uname -m)
+ok "flatpak  org.silo.Hello + org.silo.Platform  (arch: $FLATPAK_ARCH)"
+
+# A real app from Flathub, fetched live: the example above proves silo
+# serves what flatpak builds, this proves it serves what the ecosystem
+# actually publishes — a signed commit full of real files, built by someone
+# else's pipeline. Off with E2E_SKIP_FLATHUB=1 where there is no network.
+FLATHUB_APP=com.github.tchx84.Flatseal
+if [ -z "${E2E_SKIP_FLATHUB:-}" ]; then
+    mkdir -p "$FLATPAK_DIR/flathub"
+    docker run --rm -e "FLATHUB_APP=$FLATHUB_APP" -v "$ROOT/ci/e2e:/scripts:ro" \
+        -v "$FLATPAK_DIR/flathub:/out" fedora:41 sh /scripts/build-flathub.sh >/dev/null 2>&1 \
+        || fail "fetching $FLATHUB_APP from Flathub failed (set E2E_SKIP_FLATHUB=1 to skip)"
+    FLATHUB_COMMIT=$(cat "$FLATPAK_DIR/flathub/commit")
+    ok "flathub  $FLATHUB_APP  ${FLATHUB_COMMIT:0:12}"
+fi
 
 # ------------------------------------------------------------- the server
 
@@ -433,6 +466,51 @@ publish "$(basename "$NPM_FILE")" | sed 's/^/    /'
 publish "$(basename "$PACMAN_FILE")" | sed 's/^/    /'
 publish "$(basename "$DEB_FILE")" | sed 's/^/    /'
 
+# Flatpak is published into channels of its own: a channel is one OSTree
+# remote, so each upload path gets one to itself and the two can be told
+# apart. The runtime and the app go in by bundle in one and as a pushed
+# repository in the other.
+FP_BUNDLE=flatpak-bundle
+FP_PUSH=flatpak-push
+FP_FLATHUB_BUNDLE=flatpak-flathub-bundle
+FP_FLATHUB_PUSH=flatpak-flathub-push
+
+$COMPOSE exec -T silo mkdir -p /tmp/flatpak
+docker cp "$FLATPAK_DIR/." "$($COMPOSE ps -q silo)":/tmp/flatpak/
+
+fp_publish() {
+    $COMPOSE exec -T -e "SILO_TOKEN=$PUBLISH_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+        /usr/local/bin/silo publish "/tmp/flatpak/$1" --repo "$REPO" --channel "$2"
+}
+fp_push() {
+    $COMPOSE exec -T -e "SILO_TOKEN=$PUBLISH_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+        /usr/local/bin/silo publish-ostree "/tmp/flatpak/$1" --repo "$REPO" --channel "$2" "${@:3}"
+}
+
+fp_publish platform.flatpak "$FP_BUNDLE" | sed 's/^/    /'
+fp_publish hello.flatpak "$FP_BUNDLE" | sed 's/^/    /'
+fp_push repo-v1 "$FP_PUSH" | sed 's/^/    /'
+if [ -z "${E2E_SKIP_FLATHUB:-}" ]; then
+    fp_publish flathub/app.flatpak "$FP_FLATHUB_BUNDLE" | sed 's/^/    /'
+    fp_push flathub/repo "$FP_FLATHUB_PUSH" | sed 's/^/    /'
+fi
+
+# Pushing again sends nothing: the second push finds every object already
+# there and only moves the refs.
+SECOND_PUSH=$(fp_push repo-v1 "$FP_PUSH")
+echo "$SECOND_PUSH" | grep -q "uploaded 0 of" \
+    || fail "a repeated flatpak push re-uploaded objects: $SECOND_PUSH"
+ok "a repeated push uploads nothing"
+
+for channel in "$FP_BUNDLE" "$FP_PUSH"; do
+    LISTED_FP=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+        /usr/local/bin/silo list --repo "$REPO" --channel "$channel" --json | tr -d '\r')
+    echo "$LISTED_FP" | grep -q '"format": "flatpak"' || fail "flatpak is missing from $channel"
+    echo "$LISTED_FP" | grep -q 'org.silo.Hello' || fail "org.silo.Hello is missing from $channel"
+    echo "$LISTED_FP" | grep -q 'org.silo.Platform' || fail "org.silo.Platform is missing from $channel"
+done
+ok "flatpak is indexed under both upload paths"
+
 # Five packages, five formats, all in one repo/channel.
 LISTED=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
     /usr/local/bin/silo list --repo "$REPO" --channel "$CHANNEL" --json | tr -d '\r')
@@ -478,6 +556,57 @@ verify apk    alpine:3.20      verify-apk.sh
 verify npm    node:22-alpine   verify-npm.sh
 verify pacman archlinux:base   verify-pacman.sh
 verify apt    debian:12        verify-apt.sh
+
+# flatpak needs a sandbox to run an app in, which needs user namespaces, so
+# these containers are privileged. Each scenario is a fresh container; the
+# volumes carry an installation from `install` to `update`.
+verify_flatpak() {
+    local label=$1 channel=$2 phase=$3
+    shift 3
+    log "verifying with real flatpak: $label"
+    docker run --rm --privileged \
+        --network "${PROJECT}_silo" \
+        -e "REPO=$REPO" -e "FLATPAK_CHANNEL=$channel" -e "PHASE=$phase" \
+        -v "$ROOT/ci/e2e:/verify:ro" \
+        -v "$WORK/keys:/keys:ro" \
+        "$@" \
+        fedora:41 sh /verify/verify-flatpak.sh 2>&1 | sed 's/^/    /' \
+        || fail "flatpak verification ($label) failed"
+    ok "flatpak $label"
+}
+
+FP_HOME_BUNDLE="${PROJECT}-flatpak-home-bundle"
+FP_HOME_PUSH="${PROJECT}-flatpak-home-push"
+# Created fresh: a flatpak HOME left over from an earlier run would still
+# trust that run's signing key, and the new run generates its own.
+docker volume rm -f "$FP_HOME_BUNDLE" "$FP_HOME_PUSH" >/dev/null
+docker volume create "$FP_HOME_BUNDLE" >/dev/null
+docker volume create "$FP_HOME_PUSH" >/dev/null
+
+verify_flatpak "install, from a published bundle" "$FP_BUNDLE" install \
+    -v "$FP_HOME_BUNDLE:/flatpak-home" -e FLATPAK_HOME=/flatpak-home
+verify_flatpak "install, from a pushed repository" "$FP_PUSH" install \
+    -v "$FP_HOME_PUSH:/flatpak-home" -e FLATPAK_HOME=/flatpak-home
+verify_flatpak "install from a .flatpakref" "$FP_BUNDLE" ref
+verify_flatpak "refusing a remote pinned to another key" "$FP_BUNDLE" signature
+
+if [ -z "${E2E_SKIP_FLATHUB:-}" ]; then
+    verify_flatpak "a Flathub app, republished as a bundle" "$FP_FLATHUB_BUNDLE" flathub \
+        -e "FLATHUB_APP=$FLATHUB_APP" -e "FLATHUB_COMMIT=$FLATHUB_COMMIT"
+    verify_flatpak "a Flathub app, republished by pushing its repository" "$FP_FLATHUB_PUSH" flathub \
+        -e "FLATHUB_APP=$FLATHUB_APP" -e "FLATHUB_COMMIT=$FLATHUB_COMMIT"
+fi
+
+# A new version of the app, published the same two ways, has to reach a
+# client that already has the old one.
+log "publishing app 2.0.0 and updating the installed clients"
+fp_publish hello-v2.flatpak "$FP_BUNDLE" | sed 's/^/    /'
+fp_push repo-v2 "$FP_PUSH" --ref "app/org.silo.Hello/$FLATPAK_ARCH/stable" | sed 's/^/    /'
+verify_flatpak "update, from a published bundle" "$FP_BUNDLE" update \
+    -v "$FP_HOME_BUNDLE:/flatpak-home" -e FLATPAK_HOME=/flatpak-home
+verify_flatpak "update, from a pushed repository" "$FP_PUSH" update \
+    -v "$FP_HOME_PUSH:/flatpak-home" -e FLATPAK_HOME=/flatpak-home
+docker volume rm -f "$FP_HOME_BUNDLE" "$FP_HOME_PUSH" >/dev/null
 
 # ---------------------------------------------------- pull-through cache
 
@@ -770,5 +899,13 @@ $COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:80
     /usr/local/bin/silo index rebuild --repo "$REPO" --channel "$CHANNEL" --format deb \
     | sed 's/^/    /'
 verify "apt (after an index rebuild)" debian:12 verify-apt.sh
+
+for channel in "$FP_BUNDLE" "$FP_PUSH"; do
+    $COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+        /usr/local/bin/silo index rebuild --repo "$REPO" --channel "$channel" --format flatpak \
+        | sed 's/^/    /'
+    verify_flatpak "after an index rebuild ($channel)" "$channel" install \
+        -e EXPECTED_VERSION=2.0.0
+done
 
 log "end-to-end suite passed"

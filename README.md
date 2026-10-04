@@ -3,10 +3,10 @@
 # Silo
 
 Self-hosted package registry for **RPM**, **Alpine APK**, **npm**,
-**pacman** (Arch Linux), and **Debian** (`apt`). Publish over gRPC; `dnf`,
-`apk`, `npm`, `pacman` and `apt` consume the results as real repositories
-over plain HTTP. Packages live in S3-compatible object storage, everything
-else lives in Postgres. A repo/channel can also pull through one or more
+**pacman** (Arch Linux), **Debian** (`apt`), and **Flatpak**. Publish over
+gRPC; `dnf`, `apk`, `npm`, `pacman`, `apt` and `flatpak` consume the results
+as real repositories over plain HTTP. Packages live in S3-compatible object
+storage, everything else lives in Postgres. A repo/channel can also pull through one or more
 upstream registries per format, optionally caching what it fetches, so it
 doubles as a local mirror in front of the public registries.
 
@@ -37,11 +37,23 @@ silo publish ./hello-1.0-r0.apk             --repo myrepo --channel edge
 silo publish ./widget-1.0.0.tgz             --repo myrepo --channel stable
 silo publish ./hello-1.0-1-x86_64.pkg.tar.zst --repo myrepo --channel arch
 silo publish ./hello_1.0-1_amd64.deb        --repo myrepo --channel stable
+silo publish ./hello.flatpak                --repo myrepo --channel apps
 silo list --repo myrepo --channel stable
 ```
 
 The format is inferred from the file extension; pass `--format` to be
 explicit.
+
+A Flatpak channel is an OSTree remote. Besides `.flatpak` bundles, `silo
+publish-ostree` pushes the apps and runtimes of a local repository (what
+`flatpak build-export` and `flatpak-builder --repo` produce), uploading only
+the objects the server lacks:
+
+```sh
+silo publish-ostree ./repo --repo myrepo --channel apps
+flatpak remote-add silo https://silo.example.com/myrepo/apps/silo.flatpakrepo
+flatpak install silo org.example.Hello
+```
 
 ## Publishing from CI
 
@@ -70,14 +82,14 @@ The [wiki](https://github.com/BirknerAlex/silo/wiki) has the full docs:
 - [Installation](https://github.com/BirknerAlex/silo/wiki/Installation) — installing the `silo` CLI itself: deb/rpm/apk/pacman, Homebrew, or the GitHub release
 - [Setup](https://github.com/BirknerAlex/silo/wiki/Setup) — Docker Compose and Helm deployment, the `config.yaml` schema
 - [Usage](https://github.com/BirknerAlex/silo/wiki/Usage) — tokens, repo public/private mode, administration
-  - [RPM](https://github.com/BirknerAlex/silo/wiki/Usage-RPM), [APK](https://github.com/BirknerAlex/silo/wiki/Usage-APK), [npm](https://github.com/BirknerAlex/silo/wiki/Usage-npm), [pacman](https://github.com/BirknerAlex/silo/wiki/Usage-Pacman), [Deb](https://github.com/BirknerAlex/silo/wiki/Usage-Deb) — per-client config, with and without auth, signing
+  - [RPM](https://github.com/BirknerAlex/silo/wiki/Usage-RPM), [APK](https://github.com/BirknerAlex/silo/wiki/Usage-APK), [npm](https://github.com/BirknerAlex/silo/wiki/Usage-npm), [pacman](https://github.com/BirknerAlex/silo/wiki/Usage-Pacman), [Deb](https://github.com/BirknerAlex/silo/wiki/Usage-Deb), [Flatpak](https://github.com/BirknerAlex/silo/wiki/Usage-Flatpak) — per-client config, with and without auth, signing
 - [Maintenance](https://github.com/BirknerAlex/silo/wiki/Maintenance) — background jobs and retention-based package pruning
 - [Contributing](https://github.com/BirknerAlex/silo/wiki/Contributing) — dev container, local builds, CI checks
 
 ## Contributing
 
 Contributions are welcome from anyone — bug fixes, docs, and new package
-formats alike. RPM, APK, npm, pacman, and Deb all hang off the same
+formats alike. RPM, APK, npm, pacman, Deb, and Flatpak all hang off the same
 `PackageFormat` seam, so adding another one is additive, not a rewrite.
 See [Contributing](https://github.com/BirknerAlex/silo/wiki/Contributing)
 for the dev container, local builds, and the checks CI runs.

@@ -1,8 +1,8 @@
-//! The plain-HTTP surface: what `dnf`, `apk`, `pacman`, `apt` and `npm`
-//! actually talk to.
+//! The plain-HTTP surface: what `dnf`, `apk`, `pacman`, `apt`, `npm` and
+//! `flatpak` actually talk to.
 //!
 //! Each client speaks its own protocol and none of them can be taught a
-//! new one, so this module is five thin adapters over the same storage and
+//! new one, so this module is six thin adapters over the same storage and
 //! the same auth:
 //!
 //! | client | reads | credential |
@@ -12,6 +12,7 @@
 //! | `pacman` | `/{repo}/{ch}/pacman/{arch}/{db.tar.gz,*.pkg.tar.*}` | Basic in principle, but pacman's downloader never sends URL-embedded credentials — see `ci/e2e.sh` |
 //! | `apt` | `/{repo}/{ch}/dists/{suite}/*`, `/{repo}/{ch}/pool/*.deb` | Basic (credentials in the URL) |
 //! | `npm` | `/{repo}/{ch}/npm/{name}`, `.../{name}/-/{file}.tgz` | Bearer (`.npmrc` `_authToken`) |
+//! | `flatpak` | `/{repo}/{ch}/ostree/*`, `/{repo}/{ch}/silo.flatpakrepo` | none for a public repo; see [`flatpak`] |
 //!
 //! Index files (repodata, APKINDEX, packuments) are proxied through the
 //! server: they're small and polled constantly. Package downloads
@@ -38,6 +39,8 @@ use silo_pkg::PackageFormat;
 
 use crate::auth::{self, Authenticated};
 use crate::AppState;
+
+mod flatpak;
 
 /// Ceiling on the JSON body of an `npm publish` request, enforced by hand
 /// in [`publish_npm`] (see its doc comment for why it can't just be a
@@ -89,6 +92,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         // handler. See `get_npm_root`'s doc for why this exists at all.
         .route("/{repo}/{channel}/npm", get(get_npm_root))
         .route("/{repo}/{channel}/npm/", get(get_npm_root))
+        // flatpak — an OSTree remote. `PUT` uploads an object and `POST`
+        // asks which are missing or moves a ref; see the module doc.
+        .route(
+            "/{repo}/{channel}/ostree/{*file}",
+            get(flatpak::get_ostree)
+                .put(flatpak::put_ostree)
+                .post(flatpak::post_ostree),
+        )
+        .route(
+            "/{repo}/{channel}/silo.flatpakrepo",
+            get(flatpak::get_flatpakrepo),
+        )
+        .route(
+            "/{repo}/{channel}/flatpakref/{file}",
+            get(flatpak::get_flatpakref),
+        )
         .with_state(state)
 }
 

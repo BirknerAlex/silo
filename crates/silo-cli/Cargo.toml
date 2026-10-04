@@ -30,3 +30,4 @@ rpassword = "7"
 [dev-dependencies]
 tempfile.workspace = true
 silo-pkg = { path = "../silo-pkg", features = ["test-util"] }
+wiremock = "0.6"
