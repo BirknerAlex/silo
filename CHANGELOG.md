@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.15.0](https://github.com/BirknerAlex/silo/compare/v0.14.0...v0.15.0) (2026-10-04)
+
+
+### Features
+
+* **flatpak:** collect the objects no ref reaches with a maintenance job ([7280c5b](https://github.com/BirknerAlex/silo/commit/7280c5bd3d4dde3501e6682635d43010890f37ad))
+* **flatpak:** serve an OSTree remote from bundles and pushed repositories ([15525f3](https://github.com/BirknerAlex/silo/commit/15525f33660619d183f515b58f67c7bd05e36bc4))
+
+
+### Bug fixes
+
+* **flatpak:** address review feedback on bundle validation and URLs ([a7a5eb4](https://github.com/BirknerAlex/silo/commit/a7a5eb431ab681347a88a35571660bac4f928d58))
+
 ## [0.14.0](https://github.com/BirknerAlex/silo/compare/v0.13.4...v0.14.0) (2026-09-09)
 
 
