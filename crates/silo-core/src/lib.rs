@@ -1,5 +1,6 @@
 pub mod config;
 pub mod oidc;
+pub mod ostree;
 pub mod prune;
 pub mod pull_through;
 pub mod repo;

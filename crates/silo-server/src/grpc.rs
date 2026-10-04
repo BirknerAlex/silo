@@ -61,8 +61,9 @@ impl PublishServiceImpl {
             return Err(Status::invalid_argument("repo and channel are required"));
         }
 
-        let format = from_proto_format(metadata.format)
-            .ok_or_else(|| Status::invalid_argument("format must be one of rpm, apk, or npm"))?;
+        let format = from_proto_format(metadata.format).ok_or_else(|| {
+            Status::invalid_argument("format must be one of rpm, apk, npm, pacman, deb or flatpak")
+        })?;
 
         // Authorize before reading the body: a client with no write access
         // shouldn't get to stream a gigabyte before being told no.
@@ -300,6 +301,7 @@ pub fn from_proto_format(value: i32) -> Option<PackageFormat> {
         ProtoFormat::Npm => Some(PackageFormat::Npm),
         ProtoFormat::Pacman => Some(PackageFormat::Pacman),
         ProtoFormat::Deb => Some(PackageFormat::Deb),
+        ProtoFormat::Flatpak => Some(PackageFormat::Flatpak),
         ProtoFormat::Unspecified => None,
     }
 }
@@ -311,6 +313,7 @@ pub fn to_proto_format(format: PackageFormat) -> ProtoFormat {
         PackageFormat::Npm => ProtoFormat::Npm,
         PackageFormat::Pacman => ProtoFormat::Pacman,
         PackageFormat::Deb => ProtoFormat::Deb,
+        PackageFormat::Flatpak => ProtoFormat::Flatpak,
     }
 }
 

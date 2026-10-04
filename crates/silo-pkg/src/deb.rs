@@ -129,6 +129,7 @@ impl Format for DebFormat {
             filename,
             metadata,
             payload: bytes.to_vec(),
+            extra_objects: Vec::new(),
         })
     }
 

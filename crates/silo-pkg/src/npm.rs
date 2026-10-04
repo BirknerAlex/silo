@@ -95,6 +95,7 @@ impl Format for NpmFormat {
             filename,
             metadata: Value::Object(manifest),
             payload: bytes.to_vec(),
+            extra_objects: Vec::new(),
         })
     }
 

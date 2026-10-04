@@ -8,6 +8,7 @@
 
 mod config;
 mod login;
+mod ostree;
 mod output;
 
 use std::path::PathBuf;
@@ -67,6 +68,9 @@ enum Command {
 
     /// Validate and publish a package.
     Publish(PublishArgs),
+    /// Publish refs from a local OSTree repository (Flatpak apps and
+    /// runtimes), uploading only the objects the server lacks.
+    PublishOstree(PublishOstreeArgs),
     /// List packages in a repo/channel.
     List(ListArgs),
     /// List repos and channels this credential can see, plus any public
@@ -166,6 +170,22 @@ struct PublishArgs {
     /// Inferred from the file extension when omitted.
     #[arg(long)]
     format: Option<String>,
+}
+
+#[derive(Args)]
+struct PublishOstreeArgs {
+    /// The local repository, in `archive` mode (what `flatpak build-export`
+    /// and `flatpak-builder --repo` produce).
+    path: PathBuf,
+    #[arg(long)]
+    repo: String,
+    #[arg(long)]
+    channel: String,
+    /// A ref to publish, e.g. `app/org.example.Hello/x86_64/stable`.
+    /// Repeatable. Without it every app and runtime under `refs/heads` is
+    /// published.
+    #[arg(long = "ref")]
+    refs: Vec<String>,
 }
 
 #[derive(Args)]
@@ -510,6 +530,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Logout => cmd_logout(&config_path),
         Command::Whoami { json } => cmd_whoami(&config_path, cli.server.as_deref(), json).await,
         Command::Publish(args) => cmd_publish(&config_path, cli.server.as_deref(), args).await,
+        Command::PublishOstree(args) => {
+            cmd_publish_ostree(&config_path, cli.server.as_deref(), args).await
+        }
         Command::List(args) => cmd_list(&config_path, cli.server.as_deref(), args).await,
         Command::Repos { json } => cmd_repos(&config_path, cli.server.as_deref(), json).await,
         Command::Repo(cmd) => cmd_repo(&config_path, cli.server.as_deref(), cmd).await,
@@ -674,6 +697,7 @@ fn to_proto_format(format: PackageFormat) -> ProtoFormat {
         PackageFormat::Npm => ProtoFormat::Npm,
         PackageFormat::Pacman => ProtoFormat::Pacman,
         PackageFormat::Deb => ProtoFormat::Deb,
+        PackageFormat::Flatpak => ProtoFormat::Flatpak,
     }
 }
 
@@ -684,6 +708,7 @@ fn format_name(value: i32) -> String {
         Ok(ProtoFormat::Npm) => "npm".into(),
         Ok(ProtoFormat::Pacman) => "pacman".into(),
         Ok(ProtoFormat::Deb) => "deb".into(),
+        Ok(ProtoFormat::Flatpak) => "flatpak".into(),
         _ => "-".into(),
     }
 }
@@ -1015,7 +1040,7 @@ async fn cmd_publish(
                 .unwrap_or_default();
             PackageFormat::from_filename(&filename).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "could not infer the format of `{filename}` — pass --format rpm|apk|npm"
+                    "could not infer the format of `{filename}` — pass --format rpm|apk|npm|pacman|deb|flatpak"
                 )
             })?
         }
@@ -1059,6 +1084,39 @@ async fn cmd_publish(
     );
     if !response.index_objects.is_empty() {
         println!("index updated: {}", response.index_objects.join(", "));
+    }
+    Ok(())
+}
+
+async fn cmd_publish_ostree(
+    config_path: &str,
+    server: Option<&str>,
+    args: PublishOstreeArgs,
+) -> anyhow::Result<()> {
+    let session = session(config_path, server)?;
+    let summary = ostree::push(
+        &session.addr,
+        &session.token,
+        &args.repo,
+        &args.channel,
+        &args.path,
+        &args.refs,
+    )
+    .await?;
+
+    for skipped in &summary.skipped {
+        println!("skipped {skipped} (not an app or runtime)");
+    }
+    println!(
+        "uploaded {} of {} objects",
+        summary.objects_uploaded, summary.objects_total
+    );
+    for reference in &summary.refs {
+        println!(
+            "published {reference} ({}{})",
+            PackageFormat::Flatpak,
+            if summary.signed { ", signed" } else { "" }
+        );
     }
     Ok(())
 }

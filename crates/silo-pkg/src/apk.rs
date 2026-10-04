@@ -116,6 +116,7 @@ impl Format for ApkFormat {
             filename: format!("{name}-{version}.apk"),
             metadata,
             payload: bytes.to_vec(),
+            extra_objects: Vec::new(),
         })
     }
 

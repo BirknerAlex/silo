@@ -130,6 +130,7 @@ impl Format for PacmanFormat {
             filename,
             metadata,
             payload: bytes.to_vec(),
+            extra_objects: Vec::new(),
         })
     }
 

@@ -1,7 +1,7 @@
 //! Package format parsing, storage layout, and index rendering.
 //!
-//! Five formats are supported: RPM (`dnf`/`yum`), Alpine APK (`apk`), npm,
-//! pacman (Arch Linux), and Debian (`apt`). Everything format-specific
+//! Six formats are supported: RPM (`dnf`/`yum`), Alpine APK (`apk`), npm,
+//! pacman (Arch Linux), Debian (`apt`), and Flatpak (an OSTree remote). Everything format-specific
 //! lives behind the [`Format`] trait so the rest of the codebase — publish
 //! flow, HTTP surface, database index — never matches on a format enum
 //! except to dispatch through [`PackageFormat::handler`].
@@ -16,8 +16,9 @@
 //! | pacman | `{repo}/{ch}/pacman/{arch}/{file}` | one architecture |
 //! | npm | `{repo}/{ch}/npm/{name}/-/{file}` | one package name |
 //! | deb | `{repo}/{ch}/pool/{file}` | the whole channel |
+//! | flatpak | `{repo}/{ch}/ostree/refs/heads/{ref}` | the whole channel |
 //!
-//! All five indexes are pure functions of the database. Whatever a
+//! All six indexes are pure functions of the database. Whatever a
 //! format's index needs that the common columns don't hold is extracted
 //! once, at publish, into the row's `metadata` — so regenerating an index
 //! never reads a package back out of object storage.
@@ -28,7 +29,9 @@
 
 pub mod apk;
 pub mod deb;
+pub mod flatpak;
 pub mod npm;
+pub mod ostree;
 pub mod pacman;
 pub mod repodata;
 pub mod rpm;
@@ -55,15 +58,17 @@ pub enum PackageFormat {
     Npm,
     Pacman,
     Deb,
+    Flatpak,
 }
 
 impl PackageFormat {
-    pub const ALL: [PackageFormat; 5] = [
+    pub const ALL: [PackageFormat; 6] = [
         PackageFormat::Rpm,
         PackageFormat::Apk,
         PackageFormat::Npm,
         PackageFormat::Pacman,
         PackageFormat::Deb,
+        PackageFormat::Flatpak,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -73,6 +78,7 @@ impl PackageFormat {
             PackageFormat::Npm => "npm",
             PackageFormat::Pacman => "pacman",
             PackageFormat::Deb => "deb",
+            PackageFormat::Flatpak => "flatpak",
         }
     }
 
@@ -84,6 +90,7 @@ impl PackageFormat {
             PackageFormat::Npm => &npm::NpmFormat,
             PackageFormat::Pacman => &pacman::PacmanFormat,
             PackageFormat::Deb => &deb::DebFormat,
+            PackageFormat::Flatpak => &flatpak::FlatpakFormat,
         }
     }
 
@@ -114,6 +121,7 @@ impl PackageFormat {
                 &join_epoch_version_release(a),
                 &join_epoch_version_release(b),
             ),
+            PackageFormat::Flatpak => flatpak::version_cmp(a.1, b.1),
         }
     }
 
@@ -126,6 +134,7 @@ impl PackageFormat {
             PackageFormat::Npm => &npm::NpmUpstream,
             PackageFormat::Pacman => &pacman::PacmanUpstream,
             PackageFormat::Deb => &deb::DebUpstream,
+            PackageFormat::Flatpak => &flatpak::FlatpakUpstream,
         }
     }
 
@@ -139,6 +148,8 @@ impl PackageFormat {
             Some(PackageFormat::Apk)
         } else if lower.ends_with(".deb") {
             Some(PackageFormat::Deb)
+        } else if lower.ends_with(".flatpak") {
+            Some(PackageFormat::Flatpak)
         } else if lower.ends_with(".pkg.tar.zst")
             || lower.ends_with(".pkg.tar.xz")
             || lower.ends_with(".pkg.tar.gz")
@@ -185,6 +196,7 @@ impl FromStr for PackageFormat {
             "npm" | "node" => Ok(PackageFormat::Npm),
             "pacman" | "aur" | "arch" => Ok(PackageFormat::Pacman),
             "deb" | "apt" | "debian" => Ok(PackageFormat::Deb),
+            "flatpak" | "ostree" => Ok(PackageFormat::Flatpak),
             other => Err(ParseError::UnknownFormat(other.to_string())),
         }
     }
@@ -209,6 +221,24 @@ pub struct ParsedPackage {
     pub filename: String,
     pub metadata: serde_json::Value,
     pub payload: Vec<u8>,
+    /// Further objects the package's publish writes to storage, each at
+    /// a key relative to `{repo}/{channel}/`. Empty for every format whose
+    /// package is a single file; a Flatpak bundle is a commit's worth of
+    /// content-addressed objects, and the `payload` is only its ref.
+    pub extra_objects: Vec<ExtraObject>,
+}
+
+/// An object a publish writes to storage beside the package itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraObject {
+    /// Storage key relative to `{repo}/{channel}/`.
+    pub key: String,
+    pub bytes: Vec<u8>,
+    /// Whether an existing object under `key` is overwritten. A
+    /// content-addressed object is not — the key is its checksum, so what
+    /// is already there is the same bytes — but a signature over one is
+    /// rewritten with every publish.
+    pub replace: bool,
 }
 
 impl ParsedPackage {
@@ -230,6 +260,9 @@ impl ParsedPackage {
             }
             PackageFormat::Apk => format!("{}-{}.{}", self.name, self.version, self.arch),
             PackageFormat::Npm => format!("{}@{}", self.name, self.version),
+            PackageFormat::Flatpak => {
+                format!("{}/{}/{}", self.name, self.arch, self.version)
+            }
             PackageFormat::Deb => {
                 if self.release.is_empty() {
                     format!("{}_{}_{}", self.name, self.version, self.arch)
@@ -363,6 +396,19 @@ pub trait Format: Send + Sync {
 
     /// Storage prefix the group's index objects are written under.
     fn index_prefix(&self, repo: &str, channel: &str, group: &str) -> String;
+
+    /// Objects a publish writes beside the package that depend on the
+    /// signing key — for Flatpak, the signature over each commit.
+    ///
+    /// Empty by default. Keys are relative to `{repo}/{channel}/`, like
+    /// [`ParsedPackage::extra_objects`].
+    fn companion_objects(
+        &self,
+        _pkg: &ParsedPackage,
+        _signer: Option<&dyn IndexSigner>,
+    ) -> anyhow::Result<Vec<ExtraObject>> {
+        Ok(Vec::new())
+    }
 
     /// Re-derives the row's `metadata` from the bytes that will actually
     /// be stored, after any server-side rewriting.
