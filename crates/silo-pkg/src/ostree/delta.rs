@@ -326,11 +326,16 @@ fn replay_part(raw: &[u8], table: &[u8], out: &mut Vec<Object>, budget: &mut u64
                         meta.symlink_target = std::str::from_utf8(payload)
                             .map_err(|_| Error("symlink target is not UTF-8".into()))?
                             .to_string();
-                        meta.validate()?;
                         Vec::new()
                     } else {
                         payload.to_vec()
                     };
+                    // Whatever the mode table says, only a regular file or a
+                    // symlink is an object a tree can hold. A device node,
+                    // FIFO or socket whose checksum was computed with its own
+                    // mode would otherwise replay cleanly and be stored as a
+                    // header promising content that is never written.
+                    meta.validate()?;
                     charge(budget, size)?;
                     let sum = file_checksum(&meta, &content);
                     if sum != expected {
@@ -1059,19 +1064,20 @@ mod tests {
         }
 
         #[test]
-        fn a_device_node_in_a_part_is_refused() {
-            let (sum, _) = file_object(b"x", 0o100644, "");
-            let err = err_of(Spec {
-                modes: vec![(0, 0, 0o060644u32.swap_bytes())],
-                extra_data: b"x".to_vec(),
-                extra_ops: s_file(0, 1, base_len()),
-                extra_table: vec![(1, sum)],
-                ..Spec::default()
-            });
-            assert!(
-                err.contains("does not match") || err.contains("mode"),
-                "{err}"
-            );
+        fn a_device_node_in_a_part_is_refused_even_when_its_checksum_is_honest() {
+            // The checksum is computed with the device mode, so replay
+            // gets past the checksum and only the mode check can stop it.
+            for mode in [0o060644u32, 0o020644, 0o010644, 0o140644] {
+                let (sum, _) = file_object(b"x", mode, "");
+                let err = err_of(Spec {
+                    modes: vec![(0, 0, mode.swap_bytes())],
+                    extra_data: b"x".to_vec(),
+                    extra_ops: s_file(0, 1, base_len()),
+                    extra_table: vec![(1, sum)],
+                    ..Spec::default()
+                });
+                assert!(err.contains("unsupported file mode"), "{mode:o}: {err}");
+            }
         }
 
         #[test]

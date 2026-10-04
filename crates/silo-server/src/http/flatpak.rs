@@ -61,19 +61,6 @@ fn count(state: &AppState, surface: &str, response: &Response) {
         .inc();
 }
 
-/// The address clients reach this server on: the configured public URL,
-/// or failing that the `Host` they used.
-fn public_base(state: &AppState, headers: &HeaderMap) -> String {
-    if let Some(url) = &state.publish.public_base_url {
-        return url.trim_end_matches('/').to_string();
-    }
-    let host = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost");
-    format!("http://{host}")
-}
-
 pub(super) async fn get_ostree(
     State(state): State<Arc<AppState>>,
     Path((repo, channel, file)): Path<(String, String, String)>,
@@ -212,7 +199,7 @@ pub(super) async fn put_ostree(
         &channel,
         ty,
         checksum,
-        bytes.to_vec(),
+        Vec::from(bytes),
     )
     .await
     {
@@ -379,7 +366,7 @@ pub(super) async fn get_flatpakrepo(
     if let Err(resp) = authorize_read(&state, &headers, remote_addr(&connect_info), &repo).await {
         return resp;
     }
-    let url = format!("{}/{repo}/{channel}/ostree", public_base(&state, &headers));
+    let url = format!("{}/{repo}/{channel}/ostree", state.base_url_for(&headers));
     let body =
         flatpak::render_flatpakrepo(&format!("silo {repo}/{channel}"), &url, signing_key(&state));
     let response = (
@@ -452,7 +439,7 @@ pub(super) async fn get_flatpakref(
     };
 
     let reference = flatpak::join_ref(&row.name, &row.arch, &row.version);
-    let base = public_base(&state, &headers);
+    let base = state.base_url_for(&headers);
     let url = format!("{base}/{repo}/{channel}/ostree");
 
     // When the app's runtime is published in this same remote, point the

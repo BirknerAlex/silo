@@ -211,7 +211,7 @@ pub(crate) async fn store_parsed(
     repo: &str,
     channel: &str,
     format: PackageFormat,
-    parsed: silo_pkg::ParsedPackage,
+    mut parsed: silo_pkg::ParsedPackage,
     payload: Vec<u8>,
     metadata: serde_json::Value,
     signed: bool,
@@ -230,7 +230,9 @@ pub(crate) async fn store_parsed(
     // other publish — which is why this happens before the lock rather than
     // holding every publisher to the channel waiting on an upload.
     let mut companions = handler.companion_objects(&parsed, ctx.signers.for_format(format))?;
-    companions.extend(parsed.extra_objects.iter().cloned());
+    // Moved, not copied: for a bundle these are every object of the commit.
+    // `companion_objects` has already looked at them.
+    companions.extend(std::mem::take(&mut parsed.extra_objects));
     let companions = std::sync::Arc::new(companions);
     store_objects(ctx, repo, channel, &companions).await?;
 

@@ -474,6 +474,83 @@ async fn without_a_configured_public_url_the_host_a_client_used_is_the_remote() 
 }
 
 #[tokio::test]
+async fn behind_a_tls_terminating_proxy_the_links_are_https() {
+    // With no public URL configured the address comes from the forwarding
+    // headers, as it does for npm. A link that said `http://` here would
+    // send the client to a port the proxy may not even serve.
+    let url = require_db!();
+    let harness = Harness::with_config(&url, |c| {
+        signed(c);
+        c.public_base_url = None;
+    })
+    .await;
+    let repo = unique_repo("fp-proxy");
+    for bundle in [
+        include_bytes!("../../silo-pkg/tests/fixtures/mini-runtime.flatpak").as_slice(),
+        include_bytes!("../../silo-pkg/tests/fixtures/mini-app.flatpak").as_slice(),
+    ] {
+        silo_core::repo::publish(
+            &harness.state.publish,
+            &repo,
+            "stable",
+            PackageFormat::Flatpak,
+            bundle.to_vec(),
+            &actor(),
+        )
+        .await
+        .expect("publish");
+    }
+    make_public(&harness, &repo).await;
+
+    let behind_proxy = |uri: String| {
+        Request::builder()
+            .uri(uri)
+            .header("host", "silo:8080")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "silo.example.com")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let router = || silo_server::http::router(harness.state.clone());
+
+    let file = text_of(
+        router()
+            .oneshot(behind_proxy(format!("/{repo}/stable/silo.flatpakrepo")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        file.contains(&format!(
+            "Url=https://silo.example.com/{repo}/stable/ostree\n"
+        )),
+        "{file}"
+    );
+
+    let file = text_of(
+        router()
+            .oneshot(behind_proxy(format!(
+                "/{repo}/stable/flatpakref/org.example.MiniApp.flatpakref"
+            )))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        file.contains(&format!(
+            "Url=https://silo.example.com/{repo}/stable/ostree\n"
+        )),
+        "{file}"
+    );
+    assert!(
+        file.contains(&format!(
+            "RuntimeRepo=https://silo.example.com/{repo}/stable/silo.flatpakrepo\n"
+        )),
+        "{file}"
+    );
+}
+
+#[tokio::test]
 async fn well_formed_paths_to_things_that_do_not_exist_are_404() {
     let url = require_db!();
     let harness = Harness::with_config(&url, signed).await;
