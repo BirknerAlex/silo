@@ -195,7 +195,8 @@ prune:
   enabled: true
 {{- end }}
 
-{{- if or .Values.config.jobs.sessionCleanup .Values.config.jobs.auditPrune .Values.config.jobs.packagePrune }}
+{{- $gcAge := toString .Values.config.jobs.flatpakGcMinAgeHours }}
+{{- if or .Values.config.jobs.sessionCleanup .Values.config.jobs.auditPrune .Values.config.jobs.packagePrune .Values.config.jobs.flatpakGc (ne $gcAge "") }}
 
 jobs:
   {{- with .Values.config.jobs.sessionCleanup }}
@@ -206,6 +207,12 @@ jobs:
   {{- end }}
   {{- with .Values.config.jobs.packagePrune }}
   package_prune: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.jobs.flatpakGc }}
+  flatpak_gc: {{ . | quote }}
+  {{- end }}
+  {{- if ne $gcAge "" }}
+  flatpak_gc_min_age_hours: {{ $gcAge }}
   {{- end }}
 {{- end }}
 

@@ -332,6 +332,23 @@ pub struct JobsConfig {
     /// `sync-upstream` still sync on demand regardless of this setting.
     #[serde(default)]
     pub upstream_sync: Option<String>,
+    /// Deletes the objects of Flatpak remotes that no ref reaches any more —
+    /// what is left behind when a ref moves to a new commit or is removed.
+    /// Opt-in like `package_prune`, since it deletes data.
+    #[serde(default)]
+    pub flatpak_gc: Option<String>,
+    /// How old, in hours, an unreachable object must be before `flatpak_gc`
+    /// may delete it. A push uploads its objects ahead of the ref update
+    /// that makes them reachable, and this is what keeps the sweep from
+    /// taking them in between: set it longer than the slowest push takes.
+    /// `0` removes that protection (a push the sweep catches mid-upload then
+    /// fails and has to be repeated).
+    #[serde(default = "default_flatpak_gc_min_age_hours")]
+    pub flatpak_gc_min_age_hours: u64,
+}
+
+fn default_flatpak_gc_min_age_hours() -> u64 {
+    24
 }
 
 fn default_session_cleanup_schedule() -> String {
@@ -349,6 +366,8 @@ impl Default for JobsConfig {
             audit_prune: default_audit_prune_schedule(),
             package_prune: None,
             upstream_sync: None,
+            flatpak_gc: None,
+            flatpak_gc_min_age_hours: default_flatpak_gc_min_age_hours(),
         }
     }
 }
@@ -449,6 +468,9 @@ impl Config {
         }
         if let Some(schedule) = &self.jobs.upstream_sync {
             validate_schedule("jobs.upstream_sync", schedule)?;
+        }
+        if let Some(schedule) = &self.jobs.flatpak_gc {
+            validate_schedule("jobs.flatpak_gc", schedule)?;
         }
         if let Some(secret) = &self.upstream_secret {
             crate::secret_box::SecretBox::new(&secret.key)
@@ -625,6 +647,11 @@ storage:
         assert_eq!(cfg.jobs.session_cleanup, "0 */5 * * * *");
         assert_eq!(cfg.jobs.audit_prune, "0 0 * * * *");
         assert!(cfg.jobs.package_prune.is_none());
+        assert!(
+            cfg.jobs.flatpak_gc.is_none(),
+            "a job that deletes data is never on by default"
+        );
+        assert_eq!(cfg.jobs.flatpak_gc_min_age_hours, 24);
     }
 
     #[test]
@@ -694,6 +721,26 @@ jobs:
         let yaml = format!("{MINIMAL}\njobs:\n  package_prune: \"* * * * *\"\n"); // 5 fields, missing seconds
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         assert!(cfg.validate().is_err());
+
+        let yaml = format!("{MINIMAL}\njobs:\n  flatpak_gc: \"every night\"\n");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("jobs.flatpak_gc"), "{err}");
+    }
+
+    #[test]
+    fn a_flatpak_gc_schedule_is_read_and_accepted() {
+        let yaml = format!("{MINIMAL}\njobs:\n  flatpak_gc: \"0 0 4 * * *\"\n");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.jobs.flatpak_gc.as_deref(), Some("0 0 4 * * *"));
+        assert_eq!(cfg.jobs.flatpak_gc_min_age_hours, 24);
+
+        let yaml = format!(
+            "{MINIMAL}\njobs:\n  flatpak_gc: \"0 0 4 * * *\"\n  flatpak_gc_min_age_hours: 72\n"
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(cfg.jobs.flatpak_gc_min_age_hours, 72);
     }
 
     #[test]

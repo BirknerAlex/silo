@@ -19,8 +19,9 @@
 //! A row is one ref. Its `name` is `app/org.example.Hello` (or
 //! `runtime/...`), its `arch` the ref's architecture and its `version` the
 //! branch. Publishing a ref again replaces the row and moves the ref. The
-//! objects of the commit it moved away from stay where they are: objects are
-//! shared between commits, and deleting one needs a reachability walk.
+//! objects of the commit it moved away from stay where they are, because
+//! objects are shared between commits; the `flatpak_gc` job removes the ones
+//! no ref reaches (see `silo_core::ostree::gc_channel`).
 //!
 //! Everything `summary` needs beyond the common columns — commit checksum
 //! and size, timestamp, installed and download size, the app's `metadata`
@@ -74,14 +75,18 @@ pub fn object_key(repo: &str, channel: &str, ty: ObjType, checksum: &Checksum) -
     )
 }
 
+/// Where a commit's signatures live, relative to the remote's prefix.
+pub fn commitmeta_path(checksum: &Checksum) -> String {
+    let hex = checksum.hex();
+    format!("objects/{}/{}.commitmeta", &hex[..2], &hex[2..])
+}
+
 /// Where a commit's signatures live, relative to the bucket root.
 pub fn commitmeta_key(repo: &str, channel: &str, checksum: &Checksum) -> String {
-    let hex = checksum.hex();
     format!(
-        "{}/objects/{}/{}.commitmeta",
+        "{}/{}",
         ostree_prefix(repo, channel),
-        &hex[..2],
-        &hex[2..]
+        commitmeta_path(checksum)
     )
 }
 
@@ -236,9 +241,8 @@ pub fn commit_signature_object(
         return Ok(None);
     };
     let signature = signer.sign(commit_bytes)?;
-    let hex = checksum.hex();
     Ok(Some(ExtraObject {
-        key: format!("ostree/objects/{}/{}.commitmeta", &hex[..2], &hex[2..]),
+        key: format!("ostree/{}", commitmeta_path(checksum)),
         bytes: render_commit_signatures(&[signature]),
         replace: true,
     }))

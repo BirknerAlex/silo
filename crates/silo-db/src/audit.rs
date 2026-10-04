@@ -44,6 +44,7 @@ pub mod action {
     pub const UPSTREAM_UPDATE: &str = "upstream.update";
     pub const UPSTREAM_REMOVE: &str = "upstream.remove";
     pub const UPSTREAM_SYNC: &str = "upstream.sync";
+    pub const OBJECT_GC: &str = "object.gc";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

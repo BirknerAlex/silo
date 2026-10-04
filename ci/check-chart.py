@@ -93,6 +93,8 @@ EVERYTHING = [
     "--set", "config.storage.existingSecret=s3creds",
     "--set", "config.auth.tokenPepperExistingSecret=pepper",
     "--set", "config.upstreamSecret.existingSecret=upstreamkey",
+    "--set", "config.jobs.flatpakGc=0 0 4 * * *",
+    "--set", "config.jobs.flatpakGcMinAgeHours=0",
     "--set", "podLabels.tier=backend",
     "--set", "extraEnv[0].name=RUST_LOG",
     "--set", "extraEnv[0].value=debug",
@@ -184,6 +186,8 @@ def rendered_config_is_valid() -> None:
         "--set", "config.storage.existingSecret=s3creds",
         "--set", "config.database.maxConnections=40",
         "--set", "config.audit.logPullThrough=false",
+        "--set", "config.jobs.flatpakGc=0 0 4 * * *",
+        "--set", "config.jobs.flatpakGcMinAgeHours=0",
     )
     secret = next(
         d for d in docs
@@ -201,6 +205,11 @@ def rendered_config_is_valid() -> None:
     # An operator drowning in pull-through entries has to be able to turn
     # them off from values rather than hand-writing configOverride.
     assert cfg["audit"]["log_pull_through"] is False, cfg["audit"]
+    # A job with no default only ever runs if the chart can schedule it.
+    assert cfg["jobs"]["flatpak_gc"] == "0 0 4 * * *", cfg.get("jobs")
+    # `0` is a real value (no minimum age), and Helm treats it as falsy, so
+    # it has to survive the template rather than fall back to the default.
+    assert cfg["jobs"]["flatpak_gc_min_age_hours"] == 0, cfg.get("jobs")
     assert cfg["storage"]["access_key_id"] == "${SILO_STORAGE_ACCESS_KEY_ID}", cfg["storage"]
     assert cfg["public_base_url"] == "https://silo.example.com", cfg
     assert cfg["storage"]["bucket"], cfg["storage"]

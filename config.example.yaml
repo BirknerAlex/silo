@@ -87,16 +87,27 @@ metrics:
 
 # Cron schedules for background jobs (6 fields, seconds first). Every job
 # has a built-in default that preserves silo's historical housekeeping
-# cadence, except `package_prune` and `upstream_sync`, which run
-# automatically only once you set a schedule for them here — otherwise
+# cadence, except `package_prune`, `upstream_sync` and `flatpak_gc`, which
+# run automatically only once you set a schedule for them here — otherwise
 # pruning/upstream syncing happens exclusively when `silo prune` /
 # `silo repo sync-upstream` is run by hand (an upstream is always synced
-# once, synchronously, when it's first added regardless of this setting).
+# once, synchronously, when it's first added regardless of this setting),
+# and Flatpak objects are never collected.
+#
+# `flatpak_gc` deletes the objects of Flatpak remotes that no ref reaches —
+# what an app update or a removed ref leaves behind. Objects are shared
+# between commits, so it works out what each ref still needs first and
+# only removes objects older than `flatpak_gc_min_age_hours` (24 by
+# default): a push uploads its objects before the ref update that makes
+# them reachable, so keep it longer than your slowest push. See the wiki's
+# Maintenance page.
 # jobs:
 #   session_cleanup: "0 */5 * * * *"
 #   audit_prune: "0 0 * * * *"
 #   package_prune: "0 0 3 * * *"
 #   upstream_sync: "0 0 * * * *"
+#   flatpak_gc: "0 0 4 * * *"
+#   flatpak_gc_min_age_hours: 24
 
 # Encrypts credentials for pull-through upstreams that need one (see
 # `silo repo add-upstream --basic-auth`/`--bearer-token`). Required only
