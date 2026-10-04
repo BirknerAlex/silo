@@ -18,8 +18,16 @@
 //! The ref update ends in the same place a bundle publish does — one row,
 //! one regenerated `summary` under the channel's lock — so there is one
 //! path that makes a ref visible, however its objects got here.
+//!
+//! Objects are shared between commits, so removing a ref leaves its objects
+//! behind. [`gc_channel`] collects the ones no ref reaches; see its
+//! documentation for what keeps that safe next to a publish in flight.
+
+use std::collections::{BTreeMap, HashSet};
+use std::time::Duration;
 
 use futures::{StreamExt, TryStreamExt};
+use silo_db::{lock, packages};
 use silo_pkg::flatpak;
 use silo_pkg::ostree::archive;
 use silo_pkg::ostree::delta::{check_ref_binding, verify_metadata};
@@ -177,7 +185,7 @@ pub async fn publish_ref(
     check_ref_binding(&commit_bytes, reference).map_err(invalid)?;
 
     let parsed_commit = Commit::parse(&commit_bytes).map_err(invalid)?;
-    verify_tree_in_storage(ctx, repo, channel, &parsed_commit).await?;
+    walk_tree_in_storage(ctx, repo, channel, &parsed_commit).await?;
 
     // The commit rides along so its signature is made the same way as for
     // a bundle; it is already stored, so nothing is uploaded twice.
@@ -207,19 +215,24 @@ pub async fn publish_ref(
         signed,
         actor,
         None,
+        // The tree was checked above, before the lock; `store_parsed`
+        // checks it again once it holds the lock.
+        Some(&parsed_commit),
     )
     .await
 }
 
 /// Walks a commit's tree through object storage, failing on the first
-/// object that is missing or malformed.
-async fn verify_tree_in_storage(
+/// object that is missing or malformed, and returns every object it
+/// reached.
+pub(crate) async fn walk_tree_in_storage(
     ctx: &PublishContext,
     repo: &str,
     channel: &str,
     commit: &Commit,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(ObjType, Checksum)>> {
     let mut walk = TreeWalk::new(commit);
+    let mut visited = Vec::new();
     loop {
         let mut batch = Vec::new();
         while batch.len() < TREE_FETCH_CONCURRENCY {
@@ -229,8 +242,9 @@ async fn verify_tree_in_storage(
             }
         }
         if batch.is_empty() {
-            return Ok(());
+            return Ok(visited);
         }
+        visited.extend(batch.iter().map(|w| (w.ty, w.checksum)));
 
         let storage = ctx.storage.clone();
         let keyed: Vec<(ObjType, String)> = batch
@@ -271,6 +285,246 @@ async fn verify_tree_in_storage(
             }
         }
     }
+}
+
+/// How long an object must have sat in storage before a sweep may remove
+/// it, unless `jobs.flatpak_gc_min_age_hours` says otherwise. A publish
+/// uploads its objects before it makes any ref point at them, so for that
+/// stretch they are unreachable and indistinguishable from garbage by
+/// reachability alone; their age is what tells them apart.
+pub const GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The most objects one sweep of one channel deletes. The deletes happen
+/// while the channel's lock is held, which publishers wait on for at most
+/// two minutes, so a very large backlog is cleared over several runs
+/// rather than in one long stall.
+pub const GC_MAX_DELETES: usize = 10_000;
+
+/// Objects deleted at once.
+const GC_DELETE_CONCURRENCY: usize = 32;
+
+/// What a sweep of one channel found and did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcReport {
+    pub repo: String,
+    pub channel: String,
+    /// Objects the refs reach, which are never touched.
+    pub live: usize,
+    /// Unreachable objects too recent to remove.
+    pub too_new: usize,
+    /// Objects removed — or, in a dry run, that would be.
+    pub deleted: usize,
+    pub deleted_bytes: u64,
+    /// Eligible objects left for the next run by [`GC_MAX_DELETES`].
+    pub deferred: usize,
+    pub dry_run: bool,
+    /// Why nothing was deleted, when the sweep backed off.
+    pub backed_off: Option<String>,
+}
+
+/// Removes the objects of one channel that no ref reaches and that are
+/// older than `grace`.
+///
+/// What an object needs to survive is being reachable from a ref's commit,
+/// so the sweep marks everything the channel's refs reach and removes only
+/// what is left. Three things keep that from hurting a publish that is
+/// happening at the same time:
+///
+/// - **Age.** An object younger than `grace` is never removed, which covers
+///   a push still uploading ahead of its ref update.
+/// - **The refs must not move.** The marking and the listing happen without
+///   the channel's lock, so a long walk does not stall publishers; the
+///   deletes happen under it, and only after the refs are confirmed to be
+///   exactly what was marked. If they changed, the sweep backs off and the
+///   next run starts over.
+/// - **The publisher re-checks.** A publish that skipped uploading an object
+///   because it already existed confirms, under the same lock, that it still
+///   does (and restores it if not) before its ref becomes visible.
+///
+/// A commit the refs name whose tree is incomplete, or whose commit object
+/// is missing, makes the sweep back off without deleting anything: it cannot
+/// know what is reachable, and guessing wrong costs a working install.
+///
+/// The database is the source of truth for what is live, as it is for every
+/// index silo renders.
+pub async fn gc_channel(
+    ctx: &PublishContext,
+    repo: &str,
+    channel: &str,
+    grace: Duration,
+    dry_run: bool,
+) -> anyhow::Result<GcReport> {
+    validate_repo_name("repo", repo)?;
+    validate_repo_name("channel", channel)?;
+
+    let mut report = GcReport {
+        repo: repo.to_string(),
+        channel: channel.to_string(),
+        dry_run,
+        ..GcReport::default()
+    };
+
+    // Mark: every object the channel's refs reach.
+    let rows = ctx
+        .db
+        .list_packages(repo, channel, Some(PackageFormat::Flatpak))
+        .await?;
+    let marked = live_refs(&rows);
+
+    let mut live: HashSet<String> = HashSet::new();
+    let commits: HashSet<&String> = marked.values().collect();
+    for hex in commits {
+        let checksum = Checksum::from_hex(hex)?;
+        let commit_key = flatpak::object_key(repo, channel, ObjType::Commit, &checksum);
+        let Some(commit_bytes) = ctx.storage.get(&commit_key).await? else {
+            report.backed_off = Some(format!("a live ref's commit {hex} is missing from storage"));
+            return Ok(report);
+        };
+        let commit = Commit::parse(&commit_bytes)?;
+        let reached = match walk_tree_in_storage(ctx, repo, channel, &commit).await {
+            Ok(reached) => reached,
+            Err(e) => {
+                report.backed_off = Some(format!("could not walk the tree of commit {hex}: {e}"));
+                return Ok(report);
+            }
+        };
+        live.insert(ObjType::Commit.archive_path(&checksum));
+        live.insert(flatpak::commitmeta_path(&checksum));
+        for (ty, sum) in reached {
+            live.insert(ty.archive_path(&sum));
+        }
+    }
+    report.live = live.len();
+
+    // What is in storage, and which of it is both unreachable and old.
+    let prefix = flatpak::ostree_prefix(repo, channel);
+    let now = chrono::Utc::now();
+    let grace = chrono::Duration::from_std(grace)?;
+    let mut doomed: Vec<(String, u64)> = Vec::new();
+    for (key, size, modified) in ctx.storage.list_aged(&format!("{prefix}/objects/")).await? {
+        let Some(relative) = key.strip_prefix(&format!("{prefix}/")) else {
+            continue;
+        };
+        // Only what the server would serve is the server's to remove.
+        if !is_served_object(relative) || live.contains(relative) {
+            continue;
+        }
+        if now - modified < grace {
+            report.too_new += 1;
+        } else {
+            doomed.push((key, size));
+        }
+    }
+
+    if doomed.len() > GC_MAX_DELETES {
+        report.deferred = doomed.len() - GC_MAX_DELETES;
+        doomed.truncate(GC_MAX_DELETES);
+    }
+    report.deleted = doomed.len();
+    report.deleted_bytes = doomed.iter().map(|(_, size)| size).sum();
+    if dry_run || doomed.is_empty() {
+        return Ok(report);
+    }
+
+    sweep_if_unchanged(ctx, repo, channel, &marked, doomed, &mut report).await?;
+    Ok(report)
+}
+
+/// The second half of [`gc_channel`]: deletes `doomed` under the channel's
+/// lock, but only if the refs are still exactly `marked`.
+///
+/// Separate so the check that guards the deletes can be tested against refs
+/// that have moved, which a sweep racing a real publish cannot do on
+/// demand.
+pub async fn sweep_if_unchanged(
+    ctx: &PublishContext,
+    repo: &str,
+    channel: &str,
+    marked: &BTreeMap<String, String>,
+    doomed: Vec<(String, u64)>,
+    report: &mut GcReport,
+) -> anyhow::Result<()> {
+    let scope = lock::index_scope(repo, channel, PackageFormat::Flatpak.as_str(), "");
+    let mut locked = ctx.db.lock(scope).await?;
+    let rows_now = packages::list_groups(
+        locked.conn(),
+        repo,
+        channel,
+        PackageFormat::Flatpak,
+        &[String::new()],
+    )
+    .await?;
+    if &live_refs(&rows_now) != marked {
+        report.deleted = 0;
+        report.deleted_bytes = 0;
+        report.backed_off = Some("the channel's refs changed while it was being marked".into());
+        return Ok(());
+    }
+
+    let storage = ctx.storage.clone();
+    futures::stream::iter(doomed.into_iter().map(|(key, _)| key))
+        .map(|key| {
+            let storage = storage.clone();
+            async move { storage.delete(&key).await }
+        })
+        .buffer_unordered(GC_DELETE_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
+    locked.commit().await?;
+    Ok(())
+}
+
+/// The refs a channel serves and the commit each points at.
+pub fn live_refs(rows: &[silo_db::packages::PackageRow]) -> BTreeMap<String, String> {
+    rows.iter()
+        .filter_map(|r| {
+            Some((
+                flatpak::join_ref(&r.name, &r.arch, &r.version),
+                r.metadata["commit"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Sweeps every Flatpak remote the server holds objects for.
+///
+/// A channel is swept when it still has a ref or when its repo is still
+/// known to the database, so a channel whose last ref was removed gets its
+/// objects collected, while objects under a repo the database has never
+/// heard of — a fresh database pointed at an old bucket — are left alone.
+pub async fn gc_all(
+    ctx: &PublishContext,
+    grace: Duration,
+    dry_run: bool,
+) -> anyhow::Result<Vec<GcReport>> {
+    let mut reports = Vec::new();
+    for repo in ctx.storage.list_dirs("").await? {
+        if validate_repo_name("repo", &repo).is_err() || !ctx.db.repo_exists(&repo).await? {
+            continue;
+        }
+        for channel in ctx.storage.list_dirs(&repo).await? {
+            if validate_repo_name("channel", &channel).is_err() {
+                continue;
+            }
+            let has_remote = ctx
+                .storage
+                .list_dirs(&format!("{repo}/{channel}"))
+                .await?
+                .iter()
+                .any(|d| d == "ostree");
+            if !has_remote {
+                continue;
+            }
+            match gc_channel(ctx, &repo, &channel, grace, dry_run).await {
+                Ok(report) => reports.push(report),
+                Err(e) => {
+                    // One channel's trouble must not stop the others.
+                    tracing::warn!(repo, channel, error = %e, "flatpak object sweep failed");
+                }
+            }
+        }
+    }
+    Ok(reports)
 }
 
 #[cfg(test)]

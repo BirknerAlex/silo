@@ -600,6 +600,12 @@ fi
 # A new version of the app, published the same two ways, has to reach a
 # client that already has the old one.
 log "publishing app 2.0.0 and updating the installed clients"
+# The commits 1.0.0 is at now, to look for after the sweep further down.
+FP_REF="app/org.silo.Hello/$FLATPAK_ARCH/stable"
+V1_COMMIT_BUNDLE=$(curl -fsS "http://localhost:$HTTP_PORT/$REPO/$FP_BUNDLE/ostree/refs/heads/$FP_REF" | tr -d '[:space:]')
+V1_COMMIT_PUSH=$(curl -fsS "http://localhost:$HTTP_PORT/$REPO/$FP_PUSH/ostree/refs/heads/$FP_REF" | tr -d '[:space:]')
+[ ${#V1_COMMIT_BUNDLE} -eq 64 ] && [ ${#V1_COMMIT_PUSH} -eq 64 ] \
+    || fail "could not read the commits 1.0.0 is at"
 fp_publish hello-v2.flatpak "$FP_BUNDLE" | sed 's/^/    /'
 fp_push repo-v2 "$FP_PUSH" --ref "app/org.silo.Hello/$FLATPAK_ARCH/stable" | sed 's/^/    /'
 verify_flatpak "update, from a published bundle" "$FP_BUNDLE" update \
@@ -607,6 +613,61 @@ verify_flatpak "update, from a published bundle" "$FP_BUNDLE" update \
 verify_flatpak "update, from a pushed repository" "$FP_PUSH" update \
     -v "$FP_HOME_PUSH:/flatpak-home" -e FLATPAK_HOME=/flatpak-home
 docker volume rm -f "$FP_HOME_BUNDLE" "$FP_HOME_PUSH" >/dev/null
+
+# Updating moved both refs to 2.0.0 and left 1.0.0's objects behind. Turn on
+# the job that collects them, with no minimum age since nothing here is
+# older than a few minutes, and check it removes exactly those: the old
+# commit goes, the current one stays, and the fresh installs further down
+# (which run after the sweep) still work.
+log "collecting the objects the update left behind"
+
+# An object that is stored answers with a redirect to a presigned URL, as a
+# package does; one that is not answers 404 — silo checks before it signs.
+STORED=302
+commit_status() { # <channel> <commit>
+    curl -s -o /dev/null -w '%{http_code}' \
+        "http://localhost:$HTTP_PORT/$REPO/$1/ostree/objects/${2:0:2}/${2:2}.commit"
+}
+[ "$(commit_status "$FP_BUNDLE" "$V1_COMMIT_BUNDLE")" = "$STORED" ] \
+    || fail "the old commit should still be stored before the sweep"
+
+cat >> "$WORK/config/config.yaml" <<EOF
+
+jobs:
+  flatpak_gc: "0 * * * * *"
+  flatpak_gc_min_age_hours: 0
+EOF
+$COMPOSE restart silo >/dev/null 2>&1
+for i in $(seq 1 90); do
+    curl -fsS "http://localhost:$HTTP_PORT/readyz" >/dev/null 2>&1 && break
+    [ "$i" = 90 ] && fail "silo did not come back after the restart"
+    sleep 1
+done
+for i in $(seq 1 150); do
+    $COMPOSE logs --no-color silo 2>/dev/null | grep -q "removed unreachable flatpak objects" && break
+    [ "$i" = 150 ] && fail "the flatpak sweep did not run within 150s"
+    sleep 1
+done
+ok "the sweep ran"
+
+expect_commit() { # <channel> <commit> <expected status>
+    local status
+    status=$(commit_status "$1" "$2")
+    [ "$status" = "$3" ] || fail "$1: commit $2 answers $status, expected $3"
+}
+expect_commit "$FP_BUNDLE" "$V1_COMMIT_BUNDLE" 404
+expect_commit "$FP_PUSH" "$V1_COMMIT_PUSH" 404
+V2_COMMIT_BUNDLE=$(curl -fsS "http://localhost:$HTTP_PORT/$REPO/$FP_BUNDLE/ostree/refs/heads/$FP_REF" | tr -d '[:space:]')
+V2_COMMIT_PUSH=$(curl -fsS "http://localhost:$HTTP_PORT/$REPO/$FP_PUSH/ostree/refs/heads/$FP_REF" | tr -d '[:space:]')
+expect_commit "$FP_BUNDLE" "$V2_COMMIT_BUNDLE" "$STORED"
+expect_commit "$FP_PUSH" "$V2_COMMIT_PUSH" "$STORED"
+ok "1.0.0's commit is gone and 2.0.0's is still there, on both channels"
+
+# And the sweep recorded what it did.
+GC_AUDIT=$($COMPOSE exec -T -e "SILO_TOKEN=$ADMIN_TOKEN" -e SILO_SERVER=http://localhost:8080 silo \
+    /usr/local/bin/silo audit --action object.gc --json | tr -d '\r')
+echo "$GC_AUDIT" | grep -q 'object.gc' || fail "the sweep was not audited: $GC_AUDIT"
+ok "the sweep is in the audit log"
 
 # ---------------------------------------------------- pull-through cache
 

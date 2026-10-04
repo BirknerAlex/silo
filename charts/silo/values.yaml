@@ -207,11 +207,20 @@ config:
   # "0 */5 * * * *" for every 5 minutes). Leave a field blank to use the
   # server's built-in default; `packagePrune` has none, so leaving it blank
   # means automatic pruning never runs even with `prune.enabled: true` —
-  # only `silo prune` does.
+  # only `silo prune` does. `flatpakGc` has none either: it deletes the
+  # objects of Flatpak remotes that no ref reaches any more (what an app
+  # update or a removed ref leaves behind), so it only runs once scheduled.
   jobs:
     sessionCleanup: ""
     auditPrune: ""
     packagePrune: ""
+    flatpakGc: ""
+    # Hours an unreachable Flatpak object must have sat in storage before
+    # `flatpakGc` may delete it; blank is the server's default of 24. Keep
+    # it longer than your slowest push takes: a push uploads objects ahead
+    # of the ref update that makes them reachable. `0` removes the
+    # protection.
+    flatpakGcMinAgeHours: ""
 
   # Optional single sign-on. Omit `issuer` to disable.
   oidc:

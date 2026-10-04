@@ -194,6 +194,7 @@ pub async fn publish_with_origin(
         signed,
         actor,
         origin_upstream_id,
+        None,
     )
     .await
 }
@@ -216,6 +217,7 @@ pub(crate) async fn store_parsed(
     signed: bool,
     actor: &Actor,
     origin_upstream_id: Option<silo_db::Uuid>,
+    verify_commit: Option<&silo_pkg::ostree::object::Commit>,
 ) -> anyhow::Result<PublishOutcome> {
     let handler = format.handler();
     let storage_key = handler.storage_key(repo, channel, &parsed);
@@ -229,10 +231,22 @@ pub(crate) async fn store_parsed(
     // holding every publisher to the channel waiting on an upload.
     let mut companions = handler.companion_objects(&parsed, ctx.signers.for_format(format))?;
     companions.extend(parsed.extra_objects.iter().cloned());
-    store_objects(ctx, repo, channel, companions).await?;
+    let companions = std::sync::Arc::new(companions);
+    store_objects(ctx, repo, channel, &companions).await?;
 
     let scope = lock::index_scope(repo, channel, format.as_str(), &index_group);
     let mut locked = ctx.db.lock(scope).await?;
+
+    // An object that was already stored was not uploaded again, and the
+    // channel's garbage collection takes this same lock to delete objects
+    // no ref reaches. One it removed between the check above and this
+    // point would leave the ref about to be written pointing at nothing,
+    // so what the ref needs is confirmed, and restored if missing, now
+    // that no sweep can run.
+    store_objects(ctx, repo, channel, &companions).await?;
+    if let Some(commit) = verify_commit {
+        crate::ostree::walk_tree_in_storage(ctx, repo, channel, commit).await?;
+    }
 
     ctx.storage.put(&storage_key, payload).await?;
 
@@ -329,23 +343,25 @@ async fn store_objects(
     ctx: &PublishContext,
     repo: &str,
     channel: &str,
-    objects: Vec<silo_pkg::ExtraObject>,
+    objects: &std::sync::Arc<Vec<silo_pkg::ExtraObject>>,
 ) -> anyhow::Result<()> {
     use futures::{StreamExt, TryStreamExt};
 
     let storage = ctx.storage.clone();
-    let keyed: Vec<(String, silo_pkg::ExtraObject)> = objects
-        .into_iter()
-        .map(|object| (format!("{repo}/{channel}/{}", object.key), object))
+    let keys: Vec<String> = objects
+        .iter()
+        .map(|o| format!("{repo}/{channel}/{}", o.key))
         .collect();
-    futures::stream::iter(keyed)
-        .map(|(key, object)| {
+    futures::stream::iter(keys.into_iter().enumerate())
+        .map(|(i, key)| {
             let storage = storage.clone();
+            let objects = objects.clone();
             async move {
+                let object = &objects[i];
                 if !object.replace && storage.head(&key).await? {
                     return Ok::<(), anyhow::Error>(());
                 }
-                storage.put(&key, object.bytes).await
+                storage.put(&key, object.bytes.clone()).await
             }
         })
         .buffer_unordered(OBJECT_UPLOAD_CONCURRENCY)

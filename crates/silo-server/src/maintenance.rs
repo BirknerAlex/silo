@@ -2,7 +2,7 @@
 //!
 //! A small cron-scheduled job runner. Each job — `refresh_inventory`
 //! (metrics, unconditional every tick), `session_cleanup`, `audit_prune`,
-//! `package_prune` — has its own schedule, computed once at startup and
+//! `package_prune`, `flatpak_gc` — has its own schedule, computed once at startup and
 //! re-derived after every run via the `cron` crate. `session_cleanup` and
 //! `audit_prune` ship with defaults that preserve the cadence silo has
 //! always run housekeeping at; `package_prune` has no default, since
@@ -105,6 +105,9 @@ fn build_jobs(config: &silo_core::Config) -> Vec<Job> {
             config.jobs.upstream_sync.as_deref(),
             |state| Box::pin(async move { run_upstream_sync(&state).await }),
         ),
+        Job::new("flatpak_gc", config.jobs.flatpak_gc.as_deref(), |state| {
+            Box::pin(async move { run_flatpak_gc(&state).await })
+        }),
     ]
 }
 
@@ -187,6 +190,64 @@ async fn run_package_prune(state: &AppState) {
             }
         }
         Err(e) => tracing::warn!(error = %e, "scheduled package prune failed"),
+    }
+}
+
+/// Removes the objects of every Flatpak remote that no ref reaches. One
+/// channel's failure is logged and never stops the others — see
+/// `silo_core::ostree::gc_all`.
+pub async fn run_flatpak_gc(state: &AppState) {
+    let grace = Duration::from_secs(
+        state
+            .config
+            .jobs
+            .flatpak_gc_min_age_hours
+            .saturating_mul(3600),
+    );
+    let reports = match silo_core::ostree::gc_all(&state.publish, grace, false).await {
+        Ok(reports) => reports,
+        Err(e) => {
+            tracing::warn!(error = %e, "scheduled flatpak object sweep failed");
+            return;
+        }
+    };
+
+    for report in reports {
+        if let Some(reason) = &report.backed_off {
+            tracing::warn!(
+                repo = %report.repo, channel = %report.channel, reason = %reason,
+                "flatpak object sweep backed off"
+            );
+        }
+        if report.deleted == 0 {
+            continue;
+        }
+        tracing::info!(
+            repo = %report.repo, channel = %report.channel,
+            deleted = report.deleted, bytes = report.deleted_bytes,
+            deferred = report.deferred, "removed unreachable flatpak objects"
+        );
+        state
+            .metrics
+            .flatpak_gc_objects
+            .inc_by(report.deleted as u64);
+        state
+            .db
+            .record_audit(
+                silo_db::audit::AuditEntry::new(
+                    silo_db::audit::action::OBJECT_GC,
+                    &silo_db::audit::Actor::system(),
+                )
+                .repo(&report.repo)
+                .channel(&report.channel)
+                .detail(serde_json::json!({
+                    "format": "flatpak",
+                    "deleted": report.deleted,
+                    "bytes": report.deleted_bytes,
+                    "deferred": report.deferred,
+                })),
+            )
+            .await;
     }
 }
 
@@ -294,6 +355,23 @@ mod tests {
     fn job_with_no_schedule_never_has_a_next_fire_time() {
         let job = Job::new("package_prune", None, |_| Box::pin(async {}));
         assert!(job.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_flatpak_sweep_is_registered_but_dormant_until_it_is_scheduled() {
+        // It deletes data, so a server that has not been told to run it
+        // must not.
+        let mut config = crate::http::tests::test_state_with(|_| {}).config.clone();
+        let job = |config: &silo_core::Config| {
+            build_jobs(config)
+                .into_iter()
+                .find(|j| j.name == "flatpak_gc")
+                .expect("the job is registered")
+        };
+        assert!(job(&config).next.is_none(), "it fires with no schedule");
+
+        config.jobs.flatpak_gc = Some("0 0 4 * * *".into());
+        assert!(job(&config).next.is_some(), "a schedule does not arm it");
     }
 
     #[test]

@@ -12,8 +12,8 @@
 //! dashboard.
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 #[derive(Clone)]
@@ -35,6 +35,7 @@ pub struct Metrics {
     pub pull_through: IntCounterVec,
     pub pull_through_fetch_duration: HistogramVec,
     pub upstream_fetch_errors: IntCounterVec,
+    pub flatpak_gc_objects: IntCounter,
 }
 
 impl Metrics {
@@ -100,6 +101,11 @@ impl Metrics {
         )?;
         let database_up = IntGauge::new("database_up", "1 when the last database ping succeeded")?;
 
+        let flatpak_gc_objects = IntCounter::new(
+            "flatpak_gc_objects_deleted_total",
+            "Flatpak objects removed because no ref reached them",
+        )?;
+
         let upstream_syncs = IntCounterVec::new(
             Opts::new(
                 "upstream_syncs_total",
@@ -162,6 +168,7 @@ impl Metrics {
         registry.register(Box::new(pull_through.clone()))?;
         registry.register(Box::new(pull_through_fetch_duration.clone()))?;
         registry.register(Box::new(upstream_fetch_errors.clone()))?;
+        registry.register(Box::new(flatpak_gc_objects.clone()))?;
 
         Ok(Self {
             registry,
@@ -181,6 +188,7 @@ impl Metrics {
             pull_through,
             pull_through_fetch_duration,
             upstream_fetch_errors,
+            flatpak_gc_objects,
         })
     }
 

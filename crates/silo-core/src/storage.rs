@@ -148,6 +148,40 @@ impl Storage {
         Ok(entries)
     }
 
+    /// Like `list_sized`, but with each object's last-modified time, which
+    /// is how a sweep tells an object somebody is still uploading from one
+    /// nobody wants.
+    pub async fn list_aged(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, u64, chrono::DateTime<chrono::Utc>)>> {
+        use futures::StreamExt;
+        let prefix_path = ObjectPath::from(prefix);
+        let mut stream = self.store.list(Some(&prefix_path));
+        let mut entries = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta?;
+            entries.push((
+                meta.location.to_string(),
+                meta.size as u64,
+                meta.last_modified,
+            ));
+        }
+        Ok(entries)
+    }
+
+    /// The names of the directories directly under `prefix` — for
+    /// `{repo}/`, its channels.
+    pub async fn list_dirs(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let prefix_path = ObjectPath::from(prefix);
+        let listing = self.store.list_with_delimiter(Some(&prefix_path)).await?;
+        Ok(listing
+            .common_prefixes
+            .into_iter()
+            .filter_map(|p| p.filename().map(str::to_string))
+            .collect())
+    }
+
     pub fn store(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
     }
@@ -156,6 +190,37 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn list_aged_reports_size_and_a_recent_modification_time() {
+        let storage = Storage::in_memory();
+        storage.put("r/c/a.bin", b"12345".to_vec()).await.unwrap();
+        let listed = storage.list_aged("r/c").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let (key, size, modified) = &listed[0];
+        assert_eq!(key, "r/c/a.bin");
+        assert_eq!(*size, 5);
+        let age = chrono::Utc::now() - *modified;
+        assert!(age.num_seconds().abs() < 60, "{age}");
+    }
+
+    #[tokio::test]
+    async fn list_dirs_names_the_directories_one_level_down() {
+        let storage = Storage::in_memory();
+        for key in [
+            "repo/stable/x",
+            "repo/stable/y",
+            "repo/beta/z",
+            "repo-two/other/w",
+            "repo/top-level-file",
+        ] {
+            storage.put(key, b"x".to_vec()).await.unwrap();
+        }
+        let mut dirs = storage.list_dirs("repo").await.unwrap();
+        dirs.sort();
+        assert_eq!(dirs, vec!["beta", "stable"]);
+        assert!(storage.list_dirs("absent").await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn put_typed_roundtrips_like_put() {
