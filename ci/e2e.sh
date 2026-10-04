@@ -604,8 +604,9 @@ log "publishing app 2.0.0 and updating the installed clients"
 FP_REF="app/org.silo.Hello/$FLATPAK_ARCH/stable"
 V1_COMMIT_BUNDLE=$(curl -fsS "http://localhost:$HTTP_PORT/$REPO/$FP_BUNDLE/ostree/refs/heads/$FP_REF" | tr -d '[:space:]')
 V1_COMMIT_PUSH=$(curl -fsS "http://localhost:$HTTP_PORT/$REPO/$FP_PUSH/ostree/refs/heads/$FP_REF" | tr -d '[:space:]')
-[ ${#V1_COMMIT_BUNDLE} -eq 64 ] && [ ${#V1_COMMIT_PUSH} -eq 64 ] \
-    || fail "could not read the commits 1.0.0 is at"
+if [ ${#V1_COMMIT_BUNDLE} -ne 64 ] || [ ${#V1_COMMIT_PUSH} -ne 64 ]; then
+    fail "could not read the commits 1.0.0 is at"
+fi
 fp_publish hello-v2.flatpak "$FP_BUNDLE" | sed 's/^/    /'
 fp_push repo-v2 "$FP_PUSH" --ref "app/org.silo.Hello/$FLATPAK_ARCH/stable" | sed 's/^/    /'
 verify_flatpak "update, from a published bundle" "$FP_BUNDLE" update \
