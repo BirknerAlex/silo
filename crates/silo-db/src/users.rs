@@ -12,9 +12,7 @@
 //! human-chosen and low-entropy, so the memory-hard KDF is doing real work
 //! here.
 
-use argon2::password_hash::{
-    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -377,9 +375,8 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
     if password.len() < 8 {
         anyhow::bail!("password must be at least 8 characters");
     }
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| anyhow::anyhow!("failed to hash password: {e}"))
 }
@@ -399,11 +396,8 @@ fn decoy_hash() -> &'static str {
 }
 
 pub fn verify_password(phc: &str, password: &str) -> bool {
-    let Ok(parsed) = PasswordHash::new(phc) else {
-        return false;
-    };
     Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
+        .verify_password(password.as_bytes(), phc)
         .is_ok()
 }
 
@@ -681,6 +675,17 @@ mod tests {
         let phc = hash_password("correct horse battery").unwrap();
         assert!(verify_password(&phc, "correct horse battery"));
         assert!(!verify_password(&phc, "wrong horse battery"));
+    }
+
+    /// Stored hashes are plain PHC strings, so one written with a fixed
+    /// salt and the default argon2id parameters must keep verifying —
+    /// otherwise every existing user would be locked out.
+    #[test]
+    fn stored_phc_hashes_keep_verifying() {
+        let phc = "$argon2id$v=19$m=19456,t=2,p=1$c2lsb3Rlc3RzYWx0MTIzNA$\
+                   C17eFoCUxWFpAWfcnCt8FFbBuL5mwA7g3Qo4JLsn2K0";
+        assert!(verify_password(phc, "correct horse battery"));
+        assert!(!verify_password(phc, "wrong horse battery"));
     }
 
     #[test]
