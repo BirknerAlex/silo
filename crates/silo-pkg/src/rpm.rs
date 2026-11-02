@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -296,11 +297,11 @@ fn find_primary_location(repomd: &[u8]) -> Result<String, UpstreamError> {
                     in_primary_data = e
                         .attributes()
                         .flatten()
-                        .any(|a| a.key.as_ref() == b"type" && a.value.as_ref() == b"primary");
+                        .any(|a| a.key.as_ref() == "type" && a.value.as_ref() == "primary");
                 } else if name == "location" && in_primary_data {
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"href" {
-                            return Ok(String::from_utf8_lossy(&attr.value).into_owned());
+                        if attr.key.as_ref() == "href" {
+                            return Ok(attr.value.into_owned());
                         }
                     }
                 }
@@ -327,6 +328,7 @@ fn parse_primary_xml(xml: &[u8], base_url: &str) -> Result<Vec<UpstreamPackage>,
     let mut out = Vec::new();
     let mut current: Option<PartialPackage> = None;
     let mut in_text_field: Option<&'static str> = None;
+    let mut text = String::new();
 
     loop {
         match reader
@@ -343,11 +345,11 @@ fn parse_primary_xml(xml: &[u8], base_url: &str) -> Result<Vec<UpstreamPackage>,
                     "version" => {
                         if let Some(pkg) = &mut current {
                             for attr in e.attributes().flatten() {
-                                let value = String::from_utf8_lossy(&attr.value).into_owned();
+                                let value = attr.value.into_owned();
                                 match attr.key.as_ref() {
-                                    b"epoch" => pkg.epoch = value.parse().unwrap_or(0),
-                                    b"ver" => pkg.version = value,
-                                    b"rel" => pkg.release = value,
+                                    "epoch" => pkg.epoch = value.parse().unwrap_or(0),
+                                    "ver" => pkg.version = value,
+                                    "rel" => pkg.release = value,
                                     _ => {}
                                 }
                             }
@@ -365,15 +367,14 @@ fn parse_primary_xml(xml: &[u8], base_url: &str) -> Result<Vec<UpstreamPackage>,
                         let is_sha256 = e
                             .attributes()
                             .flatten()
-                            .any(|a| a.key.as_ref() == b"type" && a.value.as_ref() == b"sha256");
+                            .any(|a| a.key.as_ref() == "type" && a.value.as_ref() == "sha256");
                         in_text_field = if is_sha256 { Some("checksum") } else { None };
                     }
                     "size" => {
                         if let Some(pkg) = &mut current {
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"package" {
-                                    pkg.size_bytes =
-                                        String::from_utf8_lossy(&attr.value).parse().ok();
+                                if attr.key.as_ref() == "package" {
+                                    pkg.size_bytes = attr.value.parse().ok();
                                 }
                             }
                         }
@@ -381,8 +382,8 @@ fn parse_primary_xml(xml: &[u8], base_url: &str) -> Result<Vec<UpstreamPackage>,
                     "location" => {
                         if let Some(pkg) = &mut current {
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"href" {
-                                    pkg.href = String::from_utf8_lossy(&attr.value).into_owned();
+                                if attr.key.as_ref() == "href" {
+                                    pkg.href = attr.value.into_owned();
                                 }
                             }
                         }
@@ -390,23 +391,35 @@ fn parse_primary_xml(xml: &[u8], base_url: &str) -> Result<Vec<UpstreamPackage>,
                     _ => {}
                 }
             }
-            Event::Text(e) => {
-                if let (Some(field), Some(pkg)) = (in_text_field, &mut current) {
-                    let text = e
-                        .unescape()
-                        .map_err(|err| UpstreamError::parse(err.to_string()))?;
-                    match field {
-                        "name" => pkg.name = text.into_owned(),
-                        "arch" => pkg.arch = text.into_owned(),
-                        "checksum" => pkg.sha256 = Some(text.into_owned()),
-                        _ => {}
-                    }
-                }
+            Event::Text(e) if in_text_field.is_some() => {
+                text.push_str(&e.xml10_content());
+            }
+            // The reader hands entity references (`&amp;`, `&#38;`) over as
+            // their own events between the text runs around them.
+            Event::GeneralRef(e) if in_text_field.is_some() => {
+                let resolved = match e.resolve_char_ref() {
+                    Ok(Some(ch)) => ch.to_string(),
+                    _ => resolve_predefined_entity(&e)
+                        .ok_or_else(|| {
+                            UpstreamError::parse(format!("unknown entity reference &{};", &*e))
+                        })?
+                        .to_string(),
+                };
+                text.push_str(&resolved);
             }
             Event::End(e) => {
                 let name = local_name(e.name().into_inner());
                 if matches!(name.as_str(), "name" | "arch" | "checksum") {
-                    in_text_field = None;
+                    if let (Some(field), Some(pkg)) = (in_text_field.take(), &mut current) {
+                        let value = std::mem::take(&mut text);
+                        match field {
+                            "name" => pkg.name = value,
+                            "arch" => pkg.arch = value,
+                            "checksum" => pkg.sha256 = Some(value),
+                            _ => {}
+                        }
+                    }
+                    text.clear();
                 }
                 if name == "package" {
                     if let Some(pkg) = current.take() {
@@ -463,11 +476,11 @@ impl PartialPackage {
 
 /// Strips any namespace prefix (`ns:tag` -> `tag`) so parsing doesn't
 /// depend on which prefix (if any) a given repository's XML declares.
-fn local_name(qname: &[u8]) -> String {
-    let s = String::from_utf8_lossy(qname);
-    s.rsplit_once(':')
+fn local_name(qname: &str) -> String {
+    qname
+        .rsplit_once(':')
         .map(|(_, local)| local)
-        .unwrap_or(&s)
+        .unwrap_or(qname)
         .to_string()
 }
 
@@ -834,6 +847,25 @@ mod tests {
             "https://example.com/repo/Packages/curl-8.0.1-1.x86_64.rpm"
         );
         assert!(pkg.sha256.is_some());
+    }
+
+    #[test]
+    fn primary_xml_text_fields_resolve_entity_references() {
+        let xml = r#"<metadata xmlns="http://linux.duke.edu/metadata/common" packages="1">
+<package type="rpm">
+  <name>a&amp;b&#45;c</name>
+  <arch>noarch</arch>
+  <version epoch="0" ver="1.0" rel="1"/>
+  <checksum type="sha256" pkgid="YES">abc123</checksum>
+  <size package="42"/>
+  <location href="Packages/ab-c-1.0-1.noarch.rpm"/>
+</package>
+</metadata>"#;
+        let packages = parse_primary_xml(xml.as_bytes(), "https://example.com/repo").unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "a&b-c");
+        assert_eq!(packages[0].arch, "noarch");
+        assert_eq!(packages[0].sha256.as_deref(), Some("abc123"));
     }
 
     #[test]
