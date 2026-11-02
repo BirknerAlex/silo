@@ -1,0 +1,70 @@
+// Zed tasks for working on silo. Inside the dev container they run in the
+// container, where Postgres and SeaweedFS are reachable by service name and
+// .devcontainer/config.yaml (written by setup.sh) points at them.
+[
+  {
+    "label": "silo: run server",
+    "command": "cargo run -p silo-server",
+    "env": { "SILO_CONFIG": ".devcontainer/config.yaml" },
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "tags": ["silo-server"]
+  },
+  {
+    "label": "silo: build admin console (embedded at /admin)",
+    "command": "(test -d node_modules || npm ci) && npm run build",
+    "cwd": "$ZED_WORKTREE_ROOT/ui",
+    "reveal": "always",
+    "hide": "on_success"
+  },
+  {
+    // Hot-reloading console on :5173; proxies /admin/api to the server on
+    // :8080, so run the server task alongside it.
+    "label": "silo: admin console dev server",
+    "command": "(test -d node_modules || npm ci) && npm run dev",
+    "cwd": "$ZED_WORKTREE_ROOT/ui",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "silo: cli login as admin",
+    "command": "cargo run -q -p silo-cli -- login --username admin",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always"
+  },
+  {
+    "label": "check: cargo test",
+    "command": "cargo test --workspace --features silo-core/test-util,silo-pkg/test-util",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always"
+  },
+  {
+    "label": "check: clippy",
+    "command": "cargo clippy --workspace --all-targets --features silo-core/test-util,silo-pkg/test-util -- -D warnings",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always"
+  },
+  {
+    "label": "check: fmt",
+    "command": "cargo fmt --all -- --check",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "hide": "on_success"
+  },
+  {
+    "label": "check: admin console (typecheck + tests)",
+    "command": "(test -d node_modules || npm ci) && npm run typecheck && npm test",
+    "cwd": "$ZED_WORKTREE_ROOT/ui",
+    "reveal": "always"
+  },
+  {
+    "label": "check: e2e",
+    "command": "ci/e2e.sh",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true,
+    "reveal": "always"
+  }
+]

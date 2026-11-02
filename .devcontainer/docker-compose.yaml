@@ -31,6 +31,9 @@ services:
     environment:
       # The integration tests read this; unset, they skip.
       SILO_TEST_DATABASE_URL: postgres://silo:silo@postgres:5432/silo
+      # The admin console's Vite dev server binds here (ui/vite.config.ts);
+      # all interfaces, so port forwarding from outside the container works.
+      SILO_DEV_HOST: 0.0.0.0
     # Everything in the compose network is reachable by service name, and
     # the editor forwards the ports listed in devcontainer.json to the
     # host, so a browser on the host can reach the SeaweedFS filer UI.
