@@ -89,7 +89,12 @@ export function Prune() {
                   {() => (
                     <Form isHorizontal style={{ maxWidth: 560 }}>
                       <FormGroup label="Scope" fieldId="prune-scope">
-                        <FormSelect id="prune-scope" value={scope} onChange={(_, v) => setScope(v)}>
+                        <FormSelect
+                          id="prune-scope"
+                          value={scope}
+                          onChange={(_, v) => setScope(v)}
+                          isDisabled={confirm || !!busy}
+                        >
                           <FormSelectOption value="" label="Every configured rule" />
                           {targets.map((t) => (
                             <FormSelectOption key={t} value={t} label={t} />

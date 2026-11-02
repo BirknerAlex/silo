@@ -151,6 +151,7 @@ export function Users() {
 
       {creating && (
         <CreateUserModal
+          oidcEnabled={info.data ? info.data.oidc_enabled : true}
           onClose={() => setCreating(false)}
           onCreated={(name) => {
             setCreating(false);
@@ -197,10 +198,21 @@ export function Users() {
   );
 }
 
-function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreated: (name: string) => void }) {
+function CreateUserModal({
+  oidcEnabled,
+  onClose,
+  onCreated,
+}: {
+  oidcEnabled: boolean;
+  onClose: () => void;
+  onCreated: (name: string) => void;
+}) {
   const toast = useToast();
   const [username, setUsername] = useState("");
-  const [ssoOnly, setSsoOnly] = useState(false);
+  const [ssoOnlyChoice, setSsoOnly] = useState(false);
+  // An account with no password can only sign in through the identity
+  // provider, which a server without OIDC does not have.
+  const ssoOnly = oidcEnabled && ssoOnlyChoice;
   const [password, setPassword] = useState("");
   const [admin, setAdmin] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -225,15 +237,17 @@ function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreate
           <FormGroup label="Username" isRequired fieldId="user-name">
             <TextInput id="user-name" value={username} onChange={(_, v) => setUsername(v)} autoFocus isRequired autoComplete="off" />
           </FormGroup>
-          <FormGroup fieldId="user-sso" style={{ marginTop: 16 }}>
-            <Checkbox
-              id="user-sso"
-              label="Single sign-on only (no password)"
-              isChecked={ssoOnly}
-              onChange={(_, v) => setSsoOnly(v)}
-              description="For someone who will only ever sign in through the identity provider."
-            />
-          </FormGroup>
+          {oidcEnabled && (
+            <FormGroup fieldId="user-sso" style={{ marginTop: 16 }}>
+              <Checkbox
+                id="user-sso"
+                label="Single sign-on only (no password)"
+                isChecked={ssoOnly}
+                onChange={(_, v) => setSsoOnly(v)}
+                description="For someone who will only ever sign in through the identity provider."
+              />
+            </FormGroup>
+          )}
           {!ssoOnly && (
             <FormGroup label="Password" isRequired fieldId="user-pass" style={{ marginTop: 16 }}>
               <TextInput

@@ -229,6 +229,8 @@ impl ReadService for ReadServiceImpl {
                     sha256: row.sha256,
                     published_at: row.published_at.timestamp(),
                     id: row.id,
+                    repo: row.repo,
+                    channel: row.channel,
                     origin_upstream: row
                         .origin_upstream_id
                         .and_then(|id| upstream_names.get(&id).cloned())
