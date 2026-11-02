@@ -22,7 +22,7 @@ import {
 } from "@patternfly/react-core";
 import { Table, Tbody, Td, Th, Thead, Tr } from "@patternfly/react-table";
 import { SyncAltIcon } from "@patternfly/react-icons";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import type { Stats } from "../api/types";
@@ -77,6 +77,16 @@ export function Dashboard() {
   useInterval(() => {
     if (!document.hidden) stats.reload();
   }, 30_000, true);
+  // Catch up at once when the tab comes back, rather than at the next tick.
+  useEffect(() => {
+    const onVisible = () => {
+      if (!document.hidden) stats.reload();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+    // `reload` is stable; `stats` itself changes every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <>
