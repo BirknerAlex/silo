@@ -125,9 +125,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (token && !who) {
-      load(token, true).catch(() => {
-        /* the stored credential was refused: show the sign-in page */
-      });
+      // A refused credential is dropped and the sign-in page shows. Any
+      // other failure (the server is restarting, a proxy answered 5xx) keeps
+      // the credential, so try again a few times before giving up on it.
+      const delays = [2000, 5000, 15000];
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const restore = (retriesLeft: number) => {
+        load(token, true).catch((e: unknown) => {
+          const refused = e instanceof ApiError && e.code === "unauthenticated";
+          if (refused || retriesLeft === 0) return;
+          timer = setTimeout(() => restore(retriesLeft - 1), delays[delays.length - retriesLeft]);
+        });
+      };
+      restore(delays.length);
+      return () => clearTimeout(timer);
     }
     // Only on first load: later changes go through signIn.
     // eslint-disable-next-line react-hooks/exhaustive-deps

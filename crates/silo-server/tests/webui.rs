@@ -409,7 +409,7 @@ async fn stats_describe_what_was_published() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|p| p["name"] == "widget"));
+        .any(|p| p["name"] == "widget" && p["repo"] == repo.as_str() && p["channel"] == "stable"));
 }
 
 #[tokio::test]
