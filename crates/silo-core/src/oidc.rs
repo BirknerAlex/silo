@@ -392,6 +392,111 @@ mod tests {
         assert!(!claims(json!({"sub": "s", "groups": ["silo-admins"]})).is_admin(&cfg));
     }
 
+    /// Signs claims with the throwaway RSA test key and builds a verifier
+    /// whose key cache already holds the matching public key, so nothing
+    /// here touches the network.
+    fn signed_verifier(claims: serde_json::Value) -> (Verifier, String) {
+        use base64::Engine as _;
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::pkcs8::DecodePrivateKey;
+        use rsa::traits::PublicKeyParts;
+
+        let pem = include_str!("../testdata/apk-signing-key.pem");
+        let private = rsa::RsaPrivateKey::from_pkcs8_pem(pem.trim()).unwrap();
+        let b64 = |bytes: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+
+        let jwk = Jwk {
+            kid: Some("k1".into()),
+            kty: "RSA".into(),
+            alg: Some("RS256".into()),
+            n: Some(b64(private.n().to_bytes_be())),
+            e: Some(b64(private.e().to_bytes_be())),
+            crv: None,
+            x: None,
+            y: None,
+        };
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("k1".into());
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_der(private.to_pkcs1_der().unwrap().as_bytes()),
+        )
+        .unwrap();
+
+        let verifier = Verifier {
+            config: config(),
+            discovery: Discovery {
+                issuer: "https://id.example.com".into(),
+                jwks_uri: "https://id.example.com/jwks".into(),
+                token_endpoint: "https://id.example.com/token".into(),
+                device_authorization_endpoint: None,
+                authorization_endpoint: None,
+            },
+            jwks: RwLock::new(Some(CachedJwks {
+                keys: vec![jwk],
+                fetched_at: Instant::now(),
+            })),
+            http: reqwest::Client::new(),
+        };
+        (verifier, token)
+    }
+
+    fn in_an_hour() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600
+    }
+
+    #[tokio::test]
+    async fn a_correctly_signed_id_token_is_accepted() {
+        // Exercises the signature check itself. jsonwebtoken has no
+        // default crypto backend, and without one verification panics at
+        // runtime instead of failing a build, so only a test that really
+        // verifies a signature notices a missing one.
+        let (verifier, token) = signed_verifier(json!({
+            "iss": "https://id.example.com",
+            "aud": "silo",
+            "sub": "user-1",
+            "preferred_username": "alice",
+            "exp": in_an_hour(),
+        }));
+        let claims = verifier.verify(&token).await.unwrap();
+        assert_eq!(claims.username("preferred_username"), "alice");
+    }
+
+    #[tokio::test]
+    async fn an_id_token_for_another_audience_or_issuer_is_rejected() {
+        let (verifier, wrong_aud) = signed_verifier(json!({
+            "iss": "https://id.example.com",
+            "aud": "someone-else",
+            "sub": "user-1",
+            "exp": in_an_hour(),
+        }));
+        assert!(verifier.verify(&wrong_aud).await.is_err());
+
+        let (verifier, wrong_iss) = signed_verifier(json!({
+            "iss": "https://evil.example.com",
+            "aud": "silo",
+            "sub": "user-1",
+            "exp": in_an_hour(),
+        }));
+        assert!(verifier.verify(&wrong_iss).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_expired_id_token_is_rejected() {
+        let (verifier, token) = signed_verifier(json!({
+            "iss": "https://id.example.com",
+            "aud": "silo",
+            "sub": "user-1",
+            "exp": 1_000_000_000u64,
+        }));
+        assert!(verifier.verify(&token).await.is_err());
+    }
+
     #[test]
     fn key_matching_uses_kid_and_falls_back_only_for_a_single_key() {
         let a = Jwk {
