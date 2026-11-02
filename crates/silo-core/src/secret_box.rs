@@ -15,7 +15,7 @@
 //! something this module tries to work around with key versioning.
 
 use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use rand::Rng;
 
@@ -53,20 +53,19 @@ impl SecretBox {
                 key_bytes.len()
             );
         }
-        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-        Ok(Self {
-            cipher: Aes256Gcm::new(key),
-        })
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+            .map_err(|_| anyhow::anyhow!("upstream secret key has an invalid length"))?;
+        Ok(Self { cipher })
     }
 
     /// Encrypts `plaintext` under a freshly generated random nonce.
     pub fn seal(&self, plaintext: &str) -> anyhow::Result<Sealed> {
         let mut nonce_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = self
             .cipher
-            .encrypt(nonce, plaintext.as_bytes())
+            .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|_| anyhow::anyhow!("failed to encrypt upstream secret"))?;
         Ok(Sealed {
             ciphertext,
@@ -85,10 +84,11 @@ impl SecretBox {
                 sealed.nonce.len()
             );
         }
-        let nonce = Nonce::from_slice(&sealed.nonce);
+        let nonce = Nonce::try_from(sealed.nonce.as_slice())
+            .map_err(|_| anyhow::anyhow!("upstream secret nonce has an invalid length"))?;
         let plaintext = self
             .cipher
-            .decrypt(nonce, sealed.ciphertext.as_slice())
+            .decrypt(&nonce, sealed.ciphertext.as_slice())
             .map_err(|_| {
                 anyhow::anyhow!("failed to decrypt upstream secret (wrong key or corrupted data)")
             })?;
