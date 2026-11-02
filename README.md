@@ -55,6 +55,24 @@ flatpak remote-add silo https://silo.example.com/myrepo/apps/silo.flatpakrepo
 flatpak install silo org.example.Hello
 ```
 
+## Admin console
+
+The same listener serves a web console at `/admin` (for the quickstart,
+<http://localhost:8080/admin/>). It does everything the CLI's admin commands
+do — repos and their mode, packages, tokens, users, the audit log, retention
+rules and pruning, pull-through upstreams, index rebuilds — and adds a
+dashboard of usage and activity and a read-out of the server's configuration.
+
+Sign in the way `silo login` does: with a password, through single sign-on
+when the server has OIDC configured (the device flow, or an ID token you
+already hold), or by pasting an API token such as the bootstrap one. What you
+see follows your credential: an all-repos admin gets everything, a
+repo-scoped admin the repos it reaches, anyone else a read-only browser.
+
+It is a client of the authenticated API, not a second one, so it can do
+nothing a token cannot. Set `admin_ui.enabled: false` to stop serving it.
+The name `admin` is reserved and cannot be used as a repo name.
+
 ## Publishing from CI
 
 Any repository can publish to a silo instance with the reusable action in

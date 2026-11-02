@@ -198,6 +198,12 @@ config:
     # needs an admin token scoped to every repo (see serviceMonitor below).
     requireAuth: true
 
+  # The web admin console at /admin on the same port and Ingress as the
+  # API. It can do nothing an API token cannot; turn it off to stop serving
+  # it on an Ingress that faces the internet.
+  adminUi:
+    enabled: true
+
   # Package pruning deletes packages, so it's off by default even when
   # per-(repo, channel) rules are configured via `silo repo set-prune-rule`.
   prune:

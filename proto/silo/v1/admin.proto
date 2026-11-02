@@ -68,6 +68,15 @@ service AdminService {
   rpc ListUpstreams(ListUpstreamsRequest) returns (ListUpstreamsResponse);
   // Re-syncs one upstream's index immediately, ignoring the schedule.
   rpc SyncUpstream(SyncUpstreamRequest) returns (SyncUpstreamResponse);
+
+  // Registry-wide usage figures: inventory by format and repo, a daily
+  // activity series built from the audit log, and this replica's own
+  // runtime counters. Requires an admin token scoped to every repo.
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  // Describes how this server is configured — the parts an operator needs
+  // to know to use the other RPCs, never a secret. Requires an admin token
+  // scoped to every repo.
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 }
 
 // Which repos a token may act on.
@@ -512,4 +521,141 @@ message SyncUpstreamRequest {
 message SyncUpstreamResponse {
   UpstreamInfo upstream = 1;
   int32 packages_synced = 2;
+}
+
+message GetStatsRequest {
+  // Length of the activity window, in days, ending now. 0 means 30; values
+  // above 365 are clamped.
+  int32 days = 1;
+}
+
+message GetStatsResponse {
+  // Unix seconds.
+  int64 generated_at = 1;
+  int32 days = 2;
+  StatsTotals totals = 3;
+  repeated FormatStats formats = 4;
+  repeated RepoStats repos = 5;
+  // One entry per day in the window, oldest first, including days with no
+  // activity.
+  repeated DailyActivity activity = 6;
+  // Audit actions recorded inside the window, most frequent first.
+  repeated ActionCount actions = 7;
+  UpstreamStats upstreams = 8;
+  RuntimeStats runtime = 9;
+  // The most recently published packages, newest first.
+  repeated PackageInfo recent_packages = 10;
+}
+
+message StatsTotals {
+  int64 repos = 1;
+  int64 channels = 2;
+  int64 packages = 3;
+  int64 bytes = 4;
+  // Packages pulled through from an upstream rather than published.
+  int64 upstream_packages = 5;
+  int64 users = 6;
+  int64 admin_users = 7;
+  int64 disabled_users = 8;
+  int64 oidc_users = 9;
+  // Unrevoked, unexpired API tokens.
+  int64 api_tokens = 10;
+  // Unrevoked, unexpired session tokens.
+  int64 session_tokens = 11;
+  int64 revoked_tokens = 12;
+  int64 expired_tokens = 13;
+  int64 public_repos = 14;
+}
+
+message FormatStats {
+  PackageFormat format = 1;
+  int64 packages = 2;
+  int64 bytes = 3;
+  int64 repos = 4;
+}
+
+message RepoStats {
+  string repo = 1;
+  RepoMode mode = 2;
+  int64 channels = 3;
+  int64 packages = 4;
+  int64 bytes = 5;
+}
+
+message DailyActivity {
+  // Unix seconds at 00:00 UTC of the day.
+  int64 day = 1;
+  int64 publishes = 2;
+  int64 downloads = 3;
+  int64 deletes = 4;
+  int64 logins = 5;
+  int64 failures = 6;
+}
+
+message ActionCount {
+  string action = 1;
+  int64 count = 2;
+  int64 failures = 3;
+}
+
+message UpstreamStats {
+  int64 total = 1;
+  int64 ok = 2;
+  int64 pending = 3;
+  int64 error = 4;
+  // Rows in the synced upstream indexes, across all upstreams.
+  int64 indexed_packages = 5;
+}
+
+// Counters kept in this replica's memory. They restart from zero with the
+// process and cover only the requests this replica served.
+message RuntimeStats {
+  int64 started_at = 1;
+  int64 uptime_seconds = 2;
+  int64 publishes_ok = 3;
+  int64 publishes_failed = 4;
+  int64 downloads_redirect = 5;
+  int64 downloads_proxy = 6;
+  int64 pull_through_served = 7;
+  int64 grpc_ok = 8;
+  int64 grpc_error = 9;
+  int64 auth_failures = 10;
+  int64 upstream_syncs_ok = 11;
+  int64 upstream_syncs_failed = 12;
+  bool database_up = 13;
+}
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  string version = 1;
+  string commit = 2;
+  string built_at = 3;
+  repeated string formats = 4;
+  string public_base_url = 5;
+  bool password_login_enabled = 6;
+  bool oidc_enabled = 7;
+  string oidc_issuer = 8;
+  bool oidc_exclusive = 9;
+  bool oidc_allow_username_linking = 10;
+  int64 session_ttl_hours = 11;
+  // Formats the server signs: any of "rpm", "deb", "flatpak", "apk",
+  // "pacman".
+  repeated string signing = 12;
+  bool prune_enabled = 13;
+  // True when `upstream_secret` is configured, which credentialed
+  // upstreams require.
+  bool upstream_secret_configured = 14;
+  bool audit_log_downloads = 15;
+  bool audit_log_pull_through = 16;
+  int64 audit_retention_days = 17;
+  bool metrics_enabled = 18;
+  repeated ScheduledJob jobs = 19;
+}
+
+message ScheduledJob {
+  string name = 1;
+  // Cron expression; empty when the job is disabled.
+  string schedule = 2;
+  bool enabled = 3;
 }

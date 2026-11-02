@@ -244,6 +244,17 @@ impl Db {
         .await?)
     }
 
+    /// The most recently published packages across every repo, newest
+    /// first. Feeds the admin console's activity feed.
+    pub async fn recent_packages(&self, limit: i64) -> anyhow::Result<Vec<PackageRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM packages ORDER BY published_at DESC, id DESC LIMIT $1"
+        ))
+        .bind(limit.clamp(1, 100))
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     /// Resolves a storage key back to its package row, so a download can
     /// be audited with real package identity instead of a raw path.
     pub async fn find_by_storage_key(&self, key: &str) -> anyhow::Result<Option<PackageRow>> {

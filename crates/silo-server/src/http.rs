@@ -1889,6 +1889,7 @@ pub(crate) mod tests {
             signing: SigningConfig::default(),
             audit: AuditConfig::default(),
             metrics: MetricsConfig::default(),
+            admin_ui: Default::default(),
             prune: PruneConfig::default(),
             jobs: JobsConfig::default(),
             upstream_secret: None,

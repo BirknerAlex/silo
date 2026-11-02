@@ -14,6 +14,7 @@ pub mod grpc_auth;
 pub mod http;
 pub mod maintenance;
 pub mod metrics;
+pub mod webui;
 
 use std::sync::Arc;
 

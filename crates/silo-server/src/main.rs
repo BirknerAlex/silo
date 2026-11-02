@@ -14,7 +14,7 @@ use silo_proto::v1::auth_service_server::AuthServiceServer;
 use silo_proto::v1::publish_service_server::PublishServiceServer;
 use silo_proto::v1::read_service_server::ReadServiceServer;
 use silo_server::metrics::Metrics;
-use silo_server::{admin, bootstrap, grpc, grpc_auth, http, maintenance, AppState};
+use silo_server::{admin, bootstrap, grpc, grpc_auth, http, maintenance, webui, AppState};
 
 #[derive(Parser)]
 struct Args {
@@ -129,8 +129,11 @@ async fn main() -> anyhow::Result<()> {
         }));
     let grpc_routes = grpc_routes.routes().into_axum_router();
 
-    let app = http::router(state.clone())
-        .merge(grpc_routes)
+    let mut app = http::router(state.clone()).merge(grpc_routes);
+    if state.config.admin_ui.enabled {
+        app = app.merge(webui::router(state.clone()));
+    }
+    let app = app
         // gRPC handlers read the peer IP via `tonic::Request::remote_addr`,
         // which looks for a `TcpConnectInfo` extension that tonic's own
         // transport normally inserts. Serving through plain axum/hyper

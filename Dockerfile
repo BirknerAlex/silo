@@ -1,3 +1,12 @@
+# The admin console (`ui/`) is built first: silo-server's build.rs embeds
+# `ui/dist` into the binary, so it has to exist before cargo runs.
+FROM node:22-bookworm-slim AS ui
+WORKDIR /ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
+COPY ui/ ./
+RUN npm run build
+
 FROM rust:1-bookworm AS build
 # protoc for silo-proto's build.rs.
 RUN apt-get update \
@@ -5,6 +14,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
+COPY --from=ui /ui/dist ./ui/dist
 RUN cargo build --release -p silo-server -p silo-cli
 
 FROM debian:bookworm-slim

@@ -189,6 +189,9 @@ metrics:
   enabled: {{ .Values.config.metrics.enabled }}
   require_auth: {{ .Values.config.metrics.requireAuth }}
 
+admin_ui:
+  enabled: {{ .Values.config.adminUi.enabled }}
+
 {{- if .Values.config.prune.enabled }}
 
 prune:
