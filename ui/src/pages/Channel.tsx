@@ -52,7 +52,13 @@ export function Channel() {
   const { capabilities } = useAuth();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  const tab = (params.get("tab") as TabKey | null) ?? "packages";
+  // Only tabs this credential can see; anything else falls back to the
+  // package list rather than selecting a tab that is not rendered.
+  const allowedTabs: TabKey[] = capabilities.admin
+    ? ["packages", "upstreams", "retention", "index"]
+    : ["packages"];
+  const requested = params.get("tab") as TabKey | null;
+  const tab: TabKey = requested && allowedTabs.includes(requested) ? requested : "packages";
   const select = (key: TabKey) => setParams(key === "packages" ? {} : { tab: key }, { replace: true });
 
   return (

@@ -69,3 +69,15 @@ describe("the gateway client", () => {
     expect(error).toMatchObject({ code: "unavailable", status: 0 });
   });
 });
+
+describe("a refused credential", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("is reported to the handler by value, so a replaced one can be told apart", async () => {
+    const unauthorized = vi.fn();
+    configureClient({ token: () => "old-token", unauthorized });
+    vi.stubGlobal("fetch", respond(401, { code: "unauthenticated", message: "expired" }));
+    await rpc("ListUsers").catch(() => {});
+    expect(unauthorized).toHaveBeenCalledWith("old-token");
+  });
+});

@@ -72,7 +72,11 @@ export function Dashboard() {
   const stats = useAsync(() => api.stats(days), [days]);
   // The figures are cheap to compute and an operator watching a publish
   // land wants to see it.
-  useInterval(stats.reload, 30_000, true);
+  // Not while the tab is hidden: the figures are aggregates over the audit
+  // log, and nobody is looking at them.
+  useInterval(() => {
+    if (!document.hidden) stats.reload();
+  }, 30_000, true);
 
   return (
     <>

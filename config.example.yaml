@@ -81,7 +81,7 @@ metrics:
 # The web admin console, served at /admin on the same listener. It is a
 # client of the same authenticated API as the `silo` CLI and can do nothing
 # a token cannot. Set enabled to false to stop serving it. The name `admin`
-# is reserved and cannot be used as a repo name.
+# is reserved: no new repo can be created with it.
 admin_ui:
   enabled: true
 

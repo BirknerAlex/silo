@@ -618,16 +618,24 @@ fn validate_schedule(key: &str, schedule: &str) -> anyhow::Result<()> {
 /// character set keeps all three unambiguous — in particular, no `/`,
 /// which would let two different repo/channel pairs address the same
 /// prefix.
-/// Repo names silo cannot serve because a route of its own sits at the
-/// same path: the web admin console owns `/admin`.
+/// Repo names silo will not create, because a route of its own sits at the
+/// same path: the web admin console owns `/admin`. Only creation is
+/// refused; a repo that already has one of these names stays addressable
+/// by the API, so it can still be listed and deleted.
 pub const RESERVED_REPO_NAMES: &[&str] = &["admin"];
+
+/// [`validate_repo_name`] for a repo that is about to be created.
+pub fn validate_new_repo_name(name: &str) -> anyhow::Result<()> {
+    validate_repo_name("repo", name)?;
+    if RESERVED_REPO_NAMES.contains(&name) {
+        anyhow::bail!("`{name}` is reserved and cannot be used as a repo name");
+    }
+    Ok(())
+}
 
 pub fn validate_repo_name(kind: &str, name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.len() > 100 {
         anyhow::bail!("{kind} name must be between 1 and 100 characters");
-    }
-    if kind == "repo" && RESERVED_REPO_NAMES.contains(&name) {
-        anyhow::bail!("`{name}` is reserved and cannot be used as a repo name");
     }
     if name == "." || name == ".." {
         anyhow::bail!("`{name}` is not a valid {kind} name");
@@ -906,6 +914,10 @@ jobs:
         assert!(validate_repo_name("repo", "myrepo").is_ok());
         assert!(validate_repo_name("repo", "my-repo_1.0").is_ok());
         assert!(validate_repo_name("repo", "a/b").is_err());
+        // Reserved names are refused at creation only.
+        assert!(validate_repo_name("repo", "admin").is_ok());
+        assert!(validate_new_repo_name("admin").is_err());
+        assert!(validate_new_repo_name("administrators").is_ok());
         assert!(validate_repo_name("repo", "..").is_err());
         assert!(validate_repo_name("repo", "").is_err());
         assert!(validate_repo_name("channel", "with space").is_err());

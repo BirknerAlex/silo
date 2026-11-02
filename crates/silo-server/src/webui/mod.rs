@@ -108,10 +108,10 @@ async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Respon
     if find(&path).is_some() {
         return serve(&path);
     }
-    // A request for something that looks like a file but is not one is a
-    // real 404; anything else is a client-side route.
-    let last = path.rsplit('/').next().unwrap_or("");
-    if last.contains('.') {
+    // A missing file under `assets/` is a real 404. Anything else is a
+    // client-side route, including ones that end in what looks like an
+    // extension: repo and channel names may contain dots (`/repos/my.repo`).
+    if path.starts_with("assets/") {
         return StatusCode::NOT_FOUND.into_response();
     }
     serve("index.html")

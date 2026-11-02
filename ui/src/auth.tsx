@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { api } from "./api";
-import { configureClient } from "./api/client";
+import { ApiError, configureClient } from "./api/client";
 import type { Session, WhoAmI } from "./api/types";
 
 const STORAGE_KEY = "silo.token";
@@ -32,6 +32,11 @@ function writeStored(token: string | null): void {
     // until reload, which is the safe direction to fail in.
   }
 }
+
+// The credential of the current session, kept in memory as well so a
+// browser that refuses storage writes can still sign in for the life of the
+// page. Set before `WhoAmI` is sent.
+let sessionToken: string | null = null;
 
 /** What the signed-in credential is allowed to do, as far as the UI can tell. */
 export interface Capabilities {
@@ -65,6 +70,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(token === null);
 
   const signOut = useCallback(() => {
+    sessionToken = null;
     writeStored(null);
     setToken(null);
     setWho(undefined);
@@ -74,31 +80,43 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // The client reads the credential through a function so it always sees
   // the current one without being re-created.
   useEffect(() => {
-    configureClient({ token: () => readStored(), unauthorized: signOut });
+    configureClient({
+      token: () => sessionToken ?? readStored(),
+      // A late refusal of a credential that has since been replaced says
+      // nothing about the current one.
+      unauthorized: (refused) => {
+        if (refused === (sessionToken ?? readStored())) signOut();
+      },
+    });
   }, [signOut]);
 
-  const load = useCallback(
-    async (candidate: string) => {
-      writeStored(candidate);
-      try {
-        const me = await api.whoAmI();
-        setToken(candidate);
-        setWho(me);
-      } catch (e) {
+  // `restoring` is a stored credential being re-checked after a reload. It
+  // is dropped only when the server refuses it: an outage or a proxy error
+  // says nothing about whether it is still good.
+  const load = useCallback(async (candidate: string, restoring = false) => {
+    sessionToken = candidate;
+    writeStored(candidate);
+    try {
+      const me = await api.whoAmI();
+      setToken(candidate);
+      setWho(me);
+    } catch (e) {
+      const refused = e instanceof ApiError && e.code === "unauthenticated";
+      if (!restoring || refused) {
+        sessionToken = null;
         writeStored(null);
         setToken(null);
-        setWho(undefined);
-        throw e;
-      } finally {
-        setReady(true);
       }
-    },
-    [],
-  );
+      setWho(undefined);
+      throw e;
+    } finally {
+      setReady(true);
+    }
+  }, []);
 
   useEffect(() => {
     if (token && !who) {
-      load(token).catch(() => {
+      load(token, true).catch(() => {
         /* the stored credential was refused: show the sign-in page */
       });
     }
@@ -111,7 +129,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ready,
       who,
       capabilities: capabilitiesOf(who),
-      signIn: load,
+      signIn: (candidate) => load(candidate),
       signInWithSession: (session) => load(session.token),
       signOut,
     }),

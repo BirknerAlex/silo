@@ -103,7 +103,7 @@ export function Audit() {
     <>
       <PageHeader
         title="Audit log"
-        subtitle="Every change and every authenticated download, newest first. Entries older than the retention period are pruned."
+        subtitle="Every change, and every authenticated download while audit.log_downloads is on, newest first. Entries older than the retention period are pruned."
       />
       <Body>
         <Toolbar>
@@ -112,7 +112,17 @@ export function Audit() {
               <FormSelect
                 aria-label="Action"
                 value={action}
-                onChange={(_, v) => setParams(v ? { action: v } : {}, { replace: true })}
+                onChange={(_, v) =>
+                  setParams(
+                    (previous) => {
+                      const next = new URLSearchParams(previous);
+                      if (v) next.set("action", v);
+                      else next.delete("action");
+                      return next;
+                    },
+                    { replace: true },
+                  )
+                }
               >
                 <FormSelectOption value="" label="All actions" />
                 {ACTIONS.map((a) => (

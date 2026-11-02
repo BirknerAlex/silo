@@ -4,7 +4,8 @@
 //! identity provider. A page served from silo cannot: providers do not
 //! send CORS headers on their device and token endpoints. So the console
 //! asks silo to make the two requests, and silo makes them with the
-//! `client_id` and endpoints it already holds for ID-token verification.
+//! `client_id` and endpoints it already holds for ID-token verification,
+//! and with the `client_secret` when the provider needs one.
 //!
 //! What this relay never does is take the user's word for who they are.
 //! The person signs in at the provider; the ID token that comes back goes
@@ -20,6 +21,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use silo_proto::v1::auth_service_server::AuthService;
+use tokio::sync::Semaphore;
 use tonic::Code;
 
 use super::gateway::{error, no_store};
@@ -27,6 +29,21 @@ use crate::grpc_auth::AuthServiceImpl;
 use crate::AppState;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many relay requests may be in flight to the identity provider at
+/// once. The routes take no credential, so without a ceiling anyone who can
+/// reach the port could hold an unbounded number of outbound connections
+/// open for the full request timeout. Past it, callers get 429 and the
+/// console retries on its next poll.
+const MAX_IN_FLIGHT: usize = 16;
+static IN_FLIGHT: Semaphore = Semaphore::const_new(MAX_IN_FLIGHT);
+
+fn busy() -> Response {
+    error(
+        Code::ResourceExhausted,
+        "too many sign-in requests are in progress; try again shortly".into(),
+    )
+}
 const MAX_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +123,9 @@ fn json<T: Serialize>(value: &T) -> Response {
 
 /// `POST /admin/api/oidc/device`
 pub(super) async fn start(State(state): State<Arc<AppState>>) -> Response {
+    let Ok(_permit) = IN_FLIGHT.try_acquire() else {
+        return busy();
+    };
     let Some(verifier) = state.oidc.as_ref() else {
         return error(
             Code::FailedPrecondition,
@@ -128,14 +148,19 @@ pub(super) async fn start(State(state): State<Arc<AppState>>) -> Response {
         config.scopes.join(" ")
     };
 
+    let mut form = vec![
+        ("client_id", config.client_id.as_str()),
+        ("scope", scopes.as_str()),
+    ];
+    // A confidential client authenticates at the device endpoint too.
+    if let Some(secret) = config.client_secret.as_deref() {
+        form.push(("client_secret", secret));
+    }
     let response = state
         .upstream_http
         .post(&endpoint)
         .timeout(REQUEST_TIMEOUT)
-        .form(&[
-            ("client_id", config.client_id.as_str()),
-            ("scope", scopes.as_str()),
-        ])
+        .form(&form)
         .send()
         .await;
     let response = match response {
@@ -185,6 +210,9 @@ pub(super) async fn start(State(state): State<Arc<AppState>>) -> Response {
 /// finished, `{"status": "ok", "session": {...}}` once they have, and an
 /// ordinary error body otherwise.
 pub(super) async fn poll(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let Ok(_permit) = IN_FLIGHT.try_acquire() else {
+        return busy();
+    };
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -208,15 +236,19 @@ pub(super) async fn poll(State(state): State<Arc<AppState>>, request: Request) -
         );
     };
     let config = verifier.config();
+    let mut form = vec![
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ("device_code", poll.device_code.as_str()),
+        ("client_id", config.client_id.as_str()),
+    ];
+    if let Some(secret) = config.client_secret.as_deref() {
+        form.push(("client_secret", secret));
+    }
     let response = state
         .upstream_http
         .post(&verifier.discovery().token_endpoint)
         .timeout(REQUEST_TIMEOUT)
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("device_code", poll.device_code.as_str()),
-            ("client_id", config.client_id.as_str()),
-        ])
+        .form(&form)
         .send()
         .await;
     let token: TokenResponse = match response {
