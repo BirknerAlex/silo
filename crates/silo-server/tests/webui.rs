@@ -83,6 +83,11 @@ async fn unknown_client_routes_fall_back_to_the_page_but_missing_files_do_not() 
         get(&app, "/admin/repos/some/deep/path").await.status(),
         StatusCode::OK
     );
+    // Repo and channel names may contain dots.
+    assert_eq!(
+        get(&app, "/admin/repos/my.repo/v1.0").await.status(),
+        StatusCode::OK
+    );
     assert_eq!(
         get(&app, "/admin/assets/nope.js").await.status(),
         StatusCode::NOT_FOUND
@@ -118,7 +123,7 @@ async fn package_routes_still_work_beside_the_console() {
 }
 
 #[tokio::test]
-async fn the_name_admin_cannot_be_used_for_a_repo() {
+async fn the_name_admin_cannot_be_used_for_a_new_repo_but_an_existing_one_stays_reachable() {
     let url = require_db!();
     let harness = Harness::new(&url).await;
     let app = app(&harness);
@@ -133,6 +138,26 @@ async fn the_name_admin_cannot_be_used_for_a_repo() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body["message"].as_str().unwrap().contains("reserved"));
+
+    // A repo that already carries the name (made before the name was
+    // reserved) keeps working through the API.
+    harness.db.ensure_repo("admin").await.unwrap();
+    let (status, body) = rpc(
+        &app,
+        "SetRepoMode",
+        Some(&admin.secret),
+        serde_json::json!({ "repo": "admin", "mode": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = rpc(
+        &app,
+        "DeleteRepo",
+        Some(&admin.secret),
+        serde_json::json!({ "repo": "admin" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
@@ -322,6 +347,25 @@ async fn stats_describe_what_was_published() {
     .await
     .expect("seed a package");
 
+    // A repo whose packages have no `repos` row still appears in the
+    // per-repo breakdown, as it does in the headline count.
+    let orphan = unique_repo("orphan");
+    silo_core::repo::publish(
+        &harness.state.publish,
+        &orphan,
+        "stable",
+        silo_pkg::PackageFormat::Rpm,
+        silo_pkg::testutil::build_test_rpm("gadget", "1.0", "1", "x86_64"),
+        &silo_db::audit::Actor::system(),
+    )
+    .await
+    .expect("seed an orphan package");
+    sqlx::query("DELETE FROM repos WHERE repo = $1")
+        .bind(&orphan)
+        .execute(harness.db.pool())
+        .await
+        .unwrap();
+
     let (status, stats) = rpc(
         &app,
         "GetStats",
@@ -335,6 +379,12 @@ async fn stats_describe_what_was_published() {
     assert_eq!(stats["activity"].as_array().unwrap().len(), 7);
     assert!(stats["totals"]["packages"].as_i64().unwrap() >= 1);
     assert!(stats["totals"]["bytes"].as_i64().unwrap() > 0);
+
+    assert!(stats["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["repo"] == orphan.as_str() && r["packages"] == 1));
 
     let mine = stats["repos"]
         .as_array()

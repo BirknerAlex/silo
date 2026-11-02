@@ -49,6 +49,14 @@ fn invalid(msg: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("invalid ostree request: {msg}")
 }
 
+/// Refuses a reserved repo name when the push would create the repo.
+async fn ensure_new_repo_allowed(ctx: &PublishContext, repo: &str) -> anyhow::Result<()> {
+    if ctx.db.repo_exists(repo).await? {
+        return Ok(());
+    }
+    crate::config::validate_new_repo_name(repo).map_err(invalid)
+}
+
 /// Reads `objects/ab/cdef….ext` into the object it names.
 ///
 /// `commitmeta` is deliberately not accepted: signatures over commits are
@@ -109,6 +117,7 @@ pub async fn stage_object(
         }
     }
 
+    ensure_new_repo_allowed(ctx, repo).await?;
     ctx.db.ensure_repo(repo).await?;
     let key = flatpak::object_key(repo, channel, ty, &checksum);
     if ctx.storage.head(&key).await? {
@@ -172,6 +181,7 @@ pub async fn publish_ref(
 ) -> anyhow::Result<PublishOutcome> {
     validate_repo_name("repo", repo)?;
     validate_repo_name("channel", channel)?;
+    ensure_new_repo_allowed(ctx, repo).await?;
     ctx.db.ensure_repo(repo).await?;
 
     let checksum = Checksum::from_hex(commit).map_err(invalid)?;

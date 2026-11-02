@@ -155,6 +155,9 @@ pub async fn publish_with_origin(
     // Gives the repo a row (private by default) the moment it's first
     // published to, so its mode has somewhere to live even though nothing
     // else about a repo is stored outside of `packages`.
+    if !ctx.db.repo_exists(repo).await? {
+        crate::config::validate_new_repo_name(repo)?;
+    }
     ctx.db.ensure_repo(repo).await?;
 
     let handler = format.handler();

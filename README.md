@@ -71,7 +71,7 @@ repo-scoped admin the repos it reaches, anyone else a read-only browser.
 
 It is a client of the authenticated API, not a second one, so it can do
 nothing a token cannot. Set `admin_ui.enabled: false` to stop serving it.
-The name `admin` is reserved and cannot be used as a repo name.
+The name `admin` is reserved: no new repo can be created with it.
 
 ## Publishing from CI
 

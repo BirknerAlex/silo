@@ -663,11 +663,6 @@ async fn pull_through_miss(
             .await
             {
                 Ok(outcome) => {
-                    state
-                        .metrics
-                        .pull_through
-                        .with_label_values(&[format.as_str(), "fetch_cache"])
-                        .inc();
                     // Not `bytes`: rpm signing rewrites the payload on
                     // capture (see `repo::index_metadata`'s doc), so what
                     // was actually stored can differ from what was
@@ -675,14 +670,23 @@ async fn pull_through_miss(
                     // first response to a cold cache byte-for-byte the
                     // same as every response after it.
                     match state.storage.get(&outcome.storage_path).await {
-                        Ok(Some(stored)) => Some(
-                            (
-                                StatusCode::OK,
-                                [(header::CONTENT_TYPE, "application/octet-stream")],
-                                stored,
+                        Ok(Some(stored)) => {
+                            // Counted once the bytes are in hand, so a
+                            // read-back that fails is not a served request.
+                            state
+                                .metrics
+                                .pull_through
+                                .with_label_values(&[format.as_str(), "fetch_cache"])
+                                .inc();
+                            Some(
+                                (
+                                    StatusCode::OK,
+                                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                                    stored,
+                                )
+                                    .into_response(),
                             )
-                                .into_response(),
-                        ),
+                        }
                         Ok(None) => {
                             tracing::error!(
                                 key = outcome.storage_path,

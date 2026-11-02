@@ -112,15 +112,18 @@ impl Db {
         .await?)
     }
 
-    /// Every repo, including one with no packages yet.
+    /// Every repo, including one with no packages yet and one whose
+    /// packages have no `repos` row. The same set `stats_totals` counts.
     pub async fn stats_by_repo(&self) -> anyhow::Result<Vec<RepoTotals>> {
         Ok(sqlx::query_as(
-            "SELECT r.repo, r.public, \
+            "SELECT n.repo, coalesce(r.public, false) AS public, \
                     count(DISTINCT p.channel) AS channels, \
                     count(p.id) AS packages, \
                     coalesce(sum(p.size_bytes), 0)::bigint AS bytes \
-             FROM repos r LEFT JOIN packages p ON p.repo = r.repo \
-             GROUP BY r.repo, r.public ORDER BY bytes DESC, r.repo",
+             FROM (SELECT repo FROM repos UNION SELECT repo FROM packages) n \
+             LEFT JOIN repos r ON r.repo = n.repo \
+             LEFT JOIN packages p ON p.repo = n.repo \
+             GROUP BY n.repo, r.public ORDER BY bytes DESC, n.repo",
         )
         .fetch_all(self.pool())
         .await?)

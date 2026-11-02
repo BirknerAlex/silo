@@ -1079,7 +1079,7 @@ impl AdminServiceImpl {
         auth::require_admin(&caller)?;
         let req = request.into_inner();
 
-        silo_core::config::validate_repo_name("repo", &req.repo)
+        silo_core::config::validate_new_repo_name(&req.repo)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         // Same reasoning as `set_repo_mode_inner`: creating a repo also
         // sets its mode, so it needs the token's own scope to cover it.

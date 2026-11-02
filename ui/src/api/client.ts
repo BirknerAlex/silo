@@ -14,7 +14,8 @@ export class ApiError extends Error {
 }
 
 type TokenSource = () => string | null;
-type UnauthorizedHandler = () => void;
+/** Called with the credential the server refused. */
+type UnauthorizedHandler = (refused: string) => void;
 
 let tokenSource: TokenSource = () => null;
 let onUnauthorized: UnauthorizedHandler = () => {};
@@ -63,7 +64,7 @@ async function post<T>(path: string, body: unknown, sendToken: boolean): Promise
     );
     // A credential that was sent and refused means the session is over. A
     // failed sign-in also answers "unauthenticated", but sends no credential.
-    if (token && apiError.code === "unauthenticated") onUnauthorized();
+    if (token && apiError.code === "unauthenticated") onUnauthorized(token);
     throw apiError;
   }
   return payload as T;

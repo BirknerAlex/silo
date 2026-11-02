@@ -317,6 +317,8 @@ function RunNow({ repo, channel }: { repo: string; channel: string }) {
 
   const run = async (dry: boolean) => {
     setBusy(dry ? "dry" : "real");
+    // A preview of an earlier rule must not outlive the run that replaces it.
+    setResult(undefined);
     try {
       setResult(await api.runPrune(repo, channel, dry));
     } catch (e) {
