@@ -255,6 +255,9 @@ function SsoForm({ info }: { info: AuthInfo }) {
         const result = await api.oidcDevicePoll(device.device_code);
         if (id !== flow.current) return;
         if (result.status === "ok") {
+          // Past the point of cancelling: show progress rather than a Cancel
+          // button that could not stop the sign-in now under way.
+          setState({ phase: "starting" });
           await signInWithSession(result.session);
           return;
         }

@@ -151,7 +151,7 @@ export function Users() {
 
       {creating && (
         <CreateUserModal
-          oidcEnabled={info.data ? info.data.oidc_enabled : true}
+          oidcEnabled={info.data?.oidc_enabled ?? false}
           onClose={() => setCreating(false)}
           onCreated={(name) => {
             setCreating(false);

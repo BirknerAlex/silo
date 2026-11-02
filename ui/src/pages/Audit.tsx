@@ -13,7 +13,7 @@ import {
 } from "@patternfly/react-core";
 import { ExpandableRowContent, Table, Tbody, Td, Th, Thead, Tr } from "@patternfly/react-table";
 import { SyncAltIcon } from "@patternfly/react-icons";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { AuditEntry } from "../api/types";
@@ -69,6 +69,22 @@ export function Audit() {
 
   const debouncedRepo = useDebounced(repo);
   const debouncedActor = useDebounced(actor);
+
+  // Keep the URL in step with the typed filters, so a reload or a shared
+  // link shows what is on screen. `action` is written by its own selector.
+  useEffect(() => {
+    setParams(
+      (previous) => {
+        const next = new URLSearchParams(previous);
+        const set = (key: string, value: string) =>
+          value.trim() ? next.set(key, value.trim()) : next.delete(key);
+        set("repo", debouncedRepo);
+        set("actor", debouncedActor);
+        return next.toString() === previous.toString() ? previous : next;
+      },
+      { replace: true },
+    );
+  }, [debouncedRepo, debouncedActor, setParams]);
 
   const entries = useAsync(
     () =>

@@ -210,9 +210,6 @@ pub(super) async fn start(State(state): State<Arc<AppState>>) -> Response {
 /// finished, `{"status": "ok", "session": {...}}` once they have, and an
 /// ordinary error body otherwise.
 pub(super) async fn poll(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    let Ok(_permit) = IN_FLIGHT.try_acquire() else {
-        return busy();
-    };
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -228,6 +225,12 @@ pub(super) async fn poll(State(state): State<Arc<AppState>>, request: Request) -
     if poll.device_code.is_empty() {
         return error(Code::InvalidArgument, "device_code is required".into());
     }
+
+    // Taken only now: a client that dribbles its body must not be able to
+    // hold permits while it does. The permit covers the provider call.
+    let Ok(_permit) = IN_FLIGHT.try_acquire() else {
+        return busy();
+    };
 
     let Some(verifier) = state.oidc.as_ref() else {
         return error(

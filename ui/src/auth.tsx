@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -90,17 +91,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     });
   }, [signOut]);
 
+  // Each call is an attempt; only the latest may change what is signed in.
+  // A slow answer for an earlier credential (a second form submitted while
+  // the first request is pending) must not replace, or sign out, the newer.
+  const attempt = useRef(0);
+
   // `restoring` is a stored credential being re-checked after a reload. It
   // is dropped only when the server refuses it: an outage or a proxy error
   // says nothing about whether it is still good.
   const load = useCallback(async (candidate: string, restoring = false) => {
+    const mine = ++attempt.current;
     sessionToken = candidate;
     writeStored(candidate);
     try {
       const me = await api.whoAmI();
+      if (mine !== attempt.current) return;
       setToken(candidate);
       setWho(me);
     } catch (e) {
+      if (mine !== attempt.current) throw e;
       const refused = e instanceof ApiError && e.code === "unauthenticated";
       if (!restoring || refused) {
         sessionToken = null;
@@ -110,7 +119,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setWho(undefined);
       throw e;
     } finally {
-      setReady(true);
+      if (mine === attempt.current) setReady(true);
     }
   }, []);
 
