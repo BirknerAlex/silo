@@ -23,6 +23,9 @@
     "SILO_TEST_DATABASE_URL": "postgres://silo:silo@postgres:5432/silo",
     "SILO_SERVER": "http://localhost:8080",
     "SILO_CLIENT_CONFIG": "/workspace/.devcontainer/client.yaml",
+    // Binds the admin console's Vite dev server (ui/vite.config.ts) to all
+    // interfaces, so the forwarded port 5173 reaches it.
+    "SILO_DEV_HOST": "0.0.0.0",
     "RUST_BACKTRACE": "1"
   },
 
@@ -60,9 +63,10 @@
   // both before it starts.
   "postCreateCommand": ".devcontainer/setup.sh",
 
-  "forwardPorts": [8080, 5432, 8333, 8888],
+  "forwardPorts": [8080, 5173, 5432, 8333, 8888],
   "portsAttributes": {
     "8080": { "label": "silo (gRPC + HTTP)" },
+    "5173": { "label": "admin console dev server" },
     "5432": { "label": "postgres" },
     "8333": { "label": "seaweedfs S3 API" },
     "8888": { "label": "seaweedfs filer UI" }

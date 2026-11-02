@@ -1,0 +1,20 @@
+// Project settings for Zed, matching the VS Code customizations in
+// .devcontainer/devcontainer.json.
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        // The fixtures the tests use live behind these features; without
+        // them rust-analyzer reports errors in files that compile fine.
+        "cargo": {
+          "features": ["silo-core/test-util", "silo-pkg/test-util"]
+        },
+        "check": {
+          "command": "clippy",
+          "allTargets": true
+        }
+      }
+    }
+  },
+  "format_on_save": "on"
+}
