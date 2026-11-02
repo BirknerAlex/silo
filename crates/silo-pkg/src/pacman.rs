@@ -633,7 +633,7 @@ fn compare_segments(a: &PackageVersion, b: &PackageVersion) -> std::cmp::Orderin
     use alpm_types::VersionSegment;
     use std::cmp::Ordering;
 
-    if a.inner() == b.inner() {
+    if AsRef::<str>::as_ref(a) == AsRef::<str>::as_ref(b) {
         return Ordering::Equal;
     }
 
