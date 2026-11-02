@@ -90,6 +90,8 @@ message PackageInfo {
   // Empty for a locally published package; otherwise the name of the
   // upstream it was pulled through from.
   string origin_upstream = 11;
+  string repo = 12;
+  string channel = 13;
 }
 
 message ListReposRequest {}

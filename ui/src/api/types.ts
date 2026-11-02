@@ -72,6 +72,8 @@ export interface PackageInfo {
   published_at: number;
   id: number;
   origin_upstream: string;
+  repo: string;
+  channel: string;
 }
 
 export interface TokenInfo {

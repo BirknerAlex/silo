@@ -208,7 +208,10 @@ function SsoForm({ info }: { info: AuthInfo }) {
   const { signInWithSession } = useAuth();
   const [state, setState] = useState<SsoState>({ phase: "idle" });
   const [error, setError] = useState<string>();
-  const cancelled = useRef(false);
+  // Identifies the current device-flow attempt. Cancel, unmount and every new
+  // attempt change it, and anything still running for an older one stops
+  // without touching state.
+  const flow = useRef(0);
   const [showToken, setShowToken] = useState(false);
   const [idToken, setIdToken] = useState("");
   const pasted = usePending();
@@ -216,31 +219,33 @@ function SsoForm({ info }: { info: AuthInfo }) {
   // Stop polling when the page is left.
   useEffect(
     () => () => {
-      cancelled.current = true;
+      flow.current++;
     },
     [],
   );
 
   const start = async () => {
-    cancelled.current = false;
+    const id = ++flow.current;
     setError(undefined);
     setState({ phase: "starting" });
     try {
       const device = await api.oidcDeviceStart();
+      if (id !== flow.current) return;
       const deadline = Date.now() + device.expires_in * 1000;
       setState({ phase: "waiting", device, deadline });
-      void poll(device, deadline);
+      void poll(id, device, deadline);
     } catch (e) {
+      if (id !== flow.current) return;
       setState({ phase: "idle" });
       setError(e instanceof ApiError ? e.message : String(e));
     }
   };
 
-  const poll = async (device: DeviceStart, deadline: number) => {
+  const poll = async (id: number, device: DeviceStart, deadline: number) => {
     let interval = Math.max(device.interval, 1) * 1000;
-    while (!cancelled.current) {
+    while (id === flow.current) {
       await new Promise((resolve) => setTimeout(resolve, interval));
-      if (cancelled.current) return;
+      if (id !== flow.current) return;
       if (Date.now() >= deadline) {
         setState({ phase: "idle" });
         setError("The sign-in code expired before it was used. Start again.");
@@ -248,14 +253,15 @@ function SsoForm({ info }: { info: AuthInfo }) {
       }
       try {
         const result = await api.oidcDevicePoll(device.device_code);
+        if (id !== flow.current) return;
         if (result.status === "ok") {
-          cancelled.current = true;
           await signInWithSession(result.session);
           return;
         }
         // The provider asked for fewer requests: slow down, as it requires.
         if (result.status === "slow_down") interval += 5000;
       } catch (e) {
+        if (id !== flow.current) return;
         setState({ phase: "idle" });
         setError(e instanceof ApiError ? e.message : String(e));
         return;
@@ -264,7 +270,7 @@ function SsoForm({ info }: { info: AuthInfo }) {
   };
 
   const cancel = () => {
-    cancelled.current = true;
+    flow.current++;
     setState({ phase: "idle" });
   };
 

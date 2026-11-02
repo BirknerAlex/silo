@@ -276,6 +276,12 @@ function DashboardBody({ stats, days }: { stats: Stats; days: number }) {
                     <Tr key={p.id}>
                       <Td dataLabel="Package">
                         {p.name} <small>{packageVersion(p)}</small>
+                        <br />
+                        <small>
+                          <Link to={`/repos/${encodeURIComponent(p.repo)}/${encodeURIComponent(p.channel)}`}>
+                            {p.repo}/{p.channel}
+                          </Link>
+                        </small>
                         {p.origin_upstream && (
                           <>
                             {" "}
