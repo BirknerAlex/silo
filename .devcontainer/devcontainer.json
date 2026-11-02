@@ -9,6 +9,8 @@
   // compose file, which is the same shape as a real deployment.
   "features": {
     "ghcr.io/devcontainers/features/github-cli:1": {},
+    // The admin console (ui/) is a Vite project.
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
     "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
   },
 

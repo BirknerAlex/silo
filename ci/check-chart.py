@@ -95,6 +95,7 @@ EVERYTHING = [
     "--set", "config.upstreamSecret.existingSecret=upstreamkey",
     "--set", "config.jobs.flatpakGc=0 0 4 * * *",
     "--set", "config.jobs.flatpakGcMinAgeHours=0",
+    "--set", "config.adminUi.enabled=false",
     "--set", "podLabels.tier=backend",
     "--set", "extraEnv[0].name=RUST_LOG",
     "--set", "extraEnv[0].value=debug",
@@ -188,6 +189,7 @@ def rendered_config_is_valid() -> None:
         "--set", "config.audit.logPullThrough=false",
         "--set", "config.jobs.flatpakGc=0 0 4 * * *",
         "--set", "config.jobs.flatpakGcMinAgeHours=0",
+        "--set", "config.adminUi.enabled=false",
     )
     secret = next(
         d for d in docs
@@ -210,6 +212,9 @@ def rendered_config_is_valid() -> None:
     # `0` is a real value (no minimum age), and Helm treats it as falsy, so
     # it has to survive the template rather than fall back to the default.
     assert cfg["jobs"]["flatpak_gc_min_age_hours"] == 0, cfg.get("jobs")
+    # The console is on unless an operator turns it off, and has to be
+    # reachable from values to be turned off at all.
+    assert cfg["admin_ui"]["enabled"] is False, cfg.get("admin_ui")
     assert cfg["storage"]["access_key_id"] == "${SILO_STORAGE_ACCESS_KEY_ID}", cfg["storage"]
     assert cfg["public_base_url"] == "https://silo.example.com", cfg
     assert cfg["storage"]["bucket"], cfg["storage"]

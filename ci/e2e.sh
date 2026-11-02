@@ -392,6 +392,24 @@ ADMIN_TOKEN=$($COMPOSE exec -T \
     -e SILO_USERNAME=admin -e "SILO_PASSWORD=$BOOTSTRAP_PASSWORD" \
     silo /usr/local/bin/silo login --server http://localhost:8080 --print-token 2>/dev/null | tr -d '\r')
 [ -n "$ADMIN_TOKEN" ] || fail "login produced no token"
+
+# The admin console is part of the binary, not a separate deployment: the
+# page has to be the real build (not the placeholder a binary built without
+# `ui/dist` carries), and its JSON gateway has to run an admin RPC with the
+# same token the CLI just got.
+ADMIN_PAGE=$(curl -fsS "http://localhost:$HTTP_PORT/admin/")
+case "$ADMIN_PAGE" in
+    *'/admin/assets/'*) ok "admin console is embedded" ;;
+    *) fail "/admin/ did not serve the built console" ;;
+esac
+ADMIN_STATS=$(curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H 'Content-Type: application/json' -d '{}' \
+    "http://localhost:$HTTP_PORT/admin/api/rpc/GetStats") \
+    || fail "the admin console's gateway refused GetStats"
+case "$ADMIN_STATS" in
+    *'"totals"'*) ok "admin console gateway answers an admin call" ;;
+    *) fail "GetStats through the gateway returned $ADMIN_STATS" ;;
+esac
 ok "logged in as admin"
 
 # A scoped write token, so publishing exercises the same permission path a

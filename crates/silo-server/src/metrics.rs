@@ -36,6 +36,26 @@ pub struct Metrics {
     pub pull_through_fetch_duration: HistogramVec,
     pub upstream_fetch_errors: IntCounterVec,
     pub flatpak_gc_objects: IntCounter,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// This replica's counters, summed across their labels. What the admin
+/// console shows as "since this server started".
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeSnapshot {
+    pub started_at: i64,
+    pub uptime_seconds: i64,
+    pub publishes_ok: i64,
+    pub publishes_failed: i64,
+    pub downloads_redirect: i64,
+    pub downloads_proxy: i64,
+    pub pull_through_served: i64,
+    pub grpc_ok: i64,
+    pub grpc_error: i64,
+    pub auth_failures: i64,
+    pub upstream_syncs_ok: i64,
+    pub upstream_syncs_failed: i64,
+    pub database_up: bool,
 }
 
 impl Metrics {
@@ -189,7 +209,46 @@ impl Metrics {
             pull_through_fetch_duration,
             upstream_fetch_errors,
             flatpak_gc_objects,
+            started_at: chrono::Utc::now(),
         })
+    }
+
+    /// Sums the counters the admin console reports. Reads the registry
+    /// rather than keeping a second set of numbers, so the console and
+    /// `/metrics` cannot disagree.
+    pub fn runtime_snapshot(&self) -> RuntimeSnapshot {
+        let families = self.registry.gather();
+        let total = |name: &str, filter: &[(&str, &str)]| -> i64 {
+            families
+                .iter()
+                .filter(|f| f.get_name() == format!("silo_{name}"))
+                .flat_map(|f| f.get_metric())
+                .filter(|m| {
+                    filter.iter().all(|(label, value)| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == *label && l.get_value() == *value)
+                    })
+                })
+                .map(|m| m.get_counter().get_value() as i64)
+                .sum()
+        };
+        let now = chrono::Utc::now();
+        RuntimeSnapshot {
+            started_at: self.started_at.timestamp(),
+            uptime_seconds: (now - self.started_at).num_seconds().max(0),
+            publishes_ok: total("publishes_total", &[("result", "ok")]),
+            publishes_failed: total("publishes_total", &[("result", "error")]),
+            downloads_redirect: total("downloads_total", &[("mode", "redirect")]),
+            downloads_proxy: total("downloads_total", &[("mode", "proxy")]),
+            pull_through_served: total("pull_through_total", &[]),
+            grpc_ok: total("grpc_requests_total", &[("status", "ok")]),
+            grpc_error: total("grpc_requests_total", &[("status", "error")]),
+            auth_failures: total("auth_failures_total", &[]),
+            upstream_syncs_ok: total("upstream_syncs_total", &[("result", "ok")]),
+            upstream_syncs_failed: total("upstream_syncs_total", &[("result", "error")]),
+            database_up: self.database_up.get() == 1,
+        }
     }
 
     pub fn record_upstream_sync(&self, format: &str, ok: bool, seconds: f64) {
@@ -325,6 +384,32 @@ mod tests {
                 "metric is missing the namespace prefix: {line}"
             );
         }
+    }
+
+    #[test]
+    fn the_runtime_snapshot_sums_counters_across_their_other_labels() {
+        let metrics = Metrics::new().unwrap();
+        metrics.record_publish("rpm", true, 0.1);
+        metrics.record_publish("npm", true, 0.1);
+        metrics.record_publish("npm", false, 0.1);
+        metrics.downloads.with_label_values(&["rpm", "proxy"]).inc();
+        metrics.downloads.with_label_values(&["npm", "proxy"]).inc();
+        metrics
+            .downloads
+            .with_label_values(&["npm", "redirect"])
+            .inc();
+        metrics.auth_failures.with_label_values(&["expired"]).inc();
+        metrics.auth_failures.with_label_values(&["unknown"]).inc();
+        metrics.database_up.set(1);
+
+        let snapshot = metrics.runtime_snapshot();
+        assert_eq!(snapshot.publishes_ok, 2);
+        assert_eq!(snapshot.publishes_failed, 1);
+        assert_eq!(snapshot.downloads_proxy, 2);
+        assert_eq!(snapshot.downloads_redirect, 1);
+        assert_eq!(snapshot.auth_failures, 2);
+        assert!(snapshot.database_up);
+        assert!(snapshot.started_at > 0);
     }
 
     #[test]

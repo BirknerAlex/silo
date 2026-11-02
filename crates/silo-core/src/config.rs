@@ -48,6 +48,9 @@ pub struct Config {
     pub metrics: MetricsConfig,
 
     #[serde(default)]
+    pub admin_ui: AdminUiConfig,
+
+    #[serde(default)]
     pub prune: PruneConfig,
 
     #[serde(default)]
@@ -297,6 +300,24 @@ impl Default for AuditConfig {
             log_pull_through: true,
             retention_days: default_audit_retention_days(),
         }
+    }
+}
+
+/// The web admin console served under `/admin`.
+///
+/// It is a client of the same authenticated API the CLI uses and grants
+/// nothing a token does not, so it is on by default. Turn it off to stop
+/// serving the pages and the JSON gateway behind them on a listener that
+/// faces the internet; the gRPC API and `silo` are unaffected.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AdminUiConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for AdminUiConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -597,9 +618,16 @@ fn validate_schedule(key: &str, schedule: &str) -> anyhow::Result<()> {
 /// character set keeps all three unambiguous — in particular, no `/`,
 /// which would let two different repo/channel pairs address the same
 /// prefix.
+/// Repo names silo cannot serve because a route of its own sits at the
+/// same path: the web admin console owns `/admin`.
+pub const RESERVED_REPO_NAMES: &[&str] = &["admin"];
+
 pub fn validate_repo_name(kind: &str, name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.len() > 100 {
         anyhow::bail!("{kind} name must be between 1 and 100 characters");
+    }
+    if kind == "repo" && RESERVED_REPO_NAMES.contains(&name) {
+        anyhow::bail!("`{name}` is reserved and cannot be used as a repo name");
     }
     if name == "." || name == ".." {
         anyhow::bail!("`{name}` is not a valid {kind} name");

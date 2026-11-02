@@ -29,21 +29,24 @@ use silo_db::Uuid;
 use silo_pkg::PackageFormat;
 use silo_proto::v1::admin_service_server::AdminService;
 use silo_proto::v1::{
-    AddUpstreamRequest, AddUpstreamResponse, AuditEntry as ProtoAuditEntry, ClearPruneRuleRequest,
-    ClearPruneRuleResponse, CreateRepoRequest, CreateRepoResponse, CreateTokenRequest,
-    CreateTokenResponse, CreateUserRequest, CreateUserResponse, DeletePackageRequest,
-    DeletePackageResponse, DeleteRepoRequest, DeleteRepoResponse, DeleteUserRequest,
-    DeleteUserResponse, GetPruneRuleRequest, GetPruneRuleResponse, ListPruneExemptionsRequest,
-    ListPruneExemptionsResponse, ListTokensRequest, ListTokensResponse, ListUpstreamsRequest,
-    ListUpstreamsResponse, ListUsersRequest, ListUsersResponse, OriginScope as ProtoOriginScope,
-    PruneCandidate as ProtoPruneCandidate, PruneRule as ProtoPruneRule, QueryAuditRequest,
-    QueryAuditResponse, RebuildIndexRequest, RebuildIndexResponse, RemoveUpstreamRequest,
-    RemoveUpstreamResponse, RepoMode, RevokeTokenRequest, RevokeTokenResponse, RunPruneRequest,
-    RunPruneResponse, SetPruneExemptionRequest, SetPruneExemptionResponse, SetPruneRuleRequest,
+    ActionCount, AddUpstreamRequest, AddUpstreamResponse, AuditEntry as ProtoAuditEntry,
+    ClearPruneRuleRequest, ClearPruneRuleResponse, CreateRepoRequest, CreateRepoResponse,
+    CreateTokenRequest, CreateTokenResponse, CreateUserRequest, CreateUserResponse, DailyActivity,
+    DeletePackageRequest, DeletePackageResponse, DeleteRepoRequest, DeleteRepoResponse,
+    DeleteUserRequest, DeleteUserResponse, FormatStats, GetPruneRuleRequest, GetPruneRuleResponse,
+    GetServerInfoRequest, GetServerInfoResponse, GetStatsRequest, GetStatsResponse,
+    ListPruneExemptionsRequest, ListPruneExemptionsResponse, ListTokensRequest, ListTokensResponse,
+    ListUpstreamsRequest, ListUpstreamsResponse, ListUsersRequest, ListUsersResponse,
+    OriginScope as ProtoOriginScope, PruneCandidate as ProtoPruneCandidate,
+    PruneRule as ProtoPruneRule, QueryAuditRequest, QueryAuditResponse, RebuildIndexRequest,
+    RebuildIndexResponse, RemoveUpstreamRequest, RemoveUpstreamResponse, RepoMode, RepoStats,
+    RevokeTokenRequest, RevokeTokenResponse, RunPruneRequest, RunPruneResponse, RuntimeStats,
+    ScheduledJob, SetPruneExemptionRequest, SetPruneExemptionResponse, SetPruneRuleRequest,
     SetPruneRuleResponse, SetRepoModeRequest, SetRepoModeResponse, SetUserDisabledRequest,
-    SetUserDisabledResponse, SetUserPasswordRequest, SetUserPasswordResponse, SyncUpstreamRequest,
-    SyncUpstreamResponse, TokenInfo, TokenScope as ProtoScope, UpdateUpstreamRequest,
-    UpdateUpstreamResponse, UpstreamCacheMode as ProtoCacheMode, UpstreamInfo, UserInfo,
+    SetUserDisabledResponse, SetUserPasswordRequest, SetUserPasswordResponse, StatsTotals,
+    SyncUpstreamRequest, SyncUpstreamResponse, TokenInfo, TokenScope as ProtoScope,
+    UpdateUpstreamRequest, UpdateUpstreamResponse, UpstreamCacheMode as ProtoCacheMode,
+    UpstreamInfo, UpstreamStats, UserInfo,
 };
 use tonic::{Request, Response, Status};
 
@@ -285,9 +288,242 @@ impl AdminService for AdminServiceImpl {
         self.state.metrics.record_grpc("sync_upstream", &result);
         result
     }
+
+    async fn get_stats(
+        &self,
+        request: Request<GetStatsRequest>,
+    ) -> Result<Response<GetStatsResponse>, Status> {
+        let result = self.get_stats_inner(request).await;
+        self.state.metrics.record_grpc("get_stats", &result);
+        result
+    }
+
+    async fn get_server_info(
+        &self,
+        request: Request<GetServerInfoRequest>,
+    ) -> Result<Response<GetServerInfoResponse>, Status> {
+        let result = self.get_server_info_inner(request).await;
+        self.state.metrics.record_grpc("get_server_info", &result);
+        result
+    }
 }
 
 impl AdminServiceImpl {
+    async fn get_stats_inner(
+        &self,
+        request: Request<GetStatsRequest>,
+    ) -> Result<Response<GetStatsResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_global_admin(&caller)?;
+        let req = request.into_inner();
+        let days = if req.days <= 0 { 30 } else { req.days.min(365) };
+
+        let db = &self.state.db;
+        let internal = |e: anyhow::Error| Status::internal(e.to_string());
+        let (totals, formats, repos, activity, actions, upstreams, recent) = tokio::try_join!(
+            db.stats_totals(),
+            db.stats_by_format(),
+            db.stats_by_repo(),
+            db.stats_daily_activity(days),
+            db.stats_action_totals(days),
+            db.stats_upstreams(),
+            db.recent_packages(10),
+        )
+        .map_err(internal)?;
+
+        // Origin names for the recent-packages feed, resolved only when a
+        // row is actually tagged.
+        let upstream_names: std::collections::HashMap<silo_db::Uuid, String> =
+            if recent.iter().any(|p| p.origin_upstream_id.is_some()) {
+                db.list_all_upstreams()
+                    .await
+                    .map_err(internal)?
+                    .into_iter()
+                    .map(|u| (u.id, u.name))
+                    .collect()
+            } else {
+                Default::default()
+            };
+
+        let runtime = self.state.metrics.runtime_snapshot();
+
+        Ok(Response::new(GetStatsResponse {
+            generated_at: chrono::Utc::now().timestamp(),
+            days,
+            totals: Some(StatsTotals {
+                repos: totals.repos,
+                channels: totals.channels,
+                packages: totals.packages,
+                bytes: totals.bytes,
+                upstream_packages: totals.upstream_packages,
+                users: totals.users,
+                admin_users: totals.admin_users,
+                disabled_users: totals.disabled_users,
+                oidc_users: totals.oidc_users,
+                api_tokens: totals.api_tokens,
+                session_tokens: totals.session_tokens,
+                revoked_tokens: totals.revoked_tokens,
+                expired_tokens: totals.expired_tokens,
+                public_repos: totals.public_repos,
+            }),
+            formats: formats
+                .into_iter()
+                .map(|f| FormatStats {
+                    format: f
+                        .format
+                        .parse()
+                        .map(crate::grpc::to_proto_format)
+                        .unwrap_or(silo_proto::v1::PackageFormat::Unspecified)
+                        as i32,
+                    packages: f.packages,
+                    bytes: f.bytes,
+                    repos: f.repos,
+                })
+                .collect(),
+            repos: repos
+                .into_iter()
+                .map(|r| RepoStats {
+                    repo: r.repo,
+                    mode: if r.public {
+                        RepoMode::Public
+                    } else {
+                        RepoMode::Private
+                    } as i32,
+                    channels: r.channels,
+                    packages: r.packages,
+                    bytes: r.bytes,
+                })
+                .collect(),
+            activity: activity
+                .into_iter()
+                .map(|d| DailyActivity {
+                    day: d.day.timestamp(),
+                    publishes: d.publishes,
+                    downloads: d.downloads,
+                    deletes: d.deletes,
+                    logins: d.logins,
+                    failures: d.failures,
+                })
+                .collect(),
+            actions: actions
+                .into_iter()
+                .map(|a| ActionCount {
+                    action: a.action,
+                    count: a.count,
+                    failures: a.failures,
+                })
+                .collect(),
+            upstreams: Some(UpstreamStats {
+                total: upstreams.total,
+                ok: upstreams.ok,
+                pending: upstreams.pending,
+                error: upstreams.error,
+                indexed_packages: upstreams.indexed_packages,
+            }),
+            runtime: Some(RuntimeStats {
+                started_at: runtime.started_at,
+                uptime_seconds: runtime.uptime_seconds,
+                publishes_ok: runtime.publishes_ok,
+                publishes_failed: runtime.publishes_failed,
+                downloads_redirect: runtime.downloads_redirect,
+                downloads_proxy: runtime.downloads_proxy,
+                pull_through_served: runtime.pull_through_served,
+                grpc_ok: runtime.grpc_ok,
+                grpc_error: runtime.grpc_error,
+                auth_failures: runtime.auth_failures,
+                upstream_syncs_ok: runtime.upstream_syncs_ok,
+                upstream_syncs_failed: runtime.upstream_syncs_failed,
+                database_up: runtime.database_up,
+            }),
+            recent_packages: recent
+                .into_iter()
+                .map(|row| silo_proto::v1::PackageInfo {
+                    format: row
+                        .format
+                        .parse()
+                        .map(crate::grpc::to_proto_format)
+                        .unwrap_or(silo_proto::v1::PackageFormat::Unspecified)
+                        as i32,
+                    name: row.name,
+                    version: row.version,
+                    release: row.release,
+                    arch: row.arch,
+                    storage_path: row.storage_key,
+                    size_bytes: row.size_bytes,
+                    sha256: row.sha256,
+                    published_at: row.published_at.timestamp(),
+                    id: row.id,
+                    origin_upstream: row
+                        .origin_upstream_id
+                        .and_then(|id| upstream_names.get(&id).cloned())
+                        .unwrap_or_default(),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_server_info_inner(
+        &self,
+        request: Request<GetServerInfoRequest>,
+    ) -> Result<Response<GetServerInfoResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_global_admin(&caller)?;
+
+        let config = &self.state.config;
+        let build = crate::grpc_auth::version_response();
+        let oidc = self.state.oidc.as_ref().map(|v| v.config());
+
+        let signers = &self.state.publish.signers;
+        let mut signing = Vec::new();
+        if signers.gpg.is_some() {
+            signing.push("rpm".to_string());
+            signing.push("deb".to_string());
+            if signers.ostree.is_some() {
+                signing.push("flatpak".to_string());
+            }
+        }
+        if signers.apk.is_some() {
+            signing.push("apk".to_string());
+        }
+        if signers.pacman.is_some() {
+            signing.push("pacman".to_string());
+        }
+
+        let job = |name: &str, schedule: Option<&String>| ScheduledJob {
+            name: name.to_string(),
+            schedule: schedule.cloned().unwrap_or_default(),
+            enabled: schedule.is_some(),
+        };
+
+        Ok(Response::new(GetServerInfoResponse {
+            version: build.version,
+            commit: build.commit,
+            built_at: build.built_at,
+            formats: build.formats,
+            public_base_url: config.public_base_url().unwrap_or_default().to_string(),
+            password_login_enabled: !oidc.map(|c| c.exclusive).unwrap_or(false),
+            oidc_enabled: oidc.is_some(),
+            oidc_issuer: oidc.map(|c| c.issuer.clone()).unwrap_or_default(),
+            oidc_exclusive: oidc.map(|c| c.exclusive).unwrap_or(false),
+            oidc_allow_username_linking: oidc.map(|c| c.allow_username_linking).unwrap_or(false),
+            session_ttl_hours: config.auth.session_ttl_hours,
+            signing,
+            prune_enabled: config.prune.enabled,
+            upstream_secret_configured: self.state.upstream_secrets.is_some(),
+            audit_log_downloads: config.audit.log_downloads,
+            audit_log_pull_through: config.audit.log_pull_through,
+            audit_retention_days: config.audit.retention_days,
+            metrics_enabled: config.metrics.enabled,
+            jobs: vec![
+                job("session_cleanup", Some(&config.jobs.session_cleanup)),
+                job("audit_prune", Some(&config.jobs.audit_prune)),
+                job("package_prune", config.jobs.package_prune.as_ref()),
+                job("upstream_sync", config.jobs.upstream_sync.as_ref()),
+                job("flatpak_gc", config.jobs.flatpak_gc.as_ref()),
+            ],
+        }))
+    }
+
     async fn create_token_inner(
         &self,
         request: Request<CreateTokenRequest>,

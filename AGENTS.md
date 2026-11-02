@@ -116,8 +116,8 @@ fails the release rather than the pull request that caused it.
 
 ## Checks before pushing
 
-CI runs five jobs — `lint`, `proto`, `test`, `helm`, `e2e`. All of them
-run locally:
+CI runs six jobs — `lint`, `ui`, `proto`, `test`, `helm`, `e2e`. All of
+them run locally:
 
 ```sh
 cargo fmt --all -- --check
@@ -128,6 +128,7 @@ shellcheck ci/*.sh ci/e2e/*.sh .devcontainer/*.sh
 SILO_TEST_DATABASE_URL=postgres://silo:silo@localhost:55432/silo \
     cargo test --workspace --features silo-core/test-util,silo-pkg/test-util
 ci/check-chart.py
+(cd ui && npm ci && npm run typecheck && npm test && npm run build)
 ci/e2e.sh
 ```
 
@@ -143,6 +144,22 @@ docker run -d --name silo-test-pg -p 55432:5432 \
     -e POSTGRES_USER=silo -e POSTGRES_PASSWORD=silo -e POSTGRES_DB=silo \
     postgres:16-alpine
 ```
+
+## The admin console is part of the binary
+
+`ui/` is the React and PatternFly console served at `/admin`. `silo-server`'s
+`build.rs` embeds `ui/dist` at compile time, so a release binary needs
+`npm run build` to have run first; the Dockerfile and `release.yml` do it.
+Without `ui/dist` the server still builds and serves a placeholder page, so
+`cargo` alone keeps working on a machine without Node. For UI work, run
+`npm run dev` in `ui/` (it proxies `/admin/api` to a server on `:8080`).
+
+It talks to the server through a JSON gateway (`webui/gateway.rs`) that
+calls the same gRPC service implementations the CLI uses, so a new admin RPC
+needs three things in the same change: the `.proto`, the method's arm in
+`gateway.rs`'s `dispatch`, and — if people should be able to do it — the
+UI. The wire types derive serde, so the TypeScript types in
+`ui/src/api/types.ts` are the one hand-written mirror to update.
 
 ## Verify against the real thing
 

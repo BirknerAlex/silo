@@ -78,6 +78,13 @@ metrics:
   # the port is reachable solely by your monitoring stack.
   require_auth: true
 
+# The web admin console, served at /admin on the same listener. It is a
+# client of the same authenticated API as the `silo` CLI and can do nothing
+# a token cannot. Set enabled to false to stop serving it. The name `admin`
+# is reserved and cannot be used as a repo name.
+admin_ui:
+  enabled: true
+
 # Retention-based package deletion. Off by default, since pruning deletes
 # packages. Per-(repo, channel) rules and exemptions are configured at
 # runtime with `silo repo set-prune-rule` / `silo repo prune-exempt`, not

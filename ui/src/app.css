@@ -1,0 +1,13 @@
+/* Victory draws chart text with fixed light-theme colours and takes its line
+   colours from variables PatternFly leaves bright in the dark theme. Point
+   both at the theme's own tokens so charts follow the active theme. */
+.chart-wrap {
+  --pf-v6-chart-axis--axis--stroke--Color: var(--pf-t--global--border--color--default);
+  --pf-v6-chart-axis--tick--stroke--Color: var(--pf-t--global--border--color--default);
+  --pf-v6-chart-axis--grid--stroke--Color: var(--pf-t--global--border--color--subtle, var(--pf-t--global--border--color--default));
+}
+
+.chart-wrap text,
+.chart-wrap tspan {
+  fill: var(--pf-t--global--text--color--regular) !important;
+}
