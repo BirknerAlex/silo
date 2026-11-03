@@ -59,7 +59,18 @@ export function Channel() {
     : ["packages"];
   const requested = params.get("tab") as TabKey | null;
   const tab: TabKey = requested && allowedTabs.includes(requested) ? requested : "packages";
-  const select = (key: TabKey) => setParams(key === "packages" ? {} : { tab: key }, { replace: true });
+  // The format a link preselected (the repo page links each row with its own
+  // format); anything that is not a known format means "all formats".
+  const linked = Number(params.get("format"));
+  const format = FORMATS.some((f) => f.value === linked) ? linked : PackageFormat.Unspecified;
+  // The URL carries the format filter so it survives tab switches.
+  const update = (tab: TabKey, fmt: number) => {
+    const next: Record<string, string> = {};
+    if (tab !== "packages") next.tab = tab;
+    if (fmt !== PackageFormat.Unspecified) next.format = String(fmt);
+    setParams(next, { replace: true });
+  };
+  const select = (key: TabKey) => update(key, format);
 
   return (
     <>
@@ -87,7 +98,7 @@ export function Channel() {
         <Tabs activeKey={tab} onSelect={(_, key) => select(key as TabKey)} aria-label="Channel" mountOnEnter unmountOnExit>
           <Tab eventKey="packages" title={<TabTitleText>Packages</TabTitleText>}>
             <div style={{ paddingTop: 16 }}>
-              <Packages repo={repo} channel={channel} canAdmin={capabilities.admin} />
+              <Packages repo={repo} channel={channel} format={format} onFormatChange={(f) => update(tab, f)} canAdmin={capabilities.admin} />
             </div>
           </Tab>
           {capabilities.admin && (
@@ -117,9 +128,20 @@ export function Channel() {
   );
 }
 
-function Packages({ repo, channel, canAdmin }: { repo: string; channel: string; canAdmin: boolean }) {
+function Packages({
+  repo,
+  channel,
+  format,
+  onFormatChange,
+  canAdmin,
+}: {
+  repo: string;
+  channel: string;
+  format: number;
+  onFormatChange: (format: number) => void;
+  canAdmin: boolean;
+}) {
   const toast = useToast();
-  const [format, setFormat] = useState<number>(PackageFormat.Unspecified);
   const [search, setSearch] = useState("");
   const [deleting, setDeleting] = useState<PackageInfo>();
   const packages = useAsync(() => api.listPackages(repo, channel, format), [repo, channel, format]);
@@ -155,7 +177,7 @@ function Packages({ repo, channel, canAdmin }: { repo: string; channel: string; 
             <FormSelect
               aria-label="Format"
               value={format}
-              onChange={(_, v) => setFormat(Number(v))}
+              onChange={(_, v) => onFormatChange(Number(v))}
             >
               <FormSelectOption value={PackageFormat.Unspecified} label="All formats" />
               {FORMATS.map((f) => (

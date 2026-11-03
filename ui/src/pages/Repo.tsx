@@ -120,7 +120,7 @@ export function Repo() {
                               <Tr key={`${r.channel}/${r.format}`}>
                                 <Td dataLabel="Channel">
                                   <Link
-                                    to={`/repos/${encodeURIComponent(repo)}/${encodeURIComponent(r.channel)}`}
+                                    to={`/repos/${encodeURIComponent(repo)}/${encodeURIComponent(r.channel)}?format=${r.format}`}
                                   >
                                     {r.channel}
                                   </Link>
