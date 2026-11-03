@@ -1,6 +1,11 @@
 // Zed tasks for working on silo. Inside the dev container they run in the
 // container, where Postgres and SeaweedFS are reachable by service name and
 // .devcontainer/config.yaml (written by setup.sh) points at them.
+//
+// The ui/ tasks run `npm ci` unless node_modules holds a copy of the
+// lockfile it was installed from that is newer than package-lock.json. The
+// copy is written only after `npm ci` succeeds, so a changed lockfile or an
+// interrupted install both lead to a fresh one.
 [
   {
     "label": "silo: run server",
@@ -14,7 +19,7 @@
   },
   {
     "label": "silo: build admin console (embedded at /admin)",
-    "command": "(test -d node_modules || npm ci) && npm run build",
+    "command": "(test node_modules/.lock-installed -nt package-lock.json || (npm ci && cp package-lock.json node_modules/.lock-installed)) && npm run build",
     "cwd": "$ZED_WORKTREE_ROOT/ui",
     "reveal": "always",
     "hide": "on_success"
@@ -23,7 +28,7 @@
     // Hot-reloading console on :5173; proxies /admin/api to the server on
     // :8080, so run the server task alongside it.
     "label": "silo: admin console dev server",
-    "command": "(test -d node_modules || npm ci) && npm run dev",
+    "command": "(test node_modules/.lock-installed -nt package-lock.json || (npm ci && cp package-lock.json node_modules/.lock-installed)) && npm run dev",
     "cwd": "$ZED_WORKTREE_ROOT/ui",
     "use_new_terminal": true,
     "allow_concurrent_runs": false,
@@ -56,7 +61,7 @@
   },
   {
     "label": "check: admin console (typecheck + tests)",
-    "command": "(test -d node_modules || npm ci) && npm run typecheck && npm test",
+    "command": "(test node_modules/.lock-installed -nt package-lock.json || (npm ci && cp package-lock.json node_modules/.lock-installed)) && npm run typecheck && npm test",
     "cwd": "$ZED_WORKTREE_ROOT/ui",
     "reveal": "always"
   },
