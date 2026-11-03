@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.17.0](https://github.com/BirknerAlex/silo/compare/v0.16.0...v0.17.0) (2026-11-03)
+
+
+### Features
+
+* honour X-Forwarded-For from trusted proxies in the audit log ([aa19830](https://github.com/BirknerAlex/silo/commit/aa19830d76782f4f3523a497c9547f7c528d733b))
+
+
+### Bug fixes
+
+* **ui:** preselect the row's format when opening a channel ([e0e85c6](https://github.com/BirknerAlex/silo/commit/e0e85c685a6546e541e6d5a9bc6c37326637e739))
+
 ## [0.16.0](https://github.com/BirknerAlex/silo/compare/v0.15.0...v0.16.0) (2026-11-03)
 
 
