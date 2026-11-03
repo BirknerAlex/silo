@@ -4197,7 +4197,7 @@ dependencies = [
 
 [[package]]
 name = "silo-cli"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4221,7 +4221,7 @@ dependencies = [
 
 [[package]]
 name = "silo-core"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -4250,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "silo-db"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "argon2 0.6.0",
@@ -4271,7 +4271,7 @@ dependencies = [
 
 [[package]]
 name = "silo-pkg"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "alpm-types",
  "anyhow",
@@ -4299,7 +4299,7 @@ dependencies = [
 
 [[package]]
 name = "silo-proto"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "prost",
  "serde",
@@ -4310,7 +4310,7 @@ dependencies = [
 
 [[package]]
 name = "silo-server"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "axum",
