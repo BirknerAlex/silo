@@ -47,22 +47,11 @@ import { useAuth } from "../auth";
 import { useAsync } from "../hooks";
 import { formatTime } from "../format";
 import { currentTheme, setTheme, type Theme } from "../theme";
+import logoUrl from "../assets/logo.svg";
 
 function Logo() {
-  return (
-    <svg
-      viewBox="0 0 32 32"
-      width="28"
-      height="28"
-      role="img"
-      aria-label="silo"
-      style={{ verticalAlign: "middle" }}
-    >
-      <rect x="9" y="3" width="14" height="26" rx="4" fill="#0066cc" />
-      <rect x="9" y="11" width="14" height="2" fill="#fff" opacity=".6" />
-      <rect x="9" y="18" width="14" height="2" fill="#fff" opacity=".6" />
-    </svg>
-  );
+  // Decorative: the "silo" wordmark beside it already names the console.
+  return <img src={logoUrl} width={28} height={28} alt="" style={{ verticalAlign: "middle" }} />;
 }
 
 function SessionModal({ onClose }: { onClose: () => void }) {
