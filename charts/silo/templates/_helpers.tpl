@@ -174,6 +174,12 @@ audit:
   log_downloads: {{ .Values.config.audit.logDownloads }}
   log_pull_through: {{ .Values.config.audit.logPullThrough }}
   retention_days: {{ .Values.config.audit.retentionDays }}
+  {{- with .Values.config.audit.trustedProxies }}
+  trusted_proxies:
+    {{- range . }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- end }}
 
 {{- if .Values.config.upstreamSecret.existingSecret }}
 

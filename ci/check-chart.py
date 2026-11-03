@@ -96,6 +96,7 @@ EVERYTHING = [
     "--set", "config.jobs.flatpakGc=0 0 4 * * *",
     "--set", "config.jobs.flatpakGcMinAgeHours=0",
     "--set", "config.adminUi.enabled=false",
+    "--set", r"config.audit.trustedProxies={10.0.0.0/8,fd00::/8}",
     "--set", "podLabels.tier=backend",
     "--set", "extraEnv[0].name=RUST_LOG",
     "--set", "extraEnv[0].value=debug",
@@ -187,6 +188,7 @@ def rendered_config_is_valid() -> None:
         "--set", "config.storage.existingSecret=s3creds",
         "--set", "config.database.maxConnections=40",
         "--set", "config.audit.logPullThrough=false",
+        "--set", r"config.audit.trustedProxies={10.0.0.0/8,fd00::/8}",
         "--set", "config.jobs.flatpakGc=0 0 4 * * *",
         "--set", "config.jobs.flatpakGcMinAgeHours=0",
         "--set", "config.adminUi.enabled=false",
@@ -207,6 +209,7 @@ def rendered_config_is_valid() -> None:
     # An operator drowning in pull-through entries has to be able to turn
     # them off from values rather than hand-writing configOverride.
     assert cfg["audit"]["log_pull_through"] is False, cfg["audit"]
+    assert cfg["audit"]["trusted_proxies"] == ["10.0.0.0/8", "fd00::/8"], cfg["audit"]
     # A job with no default only ever runs if the chart can schedule it.
     assert cfg["jobs"]["flatpak_gc"] == "0 0 4 * * *", cfg.get("jobs")
     # `0` is a real value (no minimum age), and Helm treats it as falsy, so

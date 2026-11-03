@@ -287,6 +287,18 @@ pub struct AuditConfig {
     /// Entries older than this are pruned daily. 0 disables pruning.
     #[serde(default = "default_audit_retention_days")]
     pub retention_days: i64,
+    /// Peers (IPs or CIDR ranges) whose `X-Forwarded-For` header is
+    /// believed. A request from one of them is recorded under the nearest
+    /// address in the header that is not itself trusted; with no such
+    /// address, or a malformed header, it is recorded under the peer. A
+    /// request from anyone else is recorded under its own peer address,
+    /// because a client can send any header it likes. Empty means the
+    /// header is never read.
+    ///
+    /// Every host inside a listed range is believed, not only proxies, so
+    /// list the proxies' addresses and nothing broader.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 fn default_audit_retention_days() -> i64 {
@@ -299,6 +311,7 @@ impl Default for AuditConfig {
             log_downloads: true,
             log_pull_through: true,
             retention_days: default_audit_retention_days(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -465,6 +478,8 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        crate::proxies::TrustedProxies::parse(&self.audit.trusted_proxies)
+            .map_err(|e| anyhow::anyhow!("`audit.trusted_proxies`: {e}"))?;
         if self.database.url.trim().is_empty() {
             anyhow::bail!("`database.url` is required");
         }

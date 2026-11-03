@@ -9,6 +9,7 @@
 pub mod admin;
 pub mod auth;
 pub mod bootstrap;
+pub mod forwarded;
 pub mod grpc;
 pub mod grpc_auth;
 pub mod http;
@@ -31,12 +32,23 @@ use crate::metrics::Metrics;
 /// `/admin/api` is routed at all, so the JSON gateway is not reachable on
 /// a listener the operator chose not to expose it on.
 pub fn router(state: Arc<AppState>, grpc: axum::Router) -> axum::Router {
+    let proxies = Arc::new(
+        silo_core::proxies::TrustedProxies::parse(&state.config.audit.trusted_proxies)
+            .unwrap_or_default(),
+    );
     let app = http::router(state.clone()).merge(grpc);
-    if state.config.admin_ui.enabled {
+    let app = if state.config.admin_ui.enabled {
         app.merge(webui::router(state))
     } else {
         app
+    };
+    if proxies.is_empty() {
+        return app;
     }
+    app.layer(axum::middleware::from_fn_with_state(
+        proxies,
+        forwarded::apply,
+    ))
 }
 
 pub struct AppState {
