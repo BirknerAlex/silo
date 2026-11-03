@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.16.0](https://github.com/BirknerAlex/silo/compare/v0.15.0...v0.16.0) (2026-11-03)
+
+
+### Features
+
+* **server:** web admin console at /admin ([bf7c33c](https://github.com/BirknerAlex/silo/commit/bf7c33cdc1e98f9be03db53a1711e8ed5260ce03))
+
+
+### Bug fixes
+
+* **core:** verify OIDC ID tokens with a crypto backend enabled ([2da2f9f](https://github.com/BirknerAlex/silo/commit/2da2f9f370693c500e53777855da83b4e5999dac))
+* **server:** address review of the admin console ([9aa79aa](https://github.com/BirknerAlex/silo/commit/9aa79aaa2956ef75e478bcf86bfecb5dde9756e4))
+* **server:** close the SetRepoMode reservation gap and bound request reads ([9a67fb9](https://github.com/BirknerAlex/silo/commit/9a67fb991d75324826cee4648f9590b37b778106))
+* **server:** reuse GetStats audit aggregates between dashboard polls ([729a88c](https://github.com/BirknerAlex/silo/commit/729a88c714b1a55c371eec2f478c883043ba09f6))
+* **server:** tighten the OIDC relay and console sign-in handling ([18ddafc](https://github.com/BirknerAlex/silo/commit/18ddafc556bec2883b79963d16265c169334e3cf))
+* **ui:** address second batch of console review findings ([3267330](https://github.com/BirknerAlex/silo/commit/3267330daa45685865425f0f4e253f2d99faa477))
+* **ui:** keep relative timestamps current on pages that stay open ([2bbac7b](https://github.com/BirknerAlex/silo/commit/2bbac7b0e2c6e411254d6230e32f0a5c67b88625))
+* **ui:** retry a stored session after a transient restore failure ([02a8884](https://github.com/BirknerAlex/silo/commit/02a88843b99c2c5aa664c6d52335690367b57430))
+
 ## [0.15.0](https://github.com/BirknerAlex/silo/compare/v0.14.0...v0.15.0) (2026-10-04)
 
 
