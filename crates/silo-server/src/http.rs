@@ -1932,6 +1932,7 @@ pub(crate) mod tests {
             metrics: Metrics::new().expect("build metrics"),
             upstream_secrets: None,
             upstream_http: reqwest::Client::new(),
+            audit_stats: Default::default(),
         }
     }
 

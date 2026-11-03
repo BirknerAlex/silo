@@ -58,6 +58,54 @@ pub struct AdminServiceImpl {
     pub state: Arc<AppState>,
 }
 
+/// How long `GetStats` reuses the audit-log aggregates. Every other part
+/// of the response is cheap and always fresh; these two scan every audit
+/// row in the window, which on a registry auditing downloads is most of
+/// the table, and an open dashboard asks every 30 seconds.
+const AUDIT_STATS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The audit aggregates `GetStats` last computed, per replica.
+///
+/// The lock is held while they are recomputed, so dashboards that poll at
+/// the same moment wait for one scan instead of each running their own.
+#[derive(Default)]
+pub struct AuditStatsCache(tokio::sync::Mutex<Option<AuditStats>>);
+
+struct AuditStats {
+    days: i32,
+    computed: std::time::Instant,
+    activity: Vec<silo_db::stats::DayActivity>,
+    actions: Vec<silo_db::stats::ActionTotals>,
+}
+
+impl AuditStatsCache {
+    async fn get(
+        &self,
+        db: &silo_db::Db,
+        days: i32,
+    ) -> anyhow::Result<(
+        Vec<silo_db::stats::DayActivity>,
+        Vec<silo_db::stats::ActionTotals>,
+    )> {
+        let mut cached = self.0.lock().await;
+        if let Some(hit) = cached
+            .as_ref()
+            .filter(|c| c.days == days && c.computed.elapsed() < AUDIT_STATS_TTL)
+        {
+            return Ok((hit.activity.clone(), hit.actions.clone()));
+        }
+        let (activity, actions) =
+            tokio::try_join!(db.stats_daily_activity(days), db.stats_action_totals(days),)?;
+        *cached = Some(AuditStats {
+            days,
+            computed: std::time::Instant::now(),
+            activity: activity.clone(),
+            actions: actions.clone(),
+        });
+        Ok((activity, actions))
+    }
+}
+
 #[tonic::async_trait]
 impl AdminService for AdminServiceImpl {
     async fn create_token(
@@ -320,12 +368,11 @@ impl AdminServiceImpl {
 
         let db = &self.state.db;
         let internal = |e: anyhow::Error| Status::internal(e.to_string());
-        let (totals, formats, repos, activity, actions, upstreams, recent) = tokio::try_join!(
+        let (totals, formats, repos, (activity, actions), upstreams, recent) = tokio::try_join!(
             db.stats_totals(),
             db.stats_by_format(),
             db.stats_by_repo(),
-            db.stats_daily_activity(days),
-            db.stats_action_totals(days),
+            self.state.audit_stats.get(db, days),
             db.stats_upstreams(),
             db.recent_packages(10),
         )

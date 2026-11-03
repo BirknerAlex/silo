@@ -130,9 +130,13 @@ impl Harness {
         // separate constants, so a test that cares about pool size — how
         // many connections one request path holds at once, say — can set
         // it the same way an operator would.
-        let db = Db::connect(&config.database.to_db_config(None))
-            .await
-            .expect("connect to the test database");
+        let db = Db::connect(
+            &config
+                .database
+                .to_db_config(config.auth.token_pepper.clone()),
+        )
+        .await
+        .expect("connect to the test database");
 
         // In-memory object storage: these tests are about the database and
         // the index contents, and a real bucket would make them slow and
@@ -165,6 +169,7 @@ impl Harness {
                 .expect("build a test upstream secret box"),
             ),
             upstream_http: reqwest::Client::new(),
+            audit_stats: Default::default(),
         });
 
         Self {
@@ -174,7 +179,8 @@ impl Harness {
         }
     }
 
-    /// Mints a token with the given reach.
+    /// Mints a token with the given reach, hashed with the configured
+    /// pepper so request authentication accepts it.
     pub async fn token(&self, name: &str, permission: Permission, scope: Scope) -> IssuedToken {
         self.db
             .create_token(
@@ -187,7 +193,7 @@ impl Harness {
                     created_by: None,
                     expires_at: None,
                 },
-                None,
+                self.state.config.auth.token_pepper.as_deref(),
             )
             .await
             .expect("create a test token")

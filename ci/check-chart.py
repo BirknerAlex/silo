@@ -235,6 +235,18 @@ def rendered_config_is_valid() -> None:
     )
 
 
+def the_console_is_on_by_default() -> None:
+    # An operator who sets nothing gets the console, as the server's own
+    # default does; turning it off is a choice made in values.
+    docs = render("--set", "postgres.enabled=true")
+    secret = next(
+        d for d in docs
+        if d["kind"] == "Secret" and "config.yaml" in (d.get("stringData") or {})
+    )
+    cfg = yaml.safe_load(secret["stringData"]["config.yaml"])
+    assert cfg["admin_ui"]["enabled"] is True, cfg.get("admin_ui")
+
+
 def a_hand_written_config_needs_nothing_else() -> None:
     """`configOverride` replaces the rendered config wholesale, so it also
     carries its own `database.url`. Demanding postgres.enabled or
@@ -375,6 +387,7 @@ CHECKS = [
     ("no user label reaches an immutable selector", selectors_stay_immutable),
     ("every selector matches the pods it should", pods_match_their_selectors),
     ("rendered config.yaml is what the server expects", rendered_config_is_valid),
+    ("the admin console is on by default", the_console_is_on_by_default),
     ("a hand-written configOverride needs nothing else", a_hand_written_config_needs_nothing_else),
     ("image tag defaults to appVersion", image_tag_follows_the_chart),
     ("chart, app, cargo and lockfile versions are one number", versions_stay_in_lockstep),
