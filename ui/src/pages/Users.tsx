@@ -152,6 +152,7 @@ export function Users() {
       {creating && (
         <CreateUserModal
           oidcEnabled={info.data?.oidc_enabled ?? false}
+          serverKnown={!!info.data}
           onClose={() => setCreating(false)}
           onCreated={(name) => {
             setCreating(false);
@@ -200,10 +201,13 @@ export function Users() {
 
 function CreateUserModal({
   oidcEnabled,
+  serverKnown,
   onClose,
   onCreated,
 }: {
   oidcEnabled: boolean;
+  /** False until the server's sign-in settings have been read. */
+  serverKnown: boolean;
   onClose: () => void;
   onCreated: (name: string) => void;
 }) {
@@ -280,7 +284,7 @@ function CreateUserModal({
             type="submit"
             variant="primary"
             isLoading={busy}
-            isDisabled={busy || !username.trim() || (!ssoOnly && !password)}
+            isDisabled={busy || !serverKnown || !username.trim() || (!ssoOnly && !password)}
           >
             Create user
           </Button>

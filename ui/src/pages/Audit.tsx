@@ -17,6 +17,7 @@ import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { AuditEntry } from "../api/types";
+import { useAuth } from "../auth";
 import { Body, Empty, PageHeader, Query } from "../components/common";
 import { formatTime } from "../format";
 import { useAsync, useDebounced, useInterval } from "../hooks";
@@ -86,16 +87,23 @@ export function Audit() {
     );
   }, [debouncedRepo, debouncedActor, setParams]);
 
+  // The server answers an audit query with no repo only for an all-repos
+  // admin, so anyone else has to name one before there is anything to ask.
+  const { capabilities } = useAuth();
+  const needsRepo = !capabilities.globalAdmin && !debouncedRepo.trim();
+
   const entries = useAsync(
     () =>
-      api.queryAudit({
+      needsRepo
+        ? Promise.resolve([] as AuditEntry[])
+        : api.queryAudit({
         action: action || undefined,
         repo: debouncedRepo.trim() || undefined,
         actor: debouncedActor.trim() || undefined,
         only_failures: failures,
         limit,
       }),
-    [action, debouncedRepo, debouncedActor, failures, limit],
+    [action, debouncedRepo, debouncedActor, failures, limit, needsRepo],
   );
   useInterval(entries.reload, 10_000, live);
 
@@ -180,7 +188,12 @@ export function Audit() {
         </Toolbar>
         <Query state={entries}>
           {(rows) =>
-            rows.length === 0 ? (
+            needsRepo ? (
+              <Empty title="Choose a repo">
+                This credential reaches some repos, not all, so the log is read one repo at a time.
+                Enter a repo name above.
+              </Empty>
+            ) : rows.length === 0 ? (
               <Empty title="No matching entries" />
             ) : (
               <Table aria-label="Audit log" variant="compact">

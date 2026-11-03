@@ -179,6 +179,17 @@ async fn the_name_admin_cannot_be_used_for_a_new_repo_but_an_existing_one_stays_
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body["message"].as_str().unwrap().contains("reserved"));
 
+    // Setting a mode creates a repo's row, so it honours the reservation too.
+    let (status, body) = rpc(
+        &app,
+        "SetRepoMode",
+        Some(&admin.secret),
+        serde_json::json!({ "repo": "admin", "mode": 2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("reserved"));
+
     // A repo that already carries the name (made before the name was
     // reserved) keeps working through the API.
     harness.db.ensure_repo("admin").await.unwrap();

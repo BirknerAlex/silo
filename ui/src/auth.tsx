@@ -70,7 +70,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [who, setWho] = useState<WhoAmI>();
   const [ready, setReady] = useState(token === null);
 
+  // Each call to `load`, and each sign-out, is an attempt; only the latest
+  // may change what is signed in. A slow answer for an earlier credential
+  // (a second form submitted while the first request is pending, a restore
+  // retry still waiting when the person signs out) must not replace, or sign
+  // out, what came after it.
+  const attempt = useRef(0);
+
   const signOut = useCallback(() => {
+    attempt.current++;
     sessionToken = null;
     writeStored(null);
     setToken(null);
@@ -90,11 +98,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       },
     });
   }, [signOut]);
-
-  // Each call is an attempt; only the latest may change what is signed in.
-  // A slow answer for an earlier credential (a second form submitted while
-  // the first request is pending) must not replace, or sign out, the newer.
-  const attempt = useRef(0);
 
   // `restoring` is a stored credential being re-checked after a reload. It
   // is dropped only when the server refuses it: an outage or a proxy error
@@ -131,10 +134,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const delays = [2000, 5000, 15000];
       let timer: ReturnType<typeof setTimeout> | undefined;
       const restore = (retriesLeft: number) => {
-        load(token, true).catch((e: unknown) => {
+        const result = load(token, true);
+        // `load` has already claimed its attempt number by the time it
+        // returns, so this is the one that belongs to this try.
+        const mine = attempt.current;
+        result.catch((e: unknown) => {
           const refused = e instanceof ApiError && e.code === "unauthenticated";
-          if (refused || retriesLeft === 0) return;
-          timer = setTimeout(() => restore(retriesLeft - 1), delays[delays.length - retriesLeft]);
+          // Someone signed in or out since: this restore is superseded.
+          if (refused || retriesLeft === 0 || attempt.current !== mine) return;
+          timer = setTimeout(() => {
+            if (attempt.current === mine) restore(retriesLeft - 1);
+          }, delays[delays.length - retriesLeft]);
         });
       };
       restore(delays.length);

@@ -73,6 +73,9 @@ pub struct AuditStatsCache(tokio::sync::Mutex<Option<AuditStats>>);
 
 struct AuditStats {
     days: i32,
+    /// The UTC day the result was computed on. A result from before
+    /// midnight lacks the new day's bucket, so it is never served after it.
+    utc_day: chrono::NaiveDate,
     computed: std::time::Instant,
     activity: Vec<silo_db::stats::DayActivity>,
     actions: Vec<silo_db::stats::ActionTotals>,
@@ -88,16 +91,17 @@ impl AuditStatsCache {
         Vec<silo_db::stats::ActionTotals>,
     )> {
         let mut cached = self.0.lock().await;
-        if let Some(hit) = cached
-            .as_ref()
-            .filter(|c| c.days == days && c.computed.elapsed() < AUDIT_STATS_TTL)
-        {
+        let today = chrono::Utc::now().date_naive();
+        if let Some(hit) = cached.as_ref().filter(|c| {
+            c.days == days && c.utc_day == today && c.computed.elapsed() < AUDIT_STATS_TTL
+        }) {
             return Ok((hit.activity.clone(), hit.actions.clone()));
         }
         let (activity, actions) =
             tokio::try_join!(db.stats_daily_activity(days), db.stats_action_totals(days),)?;
         *cached = Some(AuditStats {
             days,
+            utc_day: today,
             computed: std::time::Instant::now(),
             activity: activity.clone(),
             actions: actions.clone(),
@@ -1085,6 +1089,19 @@ impl AdminServiceImpl {
         // cover that repo — otherwise a repo-scoped admin could make
         // *someone else's* private repo world-readable.
         auth::require_repo(&self.state, &caller, &req.repo, Permission::Write).await?;
+
+        // Setting a mode creates the repo's row when it has none, so it is a
+        // way to create a repo and honours the same reserved names.
+        if !self
+            .state
+            .db
+            .repo_exists(&req.repo)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            silo_core::config::validate_new_repo_name(&req.repo)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
 
         let public = match RepoMode::try_from(req.mode).unwrap_or(RepoMode::Unspecified) {
             RepoMode::Public => true,
