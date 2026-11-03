@@ -69,6 +69,12 @@ audit:
   log_pull_through: true
   # Entries older than this are pruned hourly. 0 disables pruning.
   retention_days: 90
+  # Peers (IPs or CIDR ranges) whose X-Forwarded-For header is believed:
+  # behind a reverse proxy or ingress, list its address so entries record
+  # the real client instead of the proxy. Requests from any other peer are
+  # recorded under their own address, since a client can send any header.
+  # Every host in a listed range is believed, so list only the proxies.
+  # trusted_proxies: ["10.0.1.5", "10.0.1.6"]
 
 metrics:
   enabled: true
