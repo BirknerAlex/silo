@@ -10,11 +10,16 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use common::{unique_repo, Harness};
 use silo_db::tokens::{Permission, Scope};
+use silo_pkg::ostree::delta::read_bundle;
 use tower::ServiceExt;
 
+const HELLO_FLATPAK: &[u8] = include_bytes!("../../silo-pkg/tests/fixtures/hello.flatpak");
+
+/// The server's own route assembly, without the gRPC services: the same
+/// function `main` uses, so the `admin_ui.enabled` gate is the one under
+/// test.
 fn app(harness: &Harness) -> axum::Router {
-    silo_server::http::router(harness.state.clone())
-        .merge(silo_server::webui::router(harness.state.clone()))
+    silo_server::router(harness.state.clone(), axum::Router::new())
 }
 
 async fn rpc(
@@ -104,6 +109,33 @@ async fn unknown_client_routes_fall_back_to_the_page_but_missing_files_do_not() 
 }
 
 #[tokio::test]
+async fn with_the_console_disabled_neither_the_page_nor_the_gateway_is_routed() {
+    let url = require_db!();
+    let harness = Harness::with_config(&url, |config| {
+        config.admin_ui.enabled = false;
+    })
+    .await;
+    let app = app(&harness);
+    let admin = harness.admin_token().await;
+
+    for uri in ["/admin", "/admin/", "/admin/users"] {
+        let response = get(&app, uri).await;
+        assert_ne!(response.status(), StatusCode::OK, "{uri}");
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_none(),
+            "{uri} was served by the console"
+        );
+    }
+
+    let (status, body) = rpc(&app, "GetStats", Some(&admin.secret), serde_json::json!({})).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(body.get("totals").is_none(), "{body}");
+}
+
+#[tokio::test]
 async fn package_routes_still_work_beside_the_console() {
     let url = require_db!();
     let harness = Harness::new(&url).await;
@@ -126,6 +158,14 @@ async fn package_routes_still_work_beside_the_console() {
 async fn the_name_admin_cannot_be_used_for_a_new_repo_but_an_existing_one_stays_reachable() {
     let url = require_db!();
     let harness = Harness::new(&url).await;
+    // The name is fixed, unlike every other test's, so whatever an aborted
+    // earlier run left behind would make it look already taken.
+    for table in ["packages", "repos"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE repo = 'admin'"))
+            .execute(harness.db.pool())
+            .await
+            .unwrap();
+    }
     let app = app(&harness);
     let admin = harness.admin_token().await;
 
@@ -155,6 +195,66 @@ async fn the_name_admin_cannot_be_used_for_a_new_repo_but_an_existing_one_stays_
         "DeleteRepo",
         Some(&admin.secret),
         serde_json::json!({ "repo": "admin" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Publishing follows the same rule on both paths: refused while it
+    // would create the repo, accepted into one that exists — whether it
+    // exists as a `repos` row or only as packages with no row.
+    let bundle = read_bundle(HELLO_FLATPAK).unwrap();
+    let object = &bundle.objects[0];
+    let encoded = silo_pkg::ostree::archive::encode(object).unwrap();
+    let stage = || {
+        silo_core::ostree::stage_object(
+            &harness.state.publish,
+            "admin",
+            "stable",
+            object.ty,
+            object.checksum,
+            encoded.clone(),
+        )
+    };
+    let system = silo_db::audit::Actor::system();
+    let publish = |release: &'static str| {
+        silo_core::repo::publish(
+            &harness.state.publish,
+            "admin",
+            "stable",
+            silo_pkg::PackageFormat::Rpm,
+            silo_pkg::testutil::build_test_rpm("widget", "1.0", release, "x86_64"),
+            &system,
+        )
+    };
+    let reserved = |result: anyhow::Result<()>| {
+        let message = format!("{:#}", result.expect_err("the publish is refused"));
+        assert!(message.contains("reserved"), "{message}");
+    };
+
+    reserved(publish("1").await.map(|_| ()));
+    reserved(stage().await.map(|_| ()));
+    assert!(!harness.db.repo_exists("admin").await.unwrap());
+
+    harness.db.ensure_repo("admin").await.unwrap();
+    publish("1").await.expect("publish into the existing repo");
+    stage().await.expect("stage an object in the existing repo");
+
+    sqlx::query("DELETE FROM repos WHERE repo = 'admin'")
+        .execute(harness.db.pool())
+        .await
+        .unwrap();
+    publish("2")
+        .await
+        .expect("publish into the package-only repo");
+    stage()
+        .await
+        .expect("stage an object in the package-only repo");
+
+    let (status, body) = rpc(
+        &app,
+        "DeleteRepo",
+        Some(&admin.secret),
+        serde_json::json!({ "repo": "admin", "force": true }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -435,8 +535,10 @@ async fn a_repo_scoped_admin_cannot_read_registry_wide_stats() {
 #[tokio::test]
 async fn server_info_reports_configuration_without_secrets() {
     let url = require_db!();
+    const PEPPER: &str = "pepper-value-7f3c9a1e5b2d";
     let harness = Harness::with_config(&url, |config| {
         config.prune.enabled = true;
+        config.auth.token_pepper = Some(PEPPER.into());
     })
     .await;
     let app = app(&harness);
@@ -455,7 +557,9 @@ async fn server_info_reports_configuration_without_secrets() {
     assert_eq!(info["oidc_enabled"], false);
     assert_eq!(info["upstream_secret_configured"], true);
     assert!(info["jobs"].as_array().unwrap().len() >= 5);
-    assert!(!info.to_string().contains("pepper"));
+    let text = info.to_string();
+    assert!(!text.contains(PEPPER), "{text}");
+    assert!(!text.contains("pepper"), "{text}");
 }
 
 #[tokio::test]

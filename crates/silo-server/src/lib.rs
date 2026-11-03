@@ -25,6 +25,20 @@ use silo_db::Db;
 
 use crate::metrics::Metrics;
 
+/// Every route the server answers: the package-manager HTTP surface, the
+/// gRPC services in `grpc`, and the admin console when
+/// `admin_ui.enabled` is set. With the console off, nothing under
+/// `/admin/api` is routed at all, so the JSON gateway is not reachable on
+/// a listener the operator chose not to expose it on.
+pub fn router(state: Arc<AppState>, grpc: axum::Router) -> axum::Router {
+    let app = http::router(state.clone()).merge(grpc);
+    if state.config.admin_ui.enabled {
+        app.merge(webui::router(state))
+    } else {
+        app
+    }
+}
+
 pub struct AppState {
     pub config: Config,
     pub storage: Storage,
@@ -42,6 +56,9 @@ pub struct AppState {
     /// and pull-through fetches alike, so connections to a frequently-hit
     /// upstream are reused rather than reopened per request.
     pub upstream_http: reqwest::Client,
+    /// The dashboard's audit aggregates, reused for a short while so that
+    /// open dashboards polling `GetStats` do not each rescan the audit log.
+    pub audit_stats: admin::AuditStatsCache,
 }
 
 impl AppState {

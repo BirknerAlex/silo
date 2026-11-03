@@ -14,7 +14,7 @@ use silo_proto::v1::auth_service_server::AuthServiceServer;
 use silo_proto::v1::publish_service_server::PublishServiceServer;
 use silo_proto::v1::read_service_server::ReadServiceServer;
 use silo_server::metrics::Metrics;
-use silo_server::{admin, bootstrap, grpc, grpc_auth, http, maintenance, webui, AppState};
+use silo_server::{admin, bootstrap, grpc, grpc_auth, maintenance, AppState};
 
 #[derive(Parser)]
 struct Args {
@@ -104,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .context("could not build the upstream HTTP client")?,
+        audit_stats: Default::default(),
     });
 
     // gRPC and the package-manager HTTP surface share one listener. They
@@ -129,11 +130,7 @@ async fn main() -> anyhow::Result<()> {
         }));
     let grpc_routes = grpc_routes.routes().into_axum_router();
 
-    let mut app = http::router(state.clone()).merge(grpc_routes);
-    if state.config.admin_ui.enabled {
-        app = app.merge(webui::router(state.clone()));
-    }
-    let app = app
+    let app = silo_server::router(state.clone(), grpc_routes)
         // gRPC handlers read the peer IP via `tonic::Request::remote_addr`,
         // which looks for a `TcpConnectInfo` extension that tonic's own
         // transport normally inserts. Serving through plain axum/hyper

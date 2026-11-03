@@ -398,10 +398,14 @@ ADMIN_TOKEN=$($COMPOSE exec -T \
 # `ui/dist` carries), and its JSON gateway has to run an admin RPC with the
 # same token the CLI just got.
 ADMIN_PAGE=$(curl -fsS "http://localhost:$HTTP_PORT/admin/")
-case "$ADMIN_PAGE" in
-    *'/admin/assets/'*) ok "admin console is embedded" ;;
-    *) fail "/admin/ did not serve the built console" ;;
-esac
+# `|| true`: under pipefail a page with no script would end the run here,
+# before the message that says what was wrong.
+ADMIN_SCRIPT=$(printf '%s' "$ADMIN_PAGE" \
+    | grep -o 'src="/admin/assets/[^"]*\.js"' | head -n1 | cut -d'"' -f2 || true)
+[ -n "$ADMIN_SCRIPT" ] || fail "/admin/ did not serve the built console"
+curl -fsS -o /dev/null "http://localhost:$HTTP_PORT$ADMIN_SCRIPT" \
+    || fail "the console's script $ADMIN_SCRIPT is not served"
+ok "admin console is embedded"
 ADMIN_STATS=$(curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
     -H 'Content-Type: application/json' -d '{}' \
     "http://localhost:$HTTP_PORT/admin/api/rpc/GetStats") \

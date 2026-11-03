@@ -401,6 +401,20 @@ mod tests {
         metrics.auth_failures.with_label_values(&["expired"]).inc();
         metrics.auth_failures.with_label_values(&["unknown"]).inc();
         metrics.database_up.set(1);
+        metrics
+            .pull_through
+            .with_label_values(&["rpm", "fetched"])
+            .inc();
+        metrics
+            .pull_through
+            .with_label_values(&["npm", "cached"])
+            .inc();
+        metrics.record_grpc("get_stats", &Ok(tonic::Response::new(())));
+        metrics.record_grpc("list_repos", &Ok(tonic::Response::new(())));
+        metrics.record_grpc::<()>("get_stats", &Err(tonic::Status::internal("x")));
+        metrics.record_upstream_sync("rpm", true, 0.1);
+        metrics.record_upstream_sync("npm", true, 0.1);
+        metrics.record_upstream_sync("npm", false, 0.1);
 
         let snapshot = metrics.runtime_snapshot();
         assert_eq!(snapshot.publishes_ok, 2);
@@ -408,6 +422,11 @@ mod tests {
         assert_eq!(snapshot.downloads_proxy, 2);
         assert_eq!(snapshot.downloads_redirect, 1);
         assert_eq!(snapshot.auth_failures, 2);
+        assert_eq!(snapshot.pull_through_served, 2);
+        assert_eq!(snapshot.grpc_ok, 2);
+        assert_eq!(snapshot.grpc_error, 1);
+        assert_eq!(snapshot.upstream_syncs_ok, 2);
+        assert_eq!(snapshot.upstream_syncs_failed, 1);
         assert!(snapshot.database_up);
         assert!(snapshot.started_at > 0);
     }
