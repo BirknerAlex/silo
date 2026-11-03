@@ -37,6 +37,9 @@ use crate::AppState;
 /// upstream definition or a handful of repo names.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// How long a client has to send the request body.
+const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(super) async fn rpc(
     State(state): State<Arc<AppState>>,
     Path(method): Path<String>,
@@ -47,12 +50,23 @@ pub(super) async fn rpc(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr);
     let headers = request.headers().clone();
-    let body = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(_) => {
+    let body = match tokio::time::timeout(
+        BODY_TIMEOUT,
+        axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
             return error(
                 Code::InvalidArgument,
                 format!("request body exceeds {MAX_BODY_BYTES} bytes"),
+            )
+        }
+        Err(_) => {
+            return error(
+                Code::DeadlineExceeded,
+                "timed out reading the request".into(),
             )
         }
     };

@@ -46,6 +46,12 @@ fn busy() -> Response {
 }
 const MAX_BODY_BYTES: usize = 16 * 1024;
 
+/// How long a client has to send the request body. The routes take no
+/// credential and no permit is held while the body arrives, so without a
+/// deadline a client that never finishes sending holds a task and a
+/// connection open for as long as it likes.
+const BODY_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Deserialize)]
 struct DeviceAuthorization {
     device_code: String,
@@ -214,9 +220,20 @@ pub(super) async fn poll(State(state): State<Arc<AppState>>, request: Request) -
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr);
-    let body = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(_) => return error(Code::InvalidArgument, "request body is too large".into()),
+    let body = match tokio::time::timeout(
+        BODY_TIMEOUT,
+        axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => return error(Code::InvalidArgument, "request body is too large".into()),
+        Err(_) => {
+            return error(
+                Code::DeadlineExceeded,
+                "timed out reading the request".into(),
+            )
+        }
     };
     let poll: PollRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
