@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.18.0](https://github.com/BirknerAlex/silo/compare/v0.17.0...v0.18.0) (2026-11-04)
+
+
+### Features
+
+* **ui:** use the silo logo for the console favicon and header ([b0f03f2](https://github.com/BirknerAlex/silo/commit/b0f03f242db96c5a78002032ac91c8ddd0cc676f))
+
+
+### Documentation
+
+* use the SVG logo in the README and drop the PNG ([76024c4](https://github.com/BirknerAlex/silo/commit/76024c4b75505b5450f5c1489c147c1119511ac4))
+
 ## [0.17.0](https://github.com/BirknerAlex/silo/compare/v0.16.0...v0.17.0) (2026-11-03)
 
 
