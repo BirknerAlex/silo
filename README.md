@@ -1,4 +1,4 @@
-<img src="https://raw.githubusercontent.com/BirknerAlex/silo/main/assets/silo.png" width="88" align="left" alt="Silo" />
+<img src="https://raw.githubusercontent.com/BirknerAlex/silo/main/assets/silo.svg" width="88" align="left" alt="Silo" />
 
 # Silo
 
