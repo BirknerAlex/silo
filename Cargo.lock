@@ -117,9 +117,9 @@ dependencies = [
 
 [[package]]
 name = "alpm-types"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9956548e64aed46ebb9ba28a45e8ce29245e99be1ba59334410962bf51a3de9"
+checksum = "66b016c82158774a2430fe56180e4b2c771439760621d11d07091dc8973c20ae"
 dependencies = [
  "alpm-parsers",
  "base64 0.23.1",
