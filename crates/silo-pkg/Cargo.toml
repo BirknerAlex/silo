@@ -25,7 +25,7 @@ chrono.workspace = true
 reqwest = { workspace = true }
 quick-xml.workspace = true
 futures.workspace = true
-alpm-types = "0.13"
+alpm-types = "0.14"
 
 [features]
 test-util = []
