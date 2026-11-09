@@ -1,6 +1,6 @@
 # The admin console (`ui/`) is built first: silo-server's build.rs embeds
 # `ui/dist` into the binary, so it has to exist before cargo runs.
-FROM node:22-bookworm-slim AS ui
+FROM node:26-bookworm-slim AS ui
 WORKDIR /ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
