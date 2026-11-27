@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.0](https://github.com/BirknerAlex/silo/compare/v0.18.0...v0.19.0) (2026-11-27)
+
+
+### Features
+
+* let admins grant and revoke the admin role on existing users ([779a833](https://github.com/BirknerAlex/silo/commit/779a8332532584bdb128747e7a77346ddffc156b))
+
 ## [0.18.0](https://github.com/BirknerAlex/silo/compare/v0.17.0...v0.18.0) (2026-11-18)
 
 
