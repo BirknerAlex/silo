@@ -39,6 +39,7 @@ const ACTIONS = [
   "token.revoke",
   "user.create",
   "user.disable",
+  "user.set_admin",
   "user.delete",
   "auth.login",
   "auth.failed",

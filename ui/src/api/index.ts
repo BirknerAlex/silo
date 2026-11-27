@@ -72,6 +72,8 @@ export const api = {
     rpc<{ user: UserInfo }>("CreateUser", { username, password, is_admin }),
   setUserDisabled: (username: string, disabled: boolean) =>
     rpc<{ user: UserInfo }>("SetUserDisabled", { username, disabled }),
+  setUserAdmin: (username: string, is_admin: boolean) =>
+    rpc<{ user: UserInfo }>("SetUserAdmin", { username, is_admin }),
   setUserPassword: (username: string, password: string) =>
     rpc<{ user: UserInfo }>("SetUserPassword", { username, password }),
   deleteUser: (username: string) => rpc<{ deleted: boolean }>("DeleteUser", { username }),

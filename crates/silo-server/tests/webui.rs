@@ -433,6 +433,156 @@ async fn an_admin_can_run_the_registry_through_the_gateway() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// A role change applies to what the user can do, not only to what the
+/// list shows: sessions issued under the old role end, the next sign-in
+/// carries the new one, and a signed-in admin cannot demote themselves.
+#[tokio::test]
+async fn changing_a_users_admin_role_ends_their_sessions_and_takes_effect_on_sign_in() {
+    let url = require_db!();
+    let harness = Harness::new(&url).await;
+    let app = app(&harness);
+    let admin = harness.admin_token().await;
+    let token = admin.secret.as_str();
+
+    let username = format!("promotee-{}", unique_repo("u"));
+    let password = "correct horse battery";
+    let (status, body) = rpc(
+        &app,
+        "CreateUser",
+        Some(token),
+        serde_json::json!({ "username": username, "password": password }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user"]["is_admin"], false);
+
+    let login = |app: axum::Router, username: String| async move {
+        let (status, session) = rpc(
+            &app,
+            "Login",
+            None,
+            serde_json::json!({ "username": username, "password": password }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        session["token"].as_str().unwrap().to_string()
+    };
+
+    // Another enabled admin account, so the demotion below is not the
+    // removal of the last one. The token above is not a user.
+    let keeper = format!("keeper-{}", unique_repo("u"));
+    let (status, body) = rpc(
+        &app,
+        "CreateUser",
+        Some(token),
+        serde_json::json!({ "username": keeper, "password": password, "is_admin": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A plain user cannot reach admin methods, and so cannot promote.
+    let plain = login(app.clone(), username.clone()).await;
+    let (status, body) = rpc(
+        &app,
+        "SetUserAdmin",
+        Some(&plain),
+        serde_json::json!({ "username": username, "is_admin": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Promotion ends the session issued under the old role.
+    let (status, body) = rpc(
+        &app,
+        "SetUserAdmin",
+        Some(token),
+        serde_json::json!({ "username": username, "is_admin": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user"]["is_admin"], true);
+    let (status, _) = rpc(&app, "WhoAmI", Some(&plain), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The next sign-in is an admin session.
+    let promoted = login(app.clone(), username.clone()).await;
+    let (status, body) = rpc(&app, "ListUsers", Some(&promoted), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Promoting again changes nothing and is not an error.
+    let (status, body) = rpc(
+        &app,
+        "SetUserAdmin",
+        Some(token),
+        serde_json::json!({ "username": username, "is_admin": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An admin cannot demote the account they are signed in as.
+    let (status, body) = rpc(
+        &app,
+        "SetUserAdmin",
+        Some(&promoted),
+        serde_json::json!({ "username": username, "is_admin": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Demotion ends the admin session, and the next one is not an admin.
+    let (status, body) = rpc(
+        &app,
+        "SetUserAdmin",
+        Some(token),
+        serde_json::json!({ "username": username, "is_admin": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user"]["is_admin"], false);
+    let (status, _) = rpc(&app, "ListUsers", Some(&promoted), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let demoted = login(app.clone(), username.clone()).await;
+    let (status, _) = rpc(&app, "ListUsers", Some(&demoted), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = rpc(
+        &app,
+        "SetUserAdmin",
+        Some(token),
+        serde_json::json!({ "username": "no-such-user-here", "is_admin": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // Both changes are in the audit log; the no-op is not.
+    let (status, audit) = rpc(
+        &app,
+        "QueryAudit",
+        Some(token),
+        serde_json::json!({ "action": "user.set_admin", "limit": 50 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{audit}");
+    let changes: Vec<_> = audit["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["target"] == username.as_str())
+        .collect();
+    assert_eq!(changes.len(), 2, "{audit}");
+
+    for name in [&username, &keeper] {
+        let (status, body) = rpc(
+            &app,
+            "DeleteUser",
+            Some(token),
+            serde_json::json!({ "username": name }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
 #[tokio::test]
 async fn stats_describe_what_was_published() {
     let url = require_db!();

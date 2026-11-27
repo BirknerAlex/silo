@@ -262,46 +262,55 @@ impl Db {
         new: NewToken,
         pepper: Option<&str>,
     ) -> anyhow::Result<IssuedToken> {
-        // Generated in a helper so the non-`Send` `ThreadRng` is dropped
-        // before the first `.await`; holding one across an await point
-        // makes the whole future non-`Send` and unusable in a handler.
-        let (prefix_bytes, secret_bytes, salt) = random_token_material();
+        let mut conn = self.pool().acquire().await?;
+        insert_token(&mut conn, new, pepper).await
+    }
 
-        let prefix = hex::encode(prefix_bytes);
-        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret_bytes);
-        let hash = hash_secret(&salt, &secret, pepper);
-
-        let (scope_all, repos) = match &new.scope {
-            Scope::All => (true, Vec::new()),
-            Scope::Repos(repos) => (false, repos.clone()),
-        };
-
-        let id = Uuid::new_v4();
-        let row: TokenRow = sqlx::query_as(&format!(
-            "INSERT INTO tokens (id, name, prefix, salt, secret_hash, permission, kind, \
-                                 scope_all, repos, user_id, created_by, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             RETURNING {SELECT_COLUMNS}"
-        ))
-        .bind(id)
-        .bind(&new.name)
-        .bind(&prefix)
-        .bind(salt.as_slice())
-        .bind(hash.as_slice())
-        .bind(new.permission.as_str())
-        .bind(new.kind.as_str())
-        .bind(scope_all)
-        .bind(&repos)
-        .bind(new.user_id)
-        .bind(new.created_by)
-        .bind(new.expires_at)
-        .fetch_one(self.pool())
+    /// Issues a session token carrying the user's role *as it is now*.
+    ///
+    /// The role is read under a shared row lock held until the token is
+    /// committed. [`Db::set_user_admin`] updates that row and then deletes
+    /// the user's sessions, so a login racing a role change either
+    /// finishes first, and its session is deleted, or starts after, and
+    /// reads the new role. Reading the role earlier and inserting later
+    /// would let a demoted admin keep an admin session.
+    pub async fn create_session(
+        &self,
+        user_id: Uuid,
+        username: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        pepper: Option<&str>,
+    ) -> anyhow::Result<(IssuedToken, bool)> {
+        let mut tx = self.pool().begin().await?;
+        let (is_admin, disabled): (bool, bool) =
+            sqlx::query_as("SELECT is_admin, disabled FROM users WHERE id = $1 FOR SHARE")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("the account no longer exists"))?;
+        if disabled {
+            anyhow::bail!("the account is disabled");
+        }
+        let issued = insert_token(
+            &mut tx,
+            NewToken {
+                name: format!("session:{username}"),
+                permission: if is_admin {
+                    Permission::Admin
+                } else {
+                    Permission::Write
+                },
+                kind: TokenKind::Session,
+                scope: Scope::All,
+                user_id: Some(user_id),
+                created_by: Some(user_id),
+                expires_at: Some(expires_at),
+            },
+            pepper,
+        )
         .await?;
-
-        Ok(IssuedToken {
-            token: row.into_token(),
-            secret: format!("{TOKEN_PREFIX}{prefix}_{secret}"),
-        })
+        tx.commit().await?;
+        Ok((issued, is_admin))
     }
 
     /// Verifies a presented token string. Returns the token row only if
@@ -424,6 +433,53 @@ impl Db {
         .await?;
         Ok(result.rows_affected())
     }
+}
+
+async fn insert_token(
+    conn: &mut sqlx::PgConnection,
+    new: NewToken,
+    pepper: Option<&str>,
+) -> anyhow::Result<IssuedToken> {
+    // Generated in a helper so the non-`Send` `ThreadRng` is dropped
+    // before the first `.await`; holding one across an await point
+    // makes the whole future non-`Send` and unusable in a handler.
+    let (prefix_bytes, secret_bytes, salt) = random_token_material();
+
+    let prefix = hex::encode(prefix_bytes);
+    let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret_bytes);
+    let hash = hash_secret(&salt, &secret, pepper);
+
+    let (scope_all, repos) = match &new.scope {
+        Scope::All => (true, Vec::new()),
+        Scope::Repos(repos) => (false, repos.clone()),
+    };
+
+    let id = Uuid::new_v4();
+    let row: TokenRow = sqlx::query_as(&format!(
+        "INSERT INTO tokens (id, name, prefix, salt, secret_hash, permission, kind, \
+                             scope_all, repos, user_id, created_by, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         RETURNING {SELECT_COLUMNS}"
+    ))
+    .bind(id)
+    .bind(&new.name)
+    .bind(&prefix)
+    .bind(salt.as_slice())
+    .bind(hash.as_slice())
+    .bind(new.permission.as_str())
+    .bind(new.kind.as_str())
+    .bind(scope_all)
+    .bind(&repos)
+    .bind(new.user_id)
+    .bind(new.created_by)
+    .bind(new.expires_at)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    Ok(IssuedToken {
+        token: row.into_token(),
+        secret: format!("{TOKEN_PREFIX}{prefix}_{secret}"),
+    })
 }
 
 fn random_token_material() -> ([u8; PREFIX_BYTES], [u8; SECRET_BYTES], [u8; SALT_BYTES]) {

@@ -232,6 +232,7 @@ async fn dispatch(
         "CreateUser" => call!(admin, create_user, headers, peer, body),
         "ListUsers" => call!(admin, list_users, headers, peer, body),
         "SetUserDisabled" => call!(admin, set_user_disabled, headers, peer, body),
+        "SetUserAdmin" => call!(admin, set_user_admin, headers, peer, body),
         "DeleteUser" => call!(admin, delete_user, headers, peer, body),
         "SetUserPassword" => call!(admin, set_user_password, headers, peer, body),
         "QueryAudit" => call!(admin, query_audit, headers, peer, body),

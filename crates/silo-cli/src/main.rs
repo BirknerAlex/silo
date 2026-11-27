@@ -32,9 +32,9 @@ use silo_proto::v1::{
     ListUsersRequest, LoginOidcRequest, LoginRequest, OriginScope, PackageFormat as ProtoFormat,
     PublishMetadata, PublishRequest, QueryAuditRequest, RebuildIndexRequest, RemoveUpstreamRequest,
     RepoMode, RevokeTokenRequest, RunPruneRequest, SetPruneExemptionRequest, SetPruneRuleRequest,
-    SetRepoModeRequest, SetUserDisabledRequest, SetUserPasswordRequest, SyncUpstreamRequest,
-    TokenScope, UpdateUpstreamRequest, UpstreamAuth, UpstreamCacheMode, UpstreamInfo,
-    WhoAmIRequest,
+    SetRepoModeRequest, SetUserAdminRequest, SetUserDisabledRequest, SetUserPasswordRequest,
+    SyncUpstreamRequest, TokenScope, UpdateUpstreamRequest, UpstreamAuth, UpstreamCacheMode,
+    UpstreamInfo, WhoAmIRequest,
 };
 use tonic::transport::{Channel, ClientTlsConfig};
 
@@ -463,6 +463,17 @@ enum UserCommand {
         username: String,
     },
     Enable {
+        #[arg(long)]
+        username: String,
+    },
+    /// Grants the admin role. The user's sessions end; the role applies
+    /// from their next sign-in.
+    Promote {
+        #[arg(long)]
+        username: String,
+    },
+    /// Revokes the admin role. The user's sessions end.
+    Demote {
         #[arg(long)]
         username: String,
     },
@@ -2088,6 +2099,40 @@ async fn cmd_user(config_path: &str, server: Option<&str>, cmd: UserCommand) -> 
                 .await?
                 .into_inner();
             println!("enabled {}", user.user.unwrap_or_default().username);
+        }
+
+        UserCommand::Promote { username } | UserCommand::Demote { username }
+            if username.trim().is_empty() =>
+        {
+            anyhow::bail!("--username is required");
+        }
+
+        UserCommand::Promote { username } => {
+            let user = client
+                .set_user_admin(with_auth(
+                    SetUserAdminRequest {
+                        username,
+                        is_admin: true,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            println!("promoted {}", user.user.unwrap_or_default().username);
+        }
+
+        UserCommand::Demote { username } => {
+            let user = client
+                .set_user_admin(with_auth(
+                    SetUserAdminRequest {
+                        username,
+                        is_admin: false,
+                    },
+                    &session.token,
+                )?)
+                .await?
+                .into_inner();
+            println!("demoted {}", user.user.unwrap_or_default().username);
         }
 
         UserCommand::SetPassword { username, password } => {

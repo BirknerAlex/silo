@@ -56,6 +56,20 @@ export function Users() {
     }
   };
 
+  const setAdmin = async (user: UserInfo, isAdmin: boolean) => {
+    try {
+      await api.setUserAdmin(user.username, isAdmin);
+      toast.success(
+        isAdmin
+          ? `${user.username} is an administrator from their next sign-in`
+          : `${user.username} is no longer an administrator`,
+      );
+      users.reload();
+    } catch (e) {
+      toast.error(`Could not ${isAdmin ? "promote" : "demote"} ${user.username}`, e);
+    }
+  };
+
   return (
     <>
       <PageHeader
@@ -132,6 +146,13 @@ export function Users() {
                               u.disabled
                                 ? { title: "Enable", onClick: () => void setDisabled(u, false) }
                                 : { title: "Disable", onClick: () => void setDisabled(u, true) },
+                              u.is_admin
+                                ? {
+                                    title: "Remove admin role",
+                                    isDisabled: me,
+                                    onClick: () => void setAdmin(u, false),
+                                  }
+                                : { title: "Make administrator", onClick: () => void setAdmin(u, true) },
                               { title: "Set password", onClick: () => setPasswordFor(u) },
                               { isSeparator: true },
                               { title: "Delete", onClick: () => setDeleting(u) },
