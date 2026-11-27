@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use silo_db::audit::{self, ActorKind, AuditEntry, AuditQuery};
 use silo_db::tokens::{NewToken, Permission, Scope, TokenKind};
-use silo_db::users::User;
+use silo_db::users::{SetAdminOutcome, User};
 use silo_db::Uuid;
 use silo_pkg::PackageFormat;
 use silo_proto::v1::admin_service_server::AdminService;
@@ -42,11 +42,11 @@ use silo_proto::v1::{
     RebuildIndexResponse, RemoveUpstreamRequest, RemoveUpstreamResponse, RepoMode, RepoStats,
     RevokeTokenRequest, RevokeTokenResponse, RunPruneRequest, RunPruneResponse, RuntimeStats,
     ScheduledJob, SetPruneExemptionRequest, SetPruneExemptionResponse, SetPruneRuleRequest,
-    SetPruneRuleResponse, SetRepoModeRequest, SetRepoModeResponse, SetUserDisabledRequest,
-    SetUserDisabledResponse, SetUserPasswordRequest, SetUserPasswordResponse, StatsTotals,
-    SyncUpstreamRequest, SyncUpstreamResponse, TokenInfo, TokenScope as ProtoScope,
-    UpdateUpstreamRequest, UpdateUpstreamResponse, UpstreamCacheMode as ProtoCacheMode,
-    UpstreamInfo, UpstreamStats, UserInfo,
+    SetPruneRuleResponse, SetRepoModeRequest, SetRepoModeResponse, SetUserAdminRequest,
+    SetUserAdminResponse, SetUserDisabledRequest, SetUserDisabledResponse, SetUserPasswordRequest,
+    SetUserPasswordResponse, StatsTotals, SyncUpstreamRequest, SyncUpstreamResponse, TokenInfo,
+    TokenScope as ProtoScope, UpdateUpstreamRequest, UpdateUpstreamResponse,
+    UpstreamCacheMode as ProtoCacheMode, UpstreamInfo, UpstreamStats, UserInfo,
 };
 use tonic::{Request, Response, Status};
 
@@ -163,6 +163,15 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<SetUserDisabledResponse>, Status> {
         let result = self.set_user_disabled_inner(request).await;
         self.state.metrics.record_grpc("set_user_disabled", &result);
+        result
+    }
+
+    async fn set_user_admin(
+        &self,
+        request: Request<SetUserAdminRequest>,
+    ) -> Result<Response<SetUserAdminResponse>, Status> {
+        let result = self.set_user_admin_inner(request).await;
+        self.state.metrics.record_grpc("set_user_admin", &result);
         result
     }
 
@@ -840,6 +849,51 @@ impl AdminServiceImpl {
             .await;
 
         Ok(Response::new(SetUserDisabledResponse {
+            user: Some(self.load_user(&req.username).await?),
+        }))
+    }
+
+    async fn set_user_admin_inner(
+        &self,
+        request: Request<SetUserAdminRequest>,
+    ) -> Result<Response<SetUserAdminResponse>, Status> {
+        let caller = auth::authenticate_grpc(&self.state, &request).await?;
+        auth::require_global_admin(&caller)?;
+        let req = request.into_inner();
+
+        if !req.is_admin {
+            self.guard_self_lockout(&caller, &req.username)?;
+        }
+
+        match self
+            .state
+            .db
+            .set_user_admin(&req.username, req.is_admin)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            SetAdminOutcome::NotFound => {
+                return Err(Status::not_found(format!("no user `{}`", req.username)));
+            }
+            SetAdminOutcome::LastAdmin => {
+                return Err(Status::failed_precondition(
+                    "refusing to demote the last enabled admin",
+                ));
+            }
+            SetAdminOutcome::Unchanged => {}
+            SetAdminOutcome::Changed => {
+                self.state
+                    .db
+                    .record_audit(
+                        AuditEntry::new(audit::action::USER_SET_ADMIN, &caller.actor)
+                            .target(&req.username)
+                            .detail(serde_json::json!({ "is_admin": req.is_admin })),
+                    )
+                    .await;
+            }
+        }
+
+        Ok(Response::new(SetUserAdminResponse {
             user: Some(self.load_user(&req.username).await?),
         }))
     }
@@ -2208,7 +2262,7 @@ impl AdminServiceImpl {
             && caller.actor.name.eq_ignore_ascii_case(username.trim())
         {
             return Err(Status::failed_precondition(
-                "refusing to disable or delete the account you are signed in as",
+                "refusing to disable, delete or demote the account you are signed in as",
             ));
         }
         Ok(())

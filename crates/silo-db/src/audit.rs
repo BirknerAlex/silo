@@ -37,6 +37,7 @@ pub mod action {
     pub const USER_CREATE: &str = "user.create";
     pub const USER_DELETE: &str = "user.delete";
     pub const USER_DISABLE: &str = "user.disable";
+    pub const USER_SET_ADMIN: &str = "user.set_admin";
     pub const AUTH_LOGIN: &str = "auth.login";
     pub const AUTH_FAILED: &str = "auth.failed";
     pub const SERVER_BOOTSTRAP: &str = "server.bootstrap";

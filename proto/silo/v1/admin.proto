@@ -17,6 +17,10 @@ service AdminService {
   rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
   rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
   rpc SetUserDisabled(SetUserDisabledRequest) returns (SetUserDisabledResponse);
+  // Grants or revokes the admin role. The user's sign-in sessions end, so
+  // the new role applies from their next sign-in. Refuses to demote the
+  // caller's own account or the last enabled admin.
+  rpc SetUserAdmin(SetUserAdminRequest) returns (SetUserAdminResponse);
   rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
   rpc SetUserPassword(SetUserPasswordRequest) returns (SetUserPasswordResponse);
 
@@ -157,6 +161,10 @@ message SetUserDisabledResponse {
   UserInfo user = 1;
 }
 
+message SetUserAdminResponse {
+  UserInfo user = 1;
+}
+
 message SetUserPasswordResponse {
   UserInfo user = 1;
 }
@@ -180,6 +188,11 @@ message ListUsersResponse {
 message SetUserDisabledRequest {
   string username = 1;
   bool disabled = 2;
+}
+
+message SetUserAdminRequest {
+  string username = 1;
+  bool is_admin = 2;
 }
 
 message SetUserPasswordRequest {

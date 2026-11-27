@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use silo_db::audit::{self, Actor, ActorKind, AuditEntry};
-use silo_db::tokens::{NewToken, Permission, Scope, TokenKind};
+use silo_db::tokens::Scope;
 use silo_db::users::{LoginError, OidcLoginError, User};
 use silo_proto::v1::auth_service_server::AuthService;
 use silo_proto::v1::{
@@ -346,23 +346,15 @@ impl AuthServiceImpl {
         let ttl = chrono::Duration::hours(self.state.config.auth.session_ttl_hours);
         let expires_at = chrono::Utc::now() + ttl;
 
-        let issued = self
+        // The role comes from the same locked read that inserts the token,
+        // not from `user`, which may predate a concurrent role change.
+        let (issued, is_admin) = self
             .state
             .db
-            .create_token(
-                NewToken {
-                    name: format!("session:{}", user.username),
-                    permission: if user.is_admin {
-                        Permission::Admin
-                    } else {
-                        Permission::Write
-                    },
-                    kind: TokenKind::Session,
-                    scope: Scope::All,
-                    user_id: Some(user.id),
-                    created_by: Some(user.id),
-                    expires_at: Some(expires_at),
-                },
+            .create_session(
+                user.id,
+                &user.username,
+                expires_at,
                 self.state.config.auth.token_pepper.as_deref(),
             )
             .await
@@ -390,7 +382,7 @@ impl AuthServiceImpl {
         Ok(LoginResponse {
             token: issued.secret,
             username: user.username,
-            is_admin: user.is_admin,
+            is_admin,
             expires_at: expires_at.timestamp(),
         })
     }

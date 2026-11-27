@@ -40,6 +40,17 @@ impl User {
     }
 }
 
+/// What [`Db::set_user_admin`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetAdminOutcome {
+    Changed,
+    /// The user already had the requested role; nothing was touched.
+    Unchanged,
+    NotFound,
+    /// Demoting would leave no enabled admin.
+    LastAdmin,
+}
+
 /// Why an OIDC identity was not admitted.
 ///
 /// Typed rather than `anyhow::Error` for the same reason [`LoginError`]
@@ -303,6 +314,30 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Grants or revokes the admin role.
+    ///
+    /// A session token carries the permission it was issued with, so the
+    /// user's sessions are deleted in the same transaction: a demoted
+    /// admin must not keep an admin session, and a promoted user picks up
+    /// the role on their next sign-in. API tokens keep the permission
+    /// they were minted with.
+    ///
+    /// Demoting the last enabled admin is refused. The admin rows are
+    /// locked first so two concurrent demotions cannot each see the other
+    /// admin still standing.
+    pub async fn set_user_admin(
+        &self,
+        username: &str,
+        is_admin: bool,
+    ) -> Result<SetAdminOutcome, sqlx::Error> {
+        let mut tx = self.pool().begin().await?;
+        let outcome = set_user_admin_in(&mut tx, username, is_admin).await?;
+        if outcome == SetAdminOutcome::Changed {
+            tx.commit().await?;
+        }
+        Ok(outcome)
+    }
+
     pub async fn delete_user(&self, username: &str) -> anyhow::Result<bool> {
         let result = sqlx::query("DELETE FROM users WHERE username = $1")
             .bind(username.trim().to_lowercase())
@@ -379,6 +414,56 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
         .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| anyhow::anyhow!("failed to hash password: {e}"))
+}
+
+/// The body of [`Db::set_user_admin`], on a caller-owned transaction so a
+/// test can stage the admin population and roll it back.
+///
+/// The admin rows are locked in id order: unordered, two concurrent role
+/// changes could each hold a row the other waits for.
+async fn set_user_admin_in(
+    conn: &mut sqlx::PgConnection,
+    username: &str,
+    is_admin: bool,
+) -> Result<SetAdminOutcome, sqlx::Error> {
+    sqlx::query("SELECT id FROM users WHERE is_admin ORDER BY id FOR UPDATE")
+        .fetch_all(&mut *conn)
+        .await?;
+
+    let target: Option<(Uuid, bool, bool)> =
+        sqlx::query_as("SELECT id, is_admin, disabled FROM users WHERE username = $1")
+            .bind(username.trim().to_lowercase())
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((id, current, disabled)) = target else {
+        return Ok(SetAdminOutcome::NotFound);
+    };
+    if current == is_admin {
+        return Ok(SetAdminOutcome::Unchanged);
+    }
+
+    if !is_admin && !disabled {
+        let (others,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM users WHERE is_admin AND NOT disabled AND id <> $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if others == 0 {
+            return Ok(SetAdminOutcome::LastAdmin);
+        }
+    }
+
+    sqlx::query("UPDATE users SET is_admin = $2 WHERE id = $1")
+        .bind(id)
+        .bind(is_admin)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM tokens WHERE user_id = $1 AND kind = 'session'")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(SetAdminOutcome::Changed)
 }
 
 /// An argon2id hash of a value nothing can present, built once and reused.
@@ -593,6 +678,140 @@ mod tests {
             .authenticate_password(&normal, "a real password")
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn promoting_and_demoting_changes_the_role_and_ends_sessions() {
+        let db = require_db!();
+        let _keeper = db
+            .create_user(&unique("keeper"), Some("a real password"), true)
+            .await
+            .unwrap();
+        let user = db
+            .create_user(&unique("promotee"), Some("a real password"), false)
+            .await
+            .unwrap();
+        let session = |db: &Db, id| {
+            let db = db.clone();
+            async move {
+                let (n,): (i64,) = sqlx::query_as(
+                    "SELECT count(*) FROM tokens WHERE user_id = $1 AND kind = 'session'",
+                )
+                .bind(id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                n
+            }
+        };
+        sqlx::query(
+            "INSERT INTO tokens (id, name, prefix, salt, secret_hash, permission, kind, \
+             scope_all, user_id) VALUES ($1, 's', $2, '\\x00', '\\x00', 'write', 'session', \
+             true, $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(unique("pfx"))
+        .bind(user.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(session(&db, user.id).await, 1);
+
+        assert_eq!(
+            db.set_user_admin(&user.username, true).await.unwrap(),
+            SetAdminOutcome::Changed
+        );
+        assert!(db.find_user_by_id(user.id).await.unwrap().unwrap().is_admin);
+        assert_eq!(
+            session(&db, user.id).await,
+            0,
+            "sessions end on a role change"
+        );
+
+        assert_eq!(
+            db.set_user_admin(&user.username, true).await.unwrap(),
+            SetAdminOutcome::Unchanged
+        );
+        assert_eq!(
+            db.set_user_admin(&user.username, false).await.unwrap(),
+            SetAdminOutcome::Changed
+        );
+        assert!(!db.find_user_by_id(user.id).await.unwrap().unwrap().is_admin);
+        assert_eq!(
+            db.set_user_admin("no-such-user-here", true).await.unwrap(),
+            SetAdminOutcome::NotFound
+        );
+    }
+
+    /// A session carries the role the user holds when it is issued, not
+    /// the one on a `User` value read earlier.
+    #[tokio::test]
+    async fn a_session_is_issued_with_the_current_role() {
+        let db = require_db!();
+        let _keeper = db
+            .create_user(&unique("keeper"), Some("a real password"), true)
+            .await
+            .unwrap();
+        let user = db
+            .create_user(&unique("session-role"), Some("a real password"), true)
+            .await
+            .unwrap();
+        // `user` still says admin after this demotion; the session must not.
+        assert_eq!(
+            db.set_user_admin(&user.username, false).await.unwrap(),
+            SetAdminOutcome::Changed
+        );
+        let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+        let (issued, is_admin) = db
+            .create_session(user.id, &user.username, expires, None)
+            .await
+            .unwrap();
+        assert!(!is_admin);
+        assert_eq!(issued.token.permission, crate::tokens::Permission::Write);
+    }
+
+    /// The last enabled admin cannot be demoted; a disabled admin does not
+    /// count as one that remains. The admin population is staged inside a
+    /// transaction that is rolled back, so other tests' admins cannot
+    /// change the answer.
+    #[tokio::test]
+    async fn the_last_enabled_admin_cannot_be_demoted() {
+        let db = require_db!();
+        let only = db
+            .create_user(&unique("only"), Some("a real password"), true)
+            .await
+            .unwrap();
+        let keeper = db
+            .create_user(&unique("keeper"), Some("a real password"), true)
+            .await
+            .unwrap();
+
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("UPDATE users SET disabled = true WHERE is_admin AND id <> $1")
+            .bind(only.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            set_user_admin_in(&mut tx, &only.username, false)
+                .await
+                .unwrap(),
+            SetAdminOutcome::LastAdmin
+        );
+
+        sqlx::query("UPDATE users SET disabled = false WHERE id = $1")
+            .bind(keeper.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            set_user_admin_in(&mut tx, &only.username, false)
+                .await
+                .unwrap(),
+            SetAdminOutcome::Changed
+        );
+        tx.rollback().await.unwrap();
+        assert!(db.find_user_by_id(only.id).await.unwrap().unwrap().is_admin);
     }
 
     /// The account-takeover shape: a local admin exists, and someone
